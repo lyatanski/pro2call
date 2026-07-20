@@ -198,12 +198,17 @@ int gtpu_decap(struct __sk_buff* skb)
         return TC_ACT_OK;
     }
 
-    struct udphdr* udp = data + udp_off;
-    if ((void*)(udp + 1) > data_end) return TC_ACT_OK;
-    if (udp->dest != bpf_htons(GTPU_PORT)) return TC_ACT_OK;
-    /* Scalar copy: packet pointers die at bpf_skb_adjust_room and the
-     * malformed path emits an event after the strip. */
-    const __be16 src_port = udp->source;
+    /* Read the fixed 8-byte outer UDP header at its family-dependent
+     * offset with load_bytes. Direct access (data + udp_off) adds a
+     * *variable* scalar to the packet pointer — udp_off is 34 for IPv4,
+     * 54 for IPv6 — which the verifier rejects unless the program is
+     * loaded privileged (CAP_PERFMON: "prohibited for !root"). This
+     * datapath is meant to load with only CAP_BPF + CAP_NET_ADMIN, so it
+     * reads variable-offset headers by offset, never by pointer math. */
+    struct udphdr udp;
+    if (bpf_skb_load_bytes(skb, udp_off, &udp, sizeof udp)) return TC_ACT_OK;
+    if (udp.dest != bpf_htons(GTPU_PORT)) return TC_ACT_OK;
+    const __be16 src_port = udp.source;
 
     /* From here on this is GTP-U traffic addressed to us: refuse to
      * forward against a stale/absent map layout (§13.5 ABI check). */
@@ -215,30 +220,31 @@ int gtpu_decap(struct __sk_buff* skb)
         return TC_ACT_SHOT;
     }
 
-    __u32            gtpu_off = udp_off + sizeof *udp;
-    struct gtpu_hdr* g        = data + gtpu_off;
-    if ((void*)(g + 1) > data_end) return TC_ACT_OK;
-    if ((g->flags & 0xf0) != GTPU_F_VERSION_PT) /* version 1, PT=GTP only */
+    /* Mandatory GTP-U header, likewise read by offset (not data + off). */
+    __u32           gtpu_off = udp_off + sizeof udp;
+    struct gtpu_hdr g;
+    if (bpf_skb_load_bytes(skb, gtpu_off, &g, sizeof g)) return TC_ACT_OK;
+    if ((g.flags & 0xf0) != GTPU_F_VERSION_PT) /* version 1, PT=GTP only */
         return TC_ACT_OK;
 
-    __u32              teid = bpf_ntohl(g->teid);
+    __u32              teid = bpf_ntohl(g.teid);
     struct gtpu_stats* st   = stats_slot(teid);
 
-    if (g->msg_type == GTPU_MT_END_MARKER) {
+    if (g.msg_type == GTPU_MT_END_MARKER) {
         /* Handover state machine runs in userspace (§13.3). */
         emit_event(GTPU_EV_END_MARKER, teid, src_family, src_addr, src_port,
                    st);
         return TC_ACT_OK;
     }
-    if (g->msg_type != GTPU_MT_GPDU)
+    if (g.msg_type != GTPU_MT_GPDU)
         return TC_ACT_OK; /* Echo/Error Indication → userspace socket */
 
     /* Optional area + extension header chain (variable offsets: use
      * load_bytes, direct access would fight the verifier). */
     __u32 payload_off = gtpu_off + GTPU_HDR_MIN;
-    if (g->flags & (GTPU_F_EXT | GTPU_F_SEQ | GTPU_F_NPDU)) {
+    if (g.flags & (GTPU_F_EXT | GTPU_F_SEQ | GTPU_F_NPDU)) {
         payload_off += GTPU_HDR_OPT;
-        if (g->flags & GTPU_F_EXT) {
+        if (g.flags & GTPU_F_EXT) {
             __u8 next = 0;
             if (bpf_skb_load_bytes(skb, gtpu_off + 11, &next, 1))
                 return TC_ACT_OK;
@@ -376,20 +382,19 @@ tx_classify(__u8 family, const __u8* ue_addr, __u8 proto, __be16 ue_port,
     return bpf_map_lookup_elem(&teid_tx6_map, &lk);
 }
 
-/* Outer headers are built in this stack buffer, then written with one
- * constant-size store per shape (verifier-friendly). */
-#define OUTER_MAX                                                    \
-    (sizeof(struct ipv6hdr) + sizeof(struct udphdr) + GTPU_HDR_MIN + \
-     GTPU_HDR_OPT + 4)
-
 /* IPv6 outer needs a real UDP checksum; payloads too large for the
- * bounded checksum loop fall back to the userspace path. */
-#define CSUM_CHUNK   256
-#define CSUM_CHUNKS  8
+ * bounded checksum loop fall back to the userspace path. The chunk is
+ * kept at 128 (not 256) so csum_pkt_range's frame plus gtpu_encap's stay
+ * within BPF's 512-byte combined call-stack limit; CSUM_CHUNKS is doubled
+ * to keep the same total checksummable length. */
+#define CSUM_CHUNK   128
+#define CSUM_CHUNKS  16
 #define CSUM_MAX_LEN (CSUM_CHUNK * CSUM_CHUNKS)
 
 /* One's-complement sum over a packet byte range. A real BPF subprogram
- * (not inlined) so the chunk buffer gets its own 512-byte stack frame.
+ * (not inlined) so the chunk buffer lives in its own stack frame rather
+ * than adding to the caller's; the two frames together must still fit
+ * BPF's 512-byte combined-stack limit (hence CSUM_CHUNK = 128).
  * Returns the running 32-bit sum, or negative on a short packet. */
 static __noinline __s64 csum_pkt_range(struct __sk_buff* skb, __u32 off,
                                        __u32 remain, __u64 seed)
@@ -522,55 +527,16 @@ int gtpu_encap(struct __sk_buff* skb)
     __u32 outer_l3  = v4 ? sizeof(struct iphdr) : sizeof(struct ipv6hdr);
     __u32 outer_len = outer_l3 + sizeof(struct udphdr) + gtpu_len;
 
-    /* ---- Build the outer headers in a stack buffer ---- */
-
-    __u8 hdr[OUTER_MAX] = { 0 };
-
-    if (v4) {
-        struct iphdr* ip = (struct iphdr*)hdr;
-        ip->version      = 4;
-        ip->ihl          = 5;
-        ip->tot_len      = bpf_htons((__u16)(outer_l3 + udp_len));
-        ip->ttl          = 64;
-        ip->protocol     = IPPROTO_UDP;
-        __builtin_memcpy(&ip->saddr, cfg->local_v4, 4);
-        __builtin_memcpy(&ip->daddr, tun->remote_addr, 4);
-        ip->check = (__u16)~csum16(ip, 10, 0);
-    } else {
-        struct ipv6hdr* ip6 = (struct ipv6hdr*)hdr;
-        ip6->version        = 6;
-        ip6->payload_len    = bpf_htons((__u16)udp_len);
-        ip6->nexthdr        = IPPROTO_UDP;
-        ip6->hop_limit      = 64;
-        __builtin_memcpy(&ip6->saddr, cfg->local_v6, 16);
-        __builtin_memcpy(&ip6->daddr, tun->remote_addr, 16);
-    }
-
-    struct udphdr* udp = (struct udphdr*)(hdr + outer_l3);
-    udp->source        = bpf_htons(GTPU_PORT);
-    udp->dest          = tun->remote_port;
-    udp->len           = bpf_htons((__u16)udp_len);
-    udp->check         = 0; /* optional for IPv4 (§13.4); v6 computed below */
-
-    struct gtpu_hdr* g = (struct gtpu_hdr*)((__u8*)udp + sizeof *udp);
-    g->msg_type        = GTPU_MT_GPDU;
-    g->teid            = bpf_htonl(tun->remote_teid);
-    if (tun->flags & GTPU_TXF_QFI) {
-        /* E flag; length counts the opt area and ext header too. */
-        g->flags  = GTPU_F_VERSION_PT | GTPU_F_EXT;
-        g->length = bpf_htons((__u16)(inner_len + GTPU_HDR_OPT + 4));
-        __u8* opt = (__u8*)(g + 1);
-        opt[3]    = GTPU_EXT_PDU_SESSION; /* seq/n-pdu stay zero */
-        opt[4]    = 1;                    /* ext length, 4-byte units */
-        opt[5]    = 0x00;                 /* PDU type 0 = DL PSC */
-        opt[6]    = tun->qfi & 0x3f;
-        opt[7]    = GTPU_EXT_NONE;
-    } else {
-        g->flags  = GTPU_F_VERSION_PT;
-        g->length = bpf_htons((__u16)inner_len);
-    }
-
-    /* ---- Grow the skb and write everything in-place ---- */
+    /* ---- Grow the skb, then write each header from its own fixed stack
+     * object with store_bytes ----
+     *
+     * Overlaying udp/g on one buffer at `hdr + outer_l3` is pointer
+     * arithmetic with a per-path scalar (outer_l3 is 20 or 40), which the
+     * verifier forbids unless the program is loaded privileged. Building
+     * each header in its own object keeps every pointer offset constant;
+     * the store_bytes *destination offset* may vary freely — it is a
+     * helper argument, not pointer math. cfg/tun are map values and stay
+     * valid across bpf_skb_adjust_room (only packet pointers are killed). */
 
     if (bpf_skb_adjust_room(skb, (__s32)outer_len, BPF_ADJ_ROOM_MAC,
                             BPF_F_ADJ_ROOM_FIXED_GSO))
@@ -583,16 +549,65 @@ int gtpu_encap(struct __sk_buff* skb)
     if (bpf_skb_store_bytes(skb, 0, &neweth, sizeof neweth, 0))
         return TC_ACT_SHOT;
 
-    /* Constant sizes per shape keep the verifier out of the way. */
-    int         rc;
-    const __u32 psc = tun->flags & GTPU_TXF_QFI ? GTPU_HDR_OPT + 4 : 0;
-    if (v4)
-        rc = psc ? bpf_skb_store_bytes(skb, ETH_HLEN, hdr, 20 + 8 + 16, 0)
-                 : bpf_skb_store_bytes(skb, ETH_HLEN, hdr, 20 + 8 + 8, 0);
-    else
-        rc = psc ? bpf_skb_store_bytes(skb, ETH_HLEN, hdr, 40 + 8 + 16, 0)
-                 : bpf_skb_store_bytes(skb, ETH_HLEN, hdr, 40 + 8 + 8, 0);
-    if (rc) return TC_ACT_SHOT;
+    /* Outer L3, built and written inside each family branch so the store
+     * size is a compile-time constant. */
+    if (v4) {
+        struct iphdr ip = { 0 };
+        ip.version  = 4;
+        ip.ihl      = 5;
+        ip.tot_len  = bpf_htons((__u16)(outer_l3 + udp_len));
+        ip.ttl      = 64;
+        ip.protocol = IPPROTO_UDP;
+        __builtin_memcpy(&ip.saddr, cfg->local_v4, 4);
+        __builtin_memcpy(&ip.daddr, tun->remote_addr, 4);
+        ip.check = (__u16)~csum16(&ip, 10, 0);
+        if (bpf_skb_store_bytes(skb, ETH_HLEN, &ip, sizeof ip, 0))
+            return TC_ACT_SHOT;
+    } else {
+        struct ipv6hdr ip6 = { 0 };
+        ip6.version     = 6;
+        ip6.payload_len = bpf_htons((__u16)udp_len);
+        ip6.nexthdr     = IPPROTO_UDP;
+        ip6.hop_limit   = 64;
+        __builtin_memcpy(&ip6.saddr, cfg->local_v6, 16);
+        __builtin_memcpy(&ip6.daddr, tun->remote_addr, 16);
+        if (bpf_skb_store_bytes(skb, ETH_HLEN, &ip6, sizeof ip6, 0))
+            return TC_ACT_SHOT;
+    }
+
+    /* Outer UDP: fixed stack struct, written at the (variable) L3 offset. */
+    struct udphdr udp = { 0 };
+    udp.source = bpf_htons(GTPU_PORT);
+    udp.dest   = tun->remote_port;
+    udp.len    = bpf_htons((__u16)udp_len);
+    udp.check  = 0; /* optional for IPv4 (§13.4); v6 computed below */
+    if (bpf_skb_store_bytes(skb, ETH_HLEN + outer_l3, &udp, sizeof udp, 0))
+        return TC_ACT_SHOT;
+
+    /* GTP-U header (+ optional PDU Session Container) in a fixed buffer. */
+    __u32            gtpu_hdr_off = ETH_HLEN + outer_l3 + sizeof(struct udphdr);
+    __u8             gbuf[GTPU_HDR_MIN + GTPU_HDR_OPT + 4] = { 0 };
+    struct gtpu_hdr* g                                     = (struct gtpu_hdr*)gbuf;
+    g->msg_type                                            = GTPU_MT_GPDU;
+    g->teid = bpf_htonl(tun->remote_teid);
+    if (tun->flags & GTPU_TXF_QFI) {
+        /* E flag; length counts the opt area and ext header too. */
+        g->flags  = GTPU_F_VERSION_PT | GTPU_F_EXT;
+        g->length = bpf_htons((__u16)(inner_len + GTPU_HDR_OPT + 4));
+        gbuf[GTPU_HDR_MIN + 3] = GTPU_EXT_PDU_SESSION; /* seq/n-pdu stay zero */
+        gbuf[GTPU_HDR_MIN + 4] = 1;                    /* ext length, 4-byte units */
+        gbuf[GTPU_HDR_MIN + 5] = 0x00;                 /* PDU type 0 = DL PSC */
+        gbuf[GTPU_HDR_MIN + 6] = tun->qfi & 0x3f;
+        gbuf[GTPU_HDR_MIN + 7] = GTPU_EXT_NONE;
+        if (bpf_skb_store_bytes(skb, gtpu_hdr_off, gbuf,
+                                GTPU_HDR_MIN + GTPU_HDR_OPT + 4, 0))
+            return TC_ACT_SHOT;
+    } else {
+        g->flags  = GTPU_F_VERSION_PT;
+        g->length = bpf_htons((__u16)inner_len);
+        if (bpf_skb_store_bytes(skb, gtpu_hdr_off, gbuf, GTPU_HDR_MIN, 0))
+            return TC_ACT_SHOT;
+    }
 
     if (!v4) {
         /* Mandatory IPv6 UDP checksum: pseudo-header sum plus a bounded

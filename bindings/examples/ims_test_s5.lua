@@ -6,6 +6,14 @@
 -- PGW_IP may be a host name (resolved through the system resolver) or a
 -- literal IP address; it defaults to "smf".
 --
+-- GTP-U user plane: when the eBPF datapath is available (CAP_BPF +
+-- CAP_NET_ADMIN, eBPF build) the script programs each bearer's forwarding
+-- entry into it. Set $GTPU_IFACE (the S5/S8-U interface facing the PGW)
+-- and $GTPU_INNER_IFACE (the access side) to also attach the TC programs;
+-- without them the datapath loads and the tunnels are installed in its
+-- map, but no interface is hooked. Without the datapath the tunnels are
+-- only reported.
+--
 
 local gtp = require("gtp")
 local net = require("net")     -- event loop + UDP socket transport
@@ -26,6 +34,21 @@ local T3_MS, N3  = 1000, 3     -- retransmission: 1s T3-RESPONSE, up to 3 sends
 
 local function banner(t) print(("\n== %s"):format(t)) end
 local function line(k, v) print(("   %-22s %s"):format(k, v)) end
+
+-- Strip the leading "context: " a gtp/net Error carries, for one-line logs.
+local function why(e) return (tostring(e):gsub("^.-:%s*", "")) end
+
+-- Map an interface name to its kernel ifindex through sysfs (the binding
+-- exposes no if_nametoindex). Returns nil when the name is unset or the
+-- interface is absent, so attach can be skipped cleanly.
+local function iface_index(name)
+    if not name or name == "" then return nil end
+    local f = io.open("/sys/class/net/" .. name .. "/ifindex")
+    if not f then return nil end
+    local n = tonumber((f:read("*l") or ""):match("%d+"))
+    f:close()
+    return n
+end
 
 -- Resolve a host name to an IPv4 literal. A dotted-quad is returned
 -- unchanged; otherwise we shell out to the system resolver (the net
@@ -94,6 +117,19 @@ local function fteid_v4(if_type, teid, addr)
                        tonumber(a), tonumber(b), tonumber(c), tonumber(d))
 end
 
+-- Inverse of fteid_v4: pull the 32-bit TEID and the IPv4 address out of an
+-- F-TEID IE value, used to learn a peer's data-plane endpoint from a raw
+-- message. Returns teid, addr; addr is nil when the V4 flag is clear.
+local function fteid_v4_decode(v)
+    if #v < 5 then return nil end
+    local teid = ((v:byte(2) * 256 + v:byte(3)) * 256 + v:byte(4)) * 256 + v:byte(5)
+    local addr
+    if math.floor(v:byte(1) / 0x80) % 2 == 1 and #v >= 9 then   -- V4 flag set
+        addr = ("%d.%d.%d.%d"):format(v:byte(6), v:byte(7), v:byte(8), v:byte(9))
+    end
+    return teid, addr
+end
+
 -- A GTPv2-C Cause IE value (§8.4): the cause octet plus a spare/flags
 -- octet (CS/BCE/PCE bits, all zero here).
 local function cause_ie(cause) return string.char(cause, 0) end
@@ -118,14 +154,64 @@ local function attach_pdn_over_s5()
     local loop = net.Loop()
     local ok, ep = pcall(gtp.Endpoint, loop, sgw_ip)  -- binds sgw_ip:2123 (GTP-C)
     if not ok then
-        io.stderr:write(("cannot bind GTP-C on %s:2123: %s\n")
-            :format(sgw_ip, tostring(ep):gsub("^.-:%s*", "")))
+        io.stderr:write(("cannot bind GTP-C on %s:2123: %s\n"):format(sgw_ip, why(ep)))
         os.exit(1)
     end
     ep:set_t3_ms(T3_MS)
     ep:set_n3(N3)
 
     local st = { done = false, err = nil, ue_addr = nil }
+
+    -- ---- GTP-U user plane (eBPF datapath) ----
+    -- Load the datapath when the kernel and privileges allow it; attach its
+    -- TC programs to the S5/S8-U and access interfaces when their names are
+    -- given. Everything degrades to a log line if the datapath, the caps or
+    -- the interfaces are missing, so an unprivileged run still completes.
+    local up
+    if gtp.UserPlane.supported() then
+        local gi = iface_index(os.getenv("GTPU_IFACE"))        -- S5/S8-U (GTP-U) side
+        local ii = iface_index(os.getenv("GTPU_INNER_IFACE"))  -- access side
+        local cfg = gtp.UserPlaneConfig()
+        cfg.pin_dir        = ""        -- no bpffs pinning: a fresh datapath each run
+        cfg.local_v4       = sgw_ip    -- outer source address for encapsulated uplink
+        cfg.uplink_ifindex = gi or 0
+        local made, obj = pcall(gtp.UserPlane, cfg)
+        if made then
+            up = obj
+            if gi or ii then
+                local aok, aerr = pcall(function() up:attach(gi or 0, ii or 0) end)
+                line("GTP-U datapath", aok
+                    and ("attached (gtpu=%s inner=%s)")
+                        :format(os.getenv("GTPU_IFACE") or "-", os.getenv("GTPU_INNER_IFACE") or "-")
+                    or ("attach failed: " .. why(aerr)))
+            else
+                line("GTP-U datapath", "loaded (set GTPU_IFACE/GTPU_INNER_IFACE to attach TC)")
+            end
+        else
+            line("GTP-U datapath", "unavailable (" .. why(obj) .. ")")
+        end
+    else
+        line("GTP-U datapath", "unsupported (non-eBPF build or missing CAP_BPF/CAP_NET_ADMIN)")
+    end
+
+    -- Program one bearer's forwarding entry into the datapath (a no-op when
+    -- it is not loaded). Downlink packets to the UE address are encapsulated
+    -- to remote_teid @ remote_addr; uplink from local_teid is decapsulated.
+    local function program_tunnel(ebi, local_teid, remote_teid, remote_addr)
+        if not up then return end
+        if not (st.ue_addr and remote_addr and remote_addr ~= "") then
+            line("GTP-U tunnel", ("EBI %d not programmed (missing UE/peer address)"):format(ebi))
+            return
+        end
+        local t = gtp.Tunnel()
+        t.local_teid, t.remote_teid = local_teid, remote_teid
+        t.ebi, t.ue_addr, t.remote_addr = ebi, st.ue_addr, remote_addr
+        local pok, perr = pcall(function() up:add_tunnel(t) end)
+        line("GTP-U tunnel", pok
+            and ("EBI %d  ul TEID %#x / dl TEID %#x @ %s programmed")
+                :format(ebi, local_teid, remote_teid, remote_addr)
+            or ("EBI %d add_tunnel failed: %s"):format(ebi, why(perr)))
+    end
 
     ep:set_handler({
         -- The PGW answered the Create Session: read the cause, the
@@ -143,12 +229,13 @@ local function attach_pdn_over_s5()
         end,
 
         -- One per bearer F-TEID in the accepted response: the PGW's
-        -- data-plane endpoint. A real SGW would program its GTP-U
-        -- datapath (gtp.UserPlane) here; we just report it.
+        -- data-plane endpoint. Report it, then program the default bearer's
+        -- tunnel into the GTP-U datapath (a no-op if it is not loaded).
         on_user_plane = function(sess, tun)
             line("user plane (S5/S8-U)",
                  ("EBI %d  SGW TEID %#x -> PGW TEID %#x @ %s")
                      :format(tun.ebi, tun.local_teid, tun.remote_teid, tun.remote_addr))
+            program_tunnel(tun.ebi, tun.local_teid, tun.remote_teid, tun.remote_addr)
         end,
 
         -- With the default bearer up the PGW opens a dedicated bearer with
@@ -200,6 +287,14 @@ local function attach_pdn_over_s5()
             ep:send_raw(resp:encode(), host, port)
             line("-> Create Bearer Resp",
                  ("seq %d, EBI %d, cause accepted"):format(req.sequence, NEW_EBI))
+
+            -- Program the dedicated bearer's tunnel too: our uplink TEID is
+            -- the one we just handed the PGW; its downlink endpoint is the
+            -- PGW F-TEID carried in the request.
+            if pgw_u then
+                local rteid, raddr = fteid_v4_decode(pgw_u)
+                if rteid then program_tunnel(NEW_EBI, S5_UP_TEID + 1, rteid, raddr) end
+            end
             st.cbr_done = true
         end,
 
@@ -262,7 +357,7 @@ local function attach_pdn_over_s5()
         end
     end
 
-    return { loop = loop, ep = ep, sess = sess, st = st, ue_addr = st.ue_addr }
+    return { loop = loop, ep = ep, sess = sess, st = st, up = up, ue_addr = st.ue_addr }
 end
 
 -- main
