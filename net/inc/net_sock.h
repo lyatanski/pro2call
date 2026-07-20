@@ -21,9 +21,10 @@ extern "C" {
  * and the stream send/recv apply unchanged. */
 
 enum {
-    NET_REUSEPORT = 1, /* SO_REUSEPORT, for multi-UE load testing */
-    NET_BOUND     = 2, /* caller supplied the local address       */
-    NET_LISTEN    = 4,
+    NET_REUSEPORT    = 1, /* SO_REUSEPORT, for multi-UE load testing        */
+    NET_BOUND        = 2, /* caller supplied the local address              */
+    NET_LISTEN       = 4,
+    NET_NONLOCAL_SRC = 8, /* IP_FREEBIND+IP_TRANSPARENT: bind/send non-local */
 };
 
 typedef struct {

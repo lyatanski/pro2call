@@ -184,11 +184,12 @@ uint64_t now_ms()
 /* ---- UdpSocket ---- */
 
 UdpSocket::UdpSocket(const std::string& local_host, uint16_t local_port,
-                     bool reuseport)
+                     bool reuseport, bool nonlocal_src)
 {
     net_addr a     = addr_of(local_host, local_port);
     unsigned flags = NET_BOUND;
     if (reuseport) flags |= NET_REUSEPORT;
+    if (nonlocal_src) flags |= NET_NONLOCAL_SRC;
     int rc = net_udp_open(&s_, &a, flags);
     if (rc != NET_OK)
         throw Error(

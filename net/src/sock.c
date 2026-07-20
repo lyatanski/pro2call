@@ -12,6 +12,18 @@
 #ifndef SCTP_NODELAY
 #define SCTP_NODELAY 3 /* linux/sctp.h; avoids a libsctp-dev dependency */
 #endif
+#ifndef IP_FREEBIND
+#define IP_FREEBIND 15 /* linux/in.h */
+#endif
+#ifndef IP_TRANSPARENT
+#define IP_TRANSPARENT 19 /* linux/in.h */
+#endif
+#ifndef IPV6_FREEBIND
+#define IPV6_FREEBIND 78 /* linux/in6.h */
+#endif
+#ifndef IPV6_TRANSPARENT
+#define IPV6_TRANSPARENT 75 /* linux/in6.h */
+#endif
 
 int net_sock_wait(int fd, unsigned ev, int timeout_ms)
 {
@@ -64,6 +76,25 @@ static int sock_bind(net_sock* s, const net_addr* local, unsigned flags,
     if (reuseaddr) /* streams only: SO_REUSEADDR on UDP would defeat REUSEPORT
                     */
         setsockopt(s->fd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof on);
+    if (flags & NET_NONLOCAL_SRC) {
+        /* Use a source address this host does not own (e.g. a simulated
+         * UE's PDN address). IP_FREEBIND lifts the bind-time locality
+         * check; IP_TRANSPARENT additionally lets the kernel *route and
+         * send* from that source (IP_FREEBIND alone binds, but sends then
+         * fail with ENETUNREACH). Neither adds the address, so packets
+         * *to* it still route out instead of being delivered locally.
+         * Needs CAP_NET_ADMIN; being plain setsockopts (no /proc write)
+         * they work where /proc/sys is read-only, e.g. a default Docker
+         * mount. Best-effort: if refused, the bind or a later send fails
+         * and the caller sees the error. */
+        if (local->sa.sa_family == AF_INET6) {
+            setsockopt(s->fd, IPPROTO_IPV6, IPV6_FREEBIND, &on, sizeof on);
+            setsockopt(s->fd, IPPROTO_IPV6, IPV6_TRANSPARENT, &on, sizeof on);
+        } else {
+            setsockopt(s->fd, IPPROTO_IP, IP_FREEBIND, &on, sizeof on);
+            setsockopt(s->fd, IPPROTO_IP, IP_TRANSPARENT, &on, sizeof on);
+        }
+    }
     if (bind(s->fd, &local->sa, net_addr_len(local)) < 0) return NET_ERR;
     socklen_t sl = sizeof s->local;
     getsockname(s->fd, &s->local.sa, &sl); /* resolve ephemeral port */

@@ -14,9 +14,17 @@
 -- map, but no interface is hooked. Without the datapath the tunnels are
 -- only reported.
 --
+-- With both interfaces attached the script then drives the datapath and
+-- reads the per-TEID kernel counters back, confirming the encap path end
+-- to end without needing the PGW to answer: an opaque datagram on the
+-- default bearer, and on the IMS signalling bearer a real SIP REGISTER
+-- addressed to the P-CSCF whose address the PGW returned in the Create
+-- Session Response PCO (TS 24.008 container 0x000C).
+--
 
 local gtp = require("gtp")
 local net = require("net")     -- event loop + UDP socket transport
+local sip = require("sip")     -- IMS REGISTER builder for the user-plane probe
 
 -- ---- configuration ----------------------------------------------------
 
@@ -27,8 +35,24 @@ local mcc      = os.getenv("IMS_MCC")  or "001"              -- serving PLMN (ma
 local mnc      = os.getenv("IMS_MNC")  or "01"               -- and the mnc01.mcc001 core realm)
 local imsi     = os.getenv("IMS_IMSI") or "001010123456789"  -- TS 35.207 test IMSI
 
+-- IMS identities for the REGISTER (TS 23.003): the home network domain
+-- and the IMPU/IMPI derived from the IMSI. Override with IMS_REALM /
+-- IMS_IMPU / IMS_IMPI for a different core; the MNC is zero-padded to
+-- three digits as the domain label requires.
+local function mnc3(n) return (#n == 2) and ("0" .. n) or n end
+local ims_realm = os.getenv("IMS_REALM")
+    or ("ims.mnc%s.mcc%s.3gppnetwork.org"):format(mnc3(mnc), mcc)
+local impu = os.getenv("IMS_IMPU") or ("sip:%s@%s"):format(imsi, ims_realm)
+local impi = os.getenv("IMS_IMPI") or ("%s@%s"):format(imsi, ims_realm)
+
 local S5_UP_TEID = 0x200       -- our (SGW) S5/S8-U downlink tunnel endpoint id
 local T3_MS, N3  = 1000, 3     -- retransmission: 1s T3-RESPONSE, up to 3 sends
+
+local IPPROTO_UDP    = 17      -- inner protocol used by the confirmation probe
+local DEFAULT_UE_PORT = 4096   -- probe port for the default bearer (matches no TFT)
+local PCSCF_SIP_PORT  = 5060   -- IMS signalling bearer TFT: SIP toward the P-CSCF
+
+local PCO_PCSCF_IPV4 = 0x000c  -- TS 24.008 §10.5.6.3 P-CSCF IPv4 Address container
 
 -- ---- little helpers ---------------------------------------------------
 
@@ -48,6 +72,18 @@ local function iface_index(name)
     local n = tonumber((f:read("*l") or ""):match("%d+"))
     f:close()
     return n
+end
+
+-- Read an interface's first IPv4 address through `ip addr` (busybox or
+-- iproute2). Returns a dotted-quad or nil. Used to fill SGW_IP from the
+-- GTP-U interface so the outer source and the S5/S8 F-TEIDs carry a real
+-- address. The name is validated so it cannot smuggle shell syntax.
+local function iface_ipv4(name)
+    if not name or not name:match("^[%w._-]+$") then return nil end
+    local p = io.popen(("ip addr show dev %s 2>/dev/null"):format(name))
+    if not p then return nil end
+    local out = p:read("*a") or ""; p:close()
+    return out:match("inet%s+(%d+%.%d+%.%d+%.%d+)")
 end
 
 -- Resolve a host name to an IPv4 literal. A dotted-quad is returned
@@ -134,6 +170,53 @@ end
 -- octet (CS/BCE/PCE bits, all zero here).
 local function cause_ie(cause) return string.char(cause, 0) end
 
+-- Walk a Protocol Configuration Options field (§8.13 / TS 24.008
+-- §10.5.6.3) for the first P-CSCF IPv4 address the PGW returned. Octet 1
+-- is the configuration-protocol/flags byte; each container that follows
+-- is {id_hi, id_lo, len, len octets}. Container 0x000C carries one or
+-- more 4-octet P-CSCF IPv4 addresses. Returns a dotted quad or nil. Plain
+-- byte arithmetic only, so it runs under Lua 5.1 / LuaJIT too.
+local function pco_pcscf_v4(pco)
+    if not pco or #pco < 4 then return nil end
+    local i = 2                                   -- skip the flags octet
+    while i + 2 <= #pco do
+        local id   = pco:byte(i) * 256 + pco:byte(i + 1)
+        local len  = pco:byte(i + 2)
+        local body = i + 3
+        if body + len - 1 > #pco then break end   -- truncated container
+        if id == PCO_PCSCF_IPV4 and len >= 4 then
+            return ("%d.%d.%d.%d"):format(pco:byte(body), pco:byte(body + 1),
+                                          pco:byte(body + 2), pco:byte(body + 3))
+        end
+        i = body + len
+    end
+    return nil
+end
+
+-- Build the UE's initial (unprotected) IMS REGISTER toward the P-CSCF
+-- (TS 24.229 / RFC 3261): the Request-URI is the home domain, Via and
+-- Contact carry the UE's own (PAA) address, and an empty AKAv1-MD5
+-- Authorization advertises IMS-AKA so a live P-CSCF would answer 401.
+-- Here it is the datapath probe payload -- a real SIP packet riding the
+-- IMS signalling bearer in place of an opaque datagram.
+local function build_register(ue_addr)
+    return sip.Builder()
+        :request(sip.REGISTER, "sip:" .. ims_realm)
+        :header(sip.H_VIA,
+                ("SIP/2.0/UDP %s:%d;branch=z9hG4bK-%s"):format(ue_addr, PCSCF_SIP_PORT, imsi))
+        :header_u32(sip.H_MAX_FORWARDS, 70)
+        :header(sip.H_FROM, ("<%s>;tag=%s"):format(impu, imsi))
+        :header(sip.H_TO, ("<%s>"):format(impu))
+        :header(sip.H_CALL_ID, ("%s@%s"):format(imsi, ue_addr))
+        :header(sip.H_CSEQ, "1 REGISTER")
+        :header(sip.H_CONTACT, ("<sip:%s:%d>"):format(ue_addr, PCSCF_SIP_PORT))
+        :header_u32(sip.H_EXPIRES, 600000)
+        :header(sip.H_AUTHORIZATION,
+                ('Digest username="%s",realm="%s",uri="sip:%s",nonce="",response="",algorithm=AKAv1-MD5')
+                    :format(impi, ims_realm, ims_realm))
+        :done()
+end
+
 -- Step the loop until the in-flight transaction resolves: a response
 -- sets st.done, an N3 timeout or a rejection sets st.err. The endpoint's
 -- own retransmission timer guarantees step() cannot block forever.
@@ -144,9 +227,23 @@ end
 -- ---- GTPv2-C over S5/S8 ----------------------------------------------
 
 local function attach_pdn_over_s5()
+    -- Fill the SGW address from the GTP-U interface when it was left at the
+    -- any-address: 0.0.0.0 there gives an invalid outer source and S5/S8
+    -- F-TEID address, which breaks user-plane addressing and FIB source
+    -- selection. The GTP-U interface is the uplink, so its IP is the SGW's.
+    local gtpu_ifname = os.getenv("GTPU_IFACE") or "eth0"
+    local sgw_auto = false
+    if sgw_ip == "0.0.0.0" then
+        local ip = iface_ipv4(gtpu_ifname)
+        if ip then sgw_ip, sgw_auto = ip, true end
+    end
+
     local pgw_ip = resolve(pgw_host)
     banner(("GTPv2-C — PDN connection over S5/S8: SGW %s -> PGW %s")
         :format(sgw_ip, pgw_ip))
+    if sgw_auto then
+        line("SGW address", ("%s (auto from %s)"):format(sgw_ip, gtpu_ifname))
+    end
     if pgw_ip ~= pgw_host then
         line("PGW address", ("%s -> %s"):format(pgw_host, pgw_ip))
     end
@@ -160,7 +257,7 @@ local function attach_pdn_over_s5()
     ep:set_t3_ms(T3_MS)
     ep:set_n3(N3)
 
-    local st = { done = false, err = nil, ue_addr = nil }
+    local st = { done = false, err = nil, ue_addr = nil, peers = {}, bearers = {} }
 
     -- ---- GTP-U user plane (eBPF datapath) ----
     -- Load the datapath when the kernel and privileges allow it; attach its
@@ -168,9 +265,10 @@ local function attach_pdn_over_s5()
     -- given. Everything degrades to a log line if the datapath, the caps or
     -- the interfaces are missing, so an unprivileged run still completes.
     local up
+    local inner_name = os.getenv("GTPU_INNER_IFACE") or "eth0" -- access side (encap egress)
     if gtp.UserPlane.supported() then
-        local gi = iface_index(os.getenv("GTPU_IFACE"))        -- S5/S8-U (GTP-U) side
-        local ii = iface_index(os.getenv("GTPU_INNER_IFACE"))  -- access side
+        local gi = iface_index(gtpu_ifname)        -- S5/S8-U (GTP-U) side
+        local ii = iface_index(inner_name)  -- access side
         local cfg = gtp.UserPlaneConfig()
         cfg.pin_dir        = ""        -- no bpffs pinning: a fresh datapath each run
         cfg.local_v4       = sgw_ip    -- outer source address for encapsulated uplink
@@ -182,7 +280,7 @@ local function attach_pdn_over_s5()
                 local aok, aerr = pcall(function() up:attach(gi or 0, ii or 0) end)
                 line("GTP-U datapath", aok
                     and ("attached (gtpu=%s inner=%s)")
-                        :format(os.getenv("GTPU_IFACE") or "-", os.getenv("GTPU_INNER_IFACE") or "-")
+                        :format(gi and gtpu_ifname or "-", inner_name or "-")
                     or ("attach failed: " .. why(aerr)))
             else
                 line("GTP-U datapath", "loaded (set GTPU_IFACE/GTPU_INNER_IFACE to attach TC)")
@@ -211,6 +309,181 @@ local function attach_pdn_over_s5()
             and ("EBI %d  ul TEID %#x / dl TEID %#x @ %s programmed")
                 :format(ebi, local_teid, remote_teid, remote_addr)
             or ("EBI %d add_tunnel failed: %s"):format(ebi, why(perr)))
+        if pok then
+            st.peers[remote_addr] = true                -- outer next hop to prime
+            st.bearers[#st.bearers + 1] =
+                { ebi = ebi, teid = local_teid, port = DEFAULT_UE_PORT,
+                  kind = "default", dst = st.ue_addr }
+        end
+    end
+
+    -- Program a dedicated bearer as a TFT (traffic filter) instead of a
+    -- second default-bearer tunnel. The filter steers inner packets with a
+    -- matching {proto, dst addr, dst port} onto this bearer's own TEID
+    -- pair. For the IMS signalling bearer that destination is the P-CSCF on
+    -- the SIP port, so uplink SIP toward the P-CSCF classifies onto it; the
+    -- TFT is probed before the default bearer's UE /32 LPM entry, so the
+    -- two coexist rather than colliding on the same key (which is why a
+    -- plain add_tunnel here returned "already installed"). The encap
+    -- datapath keys the TX maps on the inner *destination*, so dst_addr
+    -- fills the Tunnel's ue_addr (its classification-address) slot.
+    local function program_filter(ebi, local_teid, remote_teid, remote_addr,
+                                  proto, dst_addr, dst_port)
+        if not up then return end
+        if not (dst_addr and dst_addr ~= "" and remote_addr and remote_addr ~= "") then
+            line("GTP-U filter", ("EBI %d not programmed (missing P-CSCF/peer address)"):format(ebi))
+            return
+        end
+        local t = gtp.Tunnel()
+        t.local_teid, t.remote_teid = local_teid, remote_teid
+        t.ebi, t.ue_addr, t.remote_addr = ebi, dst_addr, remote_addr
+        local f = gtp.TrafficFilter()
+        f.tunnel  = t
+        f.proto   = proto
+        f.ue_port = dst_port           -- inner dst port; host order, loader htons
+        local pok, perr = pcall(function() up:add_filter(f) end)
+        line("GTP-U filter", pok
+            and ("EBI %d  ul TEID %#x / dl TEID %#x @ %s  proto %d -> %s:%d")
+                :format(ebi, local_teid, remote_teid, remote_addr, proto, dst_addr, dst_port)
+            or ("EBI %d add_filter failed: %s"):format(ebi, why(perr)))
+        if pok then
+            st.peers[remote_addr] = true
+            st.bearers[#st.bearers + 1] =
+                { ebi = ebi, teid = local_teid, port = dst_port,
+                  kind = "dedicated", dst = dst_addr }
+        end
+    end
+
+    -- Confirm the eBPF encap path by driving one burst at each programmed
+    -- bearer. encap classifies on the inner *destination* (gtpu_kern.c keys
+    -- the TX maps on ip->daddr and, for a TFT, the dst port), so a packet
+    -- to a bearer's destination on its port is exactly what that bearer
+    -- tunnels towards the PGW: an opaque datagram to the UE address on the
+    -- default bearer, and a real SIP REGISTER to the P-CSCF on the IMS
+    -- signalling bearer. Counters are read per TEID: tx_pkts moving proves
+    -- classify + encapsulate + redirect ran on that bearer; err_tx_no_neigh
+    -- moving proves the classifier matched but the outer L2 could not be
+    -- resolved (prime the peer or set a static MAC).
+    local function confirm_user_plane()
+        if not up then return end                       -- datapath not loaded
+        if not st.ue_addr then
+            return line("user-plane probe", "skipped (no UE address assigned)")
+        end
+        if not inner_name or inner_name == "" then
+            return line("user-plane probe",
+                        "skipped (set GTPU_INNER_IFACE so encap is attached)")
+        end
+        if #st.bearers == 0 then
+            return line("user-plane probe", "skipped (no bearers programmed)")
+        end
+
+        -- A probe only has to physically egress the interface encap is
+        -- attached to; encap classifies on the inner headers, so the L2
+        -- next hop is irrelevant. In a single-NIC setup the default route
+        -- already carries this traffic out that interface, so we steer
+        -- nothing -- forcing an on-link /32 route instead would make the
+        -- kernel ARP the destination and drop the packet before it reaches
+        -- TC egress. We only warn if it would leave elsewhere.
+        local function route_dev(dst)
+            local p = io.popen(("ip route get %s 2>/dev/null"):format(dst))
+            if not p then return nil end
+            local out = p:read("*a") or ""; p:close()
+            return out:match("dev%s+(%S+)")
+        end
+
+        -- Prime the neighbour table for each PGW/UPF peer. encap resolves
+        -- the outer L2 with bpf_fib_lookup, which only *reads* the neighbour
+        -- table -- it never triggers ARP -- so on a cold start the peer's
+        -- MAC is not yet cached and the first encapsulated packets hit
+        -- err_tx_no_neigh. A throwaway datagram makes the kernel resolve it.
+        local prime = net.UdpSocket("0.0.0.0", 0)
+        for peer in pairs(st.peers) do
+            pcall(function() prime:sendto("x", peer, 2152) end)
+        end
+        prime:close()
+        loop:step(100)                                   -- let ARP complete
+
+        -- The IMS signalling bearer carries a real SIP REGISTER toward the
+        -- P-CSCF; every other bearer keeps an opaque datagram to the UE.
+        local register = st.pcscf and build_register(st.ue_addr)
+
+        -- Two sending sockets, because the two bearers need opposite inner
+        -- sources:
+        --   * SIP bearer -> the REGISTER must look like uplink traffic
+        --     *from the UE*, so its inner source has to be the PAA (not the
+        --     SGW address, which is also the outer GTP-U source -- the very
+        --     thing that looked wrong on the wire). The SGW does not own
+        --     the PAA, so open the socket with a non-local source (the
+        --     fourth UdpSocket arg -> IP_FREEBIND + IP_TRANSPARENT): the
+        --     kernel then binds and *sends* from an address it does not
+        --     own, without adding it, and being setsockopts it works where
+        --     /proc/sys is read-only (a default Docker mount). Needs
+        --     CAP_NET_ADMIN.
+        --   * default bearer -> its destination is the UE itself, so a
+        --     UE-sourced datagram would be UE->UE and the UPF would route
+        --     it straight back down the tunnel (a TTL-bounded loop). Keep
+        --     it SGW-sourced: the UPF drops it as source-spoofed, so it
+        --     confirms our encap without looping. Its payload is opaque, so
+        --     the "wrong" source there is immaterial.
+        local sgw_sock = net.UdpSocket("0.0.0.0", 0)     -- inner source = SGW
+        local ue_sock
+        local bok, s = pcall(function()
+            return net.UdpSocket(st.ue_addr, 0, false, true)  -- non-local source = UE PAA
+        end)
+        if bok then ue_sock = s end
+        line("user-plane probe", ue_sock
+            and ("SIP inner source %s (UE)"):format(st.ue_addr)
+            or  "SIP inner source = SGW (UE PAA bind refused; need CAP_NET_ADMIN)")
+
+        for _, b in ipairs(st.bearers) do
+            local dst     = b.dst or st.ue_addr
+            local sip_msg = (b.kind == "dedicated")
+            local payload = sip_msg and register or "pro2call gtp-u probe"
+            local sock    = (sip_msg and ue_sock) or sgw_sock
+            local what    = sip_msg and ("SIP REGISTER -> P-CSCF %s"):format(dst)
+                            or ("datagram -> UE %s"):format(dst)
+
+            if sip_msg and not payload then
+                line("user-plane probe",
+                     ("EBI %d skipped (no P-CSCF address to REGISTER to)"):format(b.ebi))
+            else
+                local dev = route_dev(dst)
+                if dev and dev ~= inner_name then
+                    line("user-plane probe", ("note: %s routes via %s, not %s -- add a "
+                         .. "route so it reaches encap"):format(dst, dev, inner_name))
+                end
+
+                local s0 = up:stats(b.teid)
+                local sok, serr = pcall(function()
+                    for _ = 1, 3 do sock:sendto(payload, dst, b.port) end
+                end)
+                loop:step(50)                            -- let the TC program run
+                if not sok then
+                    line("user-plane probe",
+                         ("EBI %d send failed: %s"):format(b.ebi, why(serr)))
+                else
+                    local s1  = up:stats(b.teid)
+                    local dtx = s1.tx_pkts - s0.tx_pkts
+                    local dby = s1.tx_bytes - s0.tx_bytes
+                    local dng = s1.err_tx_no_neigh - s0.err_tx_no_neigh
+                    if dtx > 0 then
+                        line("user-plane probe",
+                             ("EBI %d %s (TEID %#x port %d) OK -- encapsulated %d pkt / %d B")
+                                 :format(b.ebi, what, b.teid, b.port, dtx, dby))
+                    elseif dng > 0 then
+                        line("user-plane probe",
+                             ("EBI %d %s matched but no outer L2 (err_tx_no_neigh +%d); "
+                              .. "prime the peer or set a static MAC"):format(b.ebi, what, dng))
+                    else
+                        line("user-plane probe",
+                             ("EBI %d %s no counter movement -- dst %s port %d not steered "
+                              .. "here (did the datagram reach encap?)"):format(b.ebi, what, dst, b.port))
+                    end
+                end
+            end
+        end
+        sgw_sock:close()
+        if ue_sock then ue_sock:close() end
     end
 
     ep:set_handler({
@@ -223,8 +496,10 @@ local function attach_pdn_over_s5()
             end
             st.pgw_ctrl_teid = sess:remote_teid()  -- to address later responses to the PGW
             if rsp.has_paa then st.ue_addr = rsp.paa.addr4 end
+            if rsp.pco and #rsp.pco > 0 then st.pcscf = pco_pcscf_v4(rsp.pco) end
             line("<- Create Session Resp", ("accepted; PGW ctrl TEID %#x"):format(sess:remote_teid()))
             if st.ue_addr then line("PAA (UE address)", st.ue_addr) end
+            line("P-CSCF (from PCO)", st.pcscf or "not returned")
             st.done = true
         end,
 
@@ -290,10 +565,18 @@ local function attach_pdn_over_s5()
 
             -- Program the dedicated bearer's tunnel too: our uplink TEID is
             -- the one we just handed the PGW; its downlink endpoint is the
-            -- PGW F-TEID carried in the request.
-            if pgw_u then
+            -- PGW F-TEID carried in the request. The TFT steers UDP toward
+            -- the P-CSCF (from the Create Session PCO) onto this bearer, so
+            -- the SIP REGISTER probe lands here rather than on the default.
+            if pgw_u and st.pcscf then
                 local rteid, raddr = fteid_v4_decode(pgw_u)
-                if rteid then program_tunnel(NEW_EBI, S5_UP_TEID + 1, rteid, raddr) end
+                if rteid then
+                    program_filter(NEW_EBI, S5_UP_TEID + 1, rteid, raddr,
+                                   IPPROTO_UDP, st.pcscf, PCSCF_SIP_PORT)
+                end
+            elseif pgw_u then
+                line("GTP-U filter",
+                     ("EBI %d not programmed (no P-CSCF IPv4 in Create Session PCO)"):format(NEW_EBI))
             end
             st.cbr_done = true
         end,
@@ -323,6 +606,13 @@ local function attach_pdn_over_s5()
     req.has_paa      = true
     req.paa.pdn_type = gtp.GTP2_PDN_IPV4
     req.paa.addr4    = "0.0.0.0"
+
+    -- Protocol Configuration Options (§8.13): request the IMS P-CSCF IPv4
+    -- address. Octet 1 flags the PPP/IP configuration protocol (0x80);
+    -- one empty container follows -- P-CSCF IPv4 Address Request (0x000C)
+    -- -- which the PGW echoes back carrying the address(es) it assigned.
+    req.pco = string.char(0x80, math.floor(PCO_PCSCF_IPV4 / 256),
+                          PCO_PCSCF_IPV4 % 256, 0x00)
 
     local c = gtp.Fteid()
     c.if_type = gtp.GTP2_IF_S5S8C_SGW               -- sender F-TEID: SGW S5/S8-C
@@ -356,6 +646,9 @@ local function attach_pdn_over_s5()
             line("note", "no Create Bearer Request arrived within 10s")
         end
     end
+
+    -- Push a synthetic UE datagram through each bearer and read counters.
+    confirm_user_plane()
 
     return { loop = loop, ep = ep, sess = sess, st = st, up = up, ue_addr = st.ue_addr }
 end

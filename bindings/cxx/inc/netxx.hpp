@@ -146,9 +146,12 @@ class UdpSocket
   public:
     /* Binds local_host:local_port. Host "" (or "0.0.0.0"/"::") is the
      * any-address, port 0 an ephemeral one; reuseport sets SO_REUSEPORT
-     * for multi-socket load spreading. Throws Error on failure. */
+     * for multi-socket load spreading. nonlocal_src sets IP_FREEBIND +
+     * IP_TRANSPARENT so a source address this host does not own (e.g. a
+     * simulated UE's PDN address) can be both bound and sent from — needs
+     * CAP_NET_ADMIN. Throws Error on failure. */
     UdpSocket(const std::string& local_host = "", uint16_t local_port = 0,
-              bool reuseport = false);
+              bool reuseport = false, bool nonlocal_src = false);
     ~UdpSocket();
     UdpSocket(const UdpSocket&)            = delete;
     UdpSocket& operator=(const UdpSocket&) = delete;
