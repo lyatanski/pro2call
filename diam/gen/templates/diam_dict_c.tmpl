@@ -1,0 +1,116 @@
+{{- /* Diameter dictionary layer: tables. Data is Model. */ -}}
+/* Diameter dictionary — generated at build time by diamgen from
+ * {{.Spec.Doc}} ({{.Spec.Release}}). DO NOT EDIT; change diam/gen
+ * (the dictionaries, curation or templates) instead. */
+
+#include "diam_dict.h"
+#include "diam.h"
+
+/* Sorted by (vendor_id, code) for the binary search below. */
+static const diam_dict_entry_t diam_dict[] = {
+{{- range .Avps}}
+    { {{.Enum}}, {{.VendorExpr}}, {{.TypeEnum}}, {{.FlagsExpr}}, "{{cstr .Name}}" },
+{{- end}}
+};
+
+enum { DIAM_DICT_N = sizeof diam_dict / sizeof diam_dict[0] };
+
+const diam_dict_entry_t* diam_dict_get(uint32_t code, uint32_t vendor_id)
+{
+    size_t lo = 0, hi = DIAM_DICT_N;
+    while (lo < hi) {
+        const size_t mid = lo + (hi - lo) / 2;
+        const diam_dict_entry_t* e = &diam_dict[mid];
+        if (e->vendor_id < vendor_id ||
+            (e->vendor_id == vendor_id && e->code < code)) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    if (lo < DIAM_DICT_N &&
+        diam_dict[lo].code == code && diam_dict[lo].vendor_id == vendor_id) {
+        return &diam_dict[lo];
+    }
+    return 0;
+}
+
+size_t diam_dict_count(void)
+{
+    return DIAM_DICT_N;
+}
+
+const diam_dict_entry_t* diam_dict_at(size_t i)
+{
+    return i < DIAM_DICT_N ? &diam_dict[i] : 0;
+}
+
+const char* diam_avp_name(uint32_t code, uint32_t vendor_id)
+{
+    const diam_dict_entry_t* e = diam_dict_get(code, vendor_id);
+    return e ? e->name : 0;
+}
+
+static const struct { uint32_t code; const char* name; } diam_cmds[] = {
+{{- range .Cmds}}
+    { {{.Enum}}, "{{cstr .Name}}" },
+{{- end}}
+};
+
+const char* diam_cmd_name(uint32_t cmd_code)
+{
+    for (size_t i = 0; i < sizeof diam_cmds / sizeof diam_cmds[0]; i++) {
+        if (diam_cmds[i].code == cmd_code) return diam_cmds[i].name;
+    }
+    return 0;
+}
+
+static const struct { uint32_t id; const char* name; } diam_apps[] = {
+{{- range .Apps}}
+    { {{.Enum}}, "{{cstr .Name}}" },
+{{- end}}
+};
+
+const char* diam_app_name(uint32_t app_id)
+{
+    for (size_t i = 0; i < sizeof diam_apps / sizeof diam_apps[0]; i++) {
+        if (diam_apps[i].id == app_id) return diam_apps[i].name;
+    }
+    return 0;
+}
+
+/* Sorted by (vendor_id, code, value) for the binary search below. */
+static const struct {
+    uint32_t    vendor_id;
+    uint32_t    code;
+    int32_t     value;
+    const char* name;
+} diam_values[] = {
+{{- range .Values}}
+    { {{.VendorExpr}}, {{.Code}}, {{.Value}}, "{{cstr .Name}}" },
+{{- end}}
+};
+
+enum { DIAM_VALUES_N = sizeof diam_values / sizeof diam_values[0] };
+
+const char* diam_enum_name(uint32_t code, uint32_t vendor_id, int32_t value)
+{
+    size_t lo = 0, hi = DIAM_VALUES_N;
+    while (lo < hi) {
+        const size_t mid = lo + (hi - lo) / 2;
+        if (diam_values[mid].vendor_id < vendor_id ||
+            (diam_values[mid].vendor_id == vendor_id &&
+             (diam_values[mid].code < code ||
+              (diam_values[mid].code == code && diam_values[mid].value < value)))) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    if (lo < DIAM_VALUES_N &&
+        diam_values[lo].vendor_id == vendor_id &&
+        diam_values[lo].code == code && diam_values[lo].value == value) {
+        return diam_values[lo].name;
+    }
+    return 0;
+}

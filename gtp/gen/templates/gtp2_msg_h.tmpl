@@ -1,0 +1,39 @@
+/* Typed GTPv2-C messages — {{.Spec.Doc}} V{{.Spec.Release}}. */
+#ifndef GTP2_MSG_H
+#define GTP2_MSG_H
+
+#include "gtp2.h"
+#include "gtp2_ie.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+{{range .Messages}}
+/* {{.M.Name}} — §{{.M.Section}}.{{if .M.Comment}} {{.M.Comment}}.{{end}} */
+typedef struct {
+    uint32_t sequence;
+{{- if not .NoTeid}}
+    uint32_t teid;
+{{- end}}
+{{- range .Flds}}
+{{include (printf "%s_decl_%s" .P .Kind) .}}
+{{- end}}
+} {{.CType}};
+{{end}}
+
+{{- range .Messages}}
+API_EXPORT int {{$.P}}_{{.Stem}}_encode(uint8_t* buf, size_t cap, const {{.CType}}* m);
+API_EXPORT int {{$.P}}_{{.Stem}}_decode(const uint8_t* buf, size_t len, {{.CType}}* out);
+{{- end}}
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* GTP2_MSG_H */
+
+{{- /* ---- field declaration block ---- */ -}}
+
+{{define "gtp2_decl_view"}}    {{.P}}_view_t {{.Field}};{{if .Comment}}   /* {{.Comment}} */{{else if .IEName}}   /* {{.IEName}} */{{end}}
+{{- end}}

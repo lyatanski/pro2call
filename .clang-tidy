@@ -1,0 +1,32 @@
+# Static-analysis baseline for the manual `tidy` target and the
+# -DENABLE_CLANG_TIDY=ON per-compile mode (cmake/ClangTools.cmake).
+#
+# Readability checks that fight the house style are off: guard clauses
+# are written without braces, protocol codecs are full of wire-format
+# constants, and short names (it, w, rc) are idiomatic here. Recursion
+# is used deliberately (nested/grouped TLVs).
+#
+# Generated trees (diam/gen, gtp/v*/gen) override this file with their
+# own .clang-tidy; SWIG wrapper targets are opted out where they are
+# defined (bindings/CMakeLists.txt).
+---
+Checks: >
+  bugprone-*,
+  clang-analyzer-*,
+  misc-*,
+  performance-*,
+  portability-*,
+  readability-*,
+  -bugprone-easily-swappable-parameters,
+  -misc-no-recursion,
+  -readability-braces-around-statements,
+  -readability-else-after-return,
+  -readability-function-cognitive-complexity,
+  -readability-identifier-length,
+  -readability-isolate-declaration,
+  -readability-magic-numbers,
+  -clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling
+WarningsAsErrors: ''
+HeaderFilterRegex: '/(task|net|sip|sdp|rtp|xfrm|diam)/inc/|/gtp/(u|v1|v2)/inc/|/bindings/cxx/inc/'
+FormatStyle: file
+...

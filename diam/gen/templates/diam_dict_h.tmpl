@@ -1,0 +1,98 @@
+{{- /* Diameter dictionary layer: header. Data is Model. */ -}}
+#ifndef DIAM_DICT_H
+#define DIAM_DICT_H
+
+#include <stddef.h>
+#include <stdint.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* Diameter dictionary — generated at build time by diamgen from
+ * {{.Spec.Doc}} ({{.Spec.Release}}). DO NOT EDIT; change diam/gen
+ * (the dictionaries, curation or templates) instead.
+ *
+ * Application ids, command codes, AVP codes and per-AVP metadata
+ * (vendor, data type, default flags) for the covered applications.
+ * The dictionary is data only; the wire codec lives in diam.h.
+ */
+
+/* AVP data types — RFC 6733 §4.2 (basic) and §4.3 (derived). */
+typedef enum {
+{{- range $i, $t := .Types}}
+    {{$t.Enum}}{{if not $i}} = 0{{end}},
+{{- end}}
+} diam_avp_type_t;
+
+/* Vendor ids (SMI enterprise numbers) referenced by the dictionary. */
+enum {
+{{- range .Vendors}}
+    {{.Enum}} = {{.ID}},   /* {{.Name}} */
+{{- end}}
+};
+
+/* Application ids. */
+typedef enum {
+{{- range .Apps}}
+    {{.Enum}} = {{.ID}},{{if .Comment}}   /* {{.Comment}} */{{end}}
+{{- end}}
+} diam_app_t;
+
+/* Command codes (one value covers the request/answer pair). */
+typedef enum {
+{{- range .Cmds}}
+    {{.Enum}} = {{.Code}},{{if .Comment}}   /* {{.Comment}} */{{end}}
+{{- end}}
+} diam_cmd_t;
+
+/* AVP codes. Vendor AVPs keep their vendor in the dictionary entry;
+ * the code alone is not unique across vendors. */
+enum {
+{{- range .Avps}}
+    {{.Enum}} = {{.Code}},{{if .Comment}}   /* {{.Comment}} */{{end}}
+{{- end}}
+};
+{{range .Enums}}
+/* {{.AvpName}} values. */
+enum {
+{{- range .Consts}}
+    {{.Name}} = {{.Value}},
+{{- end}}
+};
+{{end}}
+/* One dictionary entry. flags holds the AVP flags the defining spec
+ * requires on the wire (V for vendor AVPs, M where the spec says the
+ * M bit must be set). */
+typedef struct {
+    uint32_t    code;
+    uint32_t    vendor_id;
+    uint8_t     type;       /* diam_avp_type_t */
+    uint8_t     flags;      /* DIAM_AVP_F_* */
+    const char* name;
+} diam_dict_entry_t;
+
+/* Lookup by (code, vendor id); NULL when unknown. vendor_id 0 is the
+ * standard (IETF) registry. */
+API_EXPORT const diam_dict_entry_t* diam_dict_get(uint32_t code,
+                                                  uint32_t vendor_id);
+
+/* Whole-registry iteration, e.g. for listings in bindings. */
+API_EXPORT size_t diam_dict_count(void);
+API_EXPORT const diam_dict_entry_t* diam_dict_at(size_t i);
+
+/* Name tables; NULL when unknown. */
+API_EXPORT const char* diam_avp_name(uint32_t code, uint32_t vendor_id);
+API_EXPORT const char* diam_cmd_name(uint32_t cmd_code);
+API_EXPORT const char* diam_app_name(uint32_t app_id);
+
+/* Enumerated value name, e.g. (CC-Request-Type, 0, 1) ->
+ * "INITIAL_REQUEST"; NULL when unknown. */
+API_EXPORT const char* diam_enum_name(uint32_t code, uint32_t vendor_id,
+                                      int32_t value);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* DIAM_DICT_H */

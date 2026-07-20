@@ -1,0 +1,34 @@
+# House style: Linux/K&R braces (functions open on their own line,
+# control statements attach), 4-space indent, pointers bound to the
+# type, hand-aligned assignment/declaration/comment columns, guard
+# clauses on one line (`if (rc) return rc;`).
+---
+Language: Cpp
+BasedOnStyle: LLVM
+IndentWidth: 4
+ContinuationIndentWidth: 4
+ColumnLimit: 80
+BreakBeforeBraces: Linux
+PointerAlignment: Left
+AlignConsecutiveAssignments: true
+AlignConsecutiveDeclarations: true
+AlignConsecutiveMacros: true
+AlignConsecutiveShortCaseStatements:
+  Enabled: true
+  AcrossComments: true
+AlignTrailingComments: true
+AlignEscapedNewlines: Left
+AllowShortIfStatementsOnASingleLine: AllIfsAndElse
+AllowShortCaseLabelsOnASingleLine: true
+AllowShortFunctionsOnASingleLine: None
+AllowShortLoopsOnASingleLine: false
+IndentCaseLabels: false
+KeepEmptyLinesAtTheStartOfBlocks: false
+# Braced initializers keep inner spaces: { 10, 0, 0, 1 }.
+Cpp11BracedListStyle: false
+# task/inc/test.h spec/context/it blocks read like control statements;
+# keep their braces attached (`spec("name") {`).
+ForEachMacros: [spec, context, it, it1, it2, xit]
+# Include order is intentional (module header first, then system).
+SortIncludes: Never
+...

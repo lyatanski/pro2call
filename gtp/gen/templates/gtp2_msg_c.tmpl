@@ -1,0 +1,131 @@
+/* Generated at build time by gtpgen from {{.Spec.Doc}} V{{.Spec.Release}} */
+
+#include "gtp2_msg.h"
+#include "endian.h"
+
+#include <string.h>
+
+/* ---- Shared helpers ---- */
+
+static void view_set(gtp2_view_t* v, const gtp2_ie_view_t* ie)
+{
+    v->data = ie->value;
+    v->len  = ie->len;
+}
+
+static void view_put(gtp2_wbuf_t* w, uint8_t type, uint8_t instance,
+                     gtp2_view_t v)
+{
+    if (v.data) gtp2_ie_put(w, type, instance, v.data, v.len);
+}
+
+static int msg_hdr_put(gtp2_wbuf_t* w, uint8_t message_type, bool has_teid,
+                       uint32_t teid, uint32_t sequence)
+{
+    const gtp2_hdr_t h = {
+        .version      = GTP2_VERSION,
+        .has_teid     = has_teid,
+        .message_type = message_type,
+        .teid         = teid,
+        .sequence     = sequence,
+    };
+    const int rc = gtp2_hdr_encode(w->buf, w->cap, &h);
+    if (rc < 0) return rc;
+    w->off = (size_t)rc;
+    return GTP2_OK;
+}
+
+static int msg_hdr_parse(const uint8_t* buf, size_t len, uint8_t message_type,
+                         bool want_teid, gtp2_hdr_t* h)
+{
+    const int hlen = gtp2_hdr_decode(buf, len, h);
+    if (hlen < 0) return hlen;
+    if (TASK_UNLIKELY(h->message_type != message_type)) return GTP2_E_INVAL;
+    if (TASK_UNLIKELY(h->has_teid != want_teid)) return GTP2_E_INVAL;
+    return hlen;
+}
+
+{{ range .Messages }}
+/* ---- {{.M.Name}} — §{{.M.Section}} ---- */
+
+int {{$.P}}_{{.Stem}}_encode(uint8_t* buf, size_t cap, const {{.CType}}* m)
+{
+    if (TASK_UNLIKELY(!buf || !m)) return GTP2_E_INVAL;
+{{- if .EncPre}}
+    if (TASK_UNLIKELY({{range $i, $e := .EncPre}}{{if $i}} || {{end}}{{$e}}{{end}}))
+        return GTP2_E_MISSING;
+{{- end}}
+
+    gtp2_wbuf_t w;
+    gtp2_wbuf_init(&w, buf, cap);
+
+    int rc = msg_hdr_put(&w, {{.MTEnum}}, {{if .NoTeid}}false, 0{{else}}true, m->teid{{end}},
+                         m->sequence);
+    if (rc) return rc;
+{{range .Flds}}{{include (printf "%s_enc_%s" .P .Kind) .}}
+{{end}}
+    rc = gtp2_hdr_finalize(&w, 0);
+    if (rc) return rc;
+    return (int)w.off;
+}
+
+int {{$.P}}_{{.Stem}}_decode(const uint8_t* buf, size_t len, {{.CType}}* out)
+{
+    if (TASK_UNLIKELY(!buf || !out)) return GTP2_E_INVAL;
+
+    gtp2_hdr_t h;
+    const int hlen =
+        msg_hdr_parse(buf, len, {{.MTEnum}}, {{if .NoTeid}}false{{else}}true{{end}}, &h);
+    if (hlen < 0) return hlen;
+
+    memset(out, 0, sizeof *out);
+{{- if not .NoTeid}}
+    out->teid     = h.teid;
+{{- end}}
+    out->sequence = h.sequence;
+
+    gtp2_ie_iter_t it;
+    gtp2_ie_iter_init(&it, buf + hlen, (size_t)h.length + 4 - (size_t)hlen);
+
+    gtp2_ie_view_t ie;
+    while (gtp2_ie_iter_next(&it, &ie)) {
+        switch (ie.type) {
+{{- range .Cases}}
+        case {{.IEEnum}}: {{if .IEName}}/* {{.IEName}} */{{end}}{
+{{include "gtp2_case_body" .}}
+            break;
+        }
+{{- end}}
+        default:
+            break;
+        }
+    }
+{{- if .DecMiss}}
+    if ({{.DecMiss}}) return GTP2_E_MISSING;
+{{- end}}
+    return (int)h.length + 4;
+}
+{{ end }}
+
+{{- /* ---- decode case body: instance dispatch within one IE type ---- */ -}}
+
+{{define "gtp2_case_body"}}
+{{- $dv := .DV}}
+{{- if eq (len .Flds) 1}}
+{{- $f := withvar (index .Flds 0) $dv}}{{include (printf "%s_dec_%s" $f.P $f.Kind) $f}}
+{{- else}}
+{{- range $i, $f0 := .Flds}}{{$f := withvar $f0 $dv}}
+            {{if $i}}} else if{{else}}if{{end}} (ie.instance == {{$f.Instance}}) {
+{{include (printf "%s_dec_%s" $f.P $f.Kind) $f}}
+{{- end}}
+            }
+{{- end}}
+{{- end}}
+
+{{- /* ---- encode / decode blocks ---- */ -}}
+
+{{define "gtp2_enc_view"}}    view_put({{.W}}, {{.IEEnum}}, {{.Instance}}, {{.V}}->{{.Field}});
+{{- end}}
+
+{{define "gtp2_dec_view"}}            view_set(&{{.V}}->{{.Field}}, &ie);
+{{- end}}

@@ -1,0 +1,51 @@
+{{- /* GTPv1-C typed message layer: header. Data is Model. */ -}}
+#ifndef GTP1_MSG_H
+#define GTP1_MSG_H
+
+#include "gtp1.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* Message types — {{.Spec.Doc}} Table 1 (subset). */
+typedef enum {
+{{- range .MTs}}
+    {{.Enum}} = {{.Val}},
+{{- end}}
+} gtp1_mt_t;
+
+/* IE types — {{.Spec.Doc}} Table 37. */
+typedef enum {
+{{- range .IEs}}
+    {{$.U}}_IE_{{.CName}} = {{.Type}},{{if .Comment}}   /* {{.Comment}} */{{end}}
+{{- end}}
+} gtp1_ie_t;
+
+API_EXPORT extern const uint16_t gtp1_tv_len[128];
+{{range .Messages}}
+/* {{.M.Name}} — §{{.M.Section}}.{{if .M.Comment}} {{.M.Comment}}.{{end}} */
+typedef struct {
+    uint32_t teid;
+    uint16_t sequence;
+{{- range .Flds}}
+{{include (printf "%s_decl_%s" .P .Kind) .}}
+{{- end}}
+} {{.CType}};
+{{end}}
+
+{{- range .Messages}}
+API_EXPORT int {{$.P}}_{{.Stem}}_encode(uint8_t* buf, size_t cap, const {{.CType}}* m);
+API_EXPORT int {{$.P}}_{{.Stem}}_decode(const uint8_t* buf, size_t len, {{.CType}}* out);
+{{- end}}
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* GTP1_MSG_H */
+
+{{- /* ---- field declaration block ---- */ -}}
+
+{{define "gtp1_decl_view"}}    {{.P}}_view_t {{.Field}};{{if .Comment}}   /* {{.Comment}} */{{else if .IEName}}   /* {{.IEName}} */{{end}}
+{{- end}}

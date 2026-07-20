@@ -1,0 +1,150 @@
+/* Generated at build time by gtpgen from {{.Spec.Doc}} V{{.Spec.Release}} */
+
+#include "gtp1_msg.h"
+#include "endian.h"
+
+#include <string.h>
+
+/* Fixed value lengths of TV IEs — {{.Spec.Doc}} Table 37. The iterator
+ * cannot skip a TV IE it does not know, so this table is the complete
+ * TV registry of the pinned spec release. */
+const uint16_t gtp1_tv_len[128] = {
+{{- range .TVLen}}
+    [{{$.U}}_IE_{{.CName}}] = {{.Len}},
+{{- end}}
+};
+
+/* ---- Shared helpers ---- */
+
+static void view_set(gtp1_view_t* v, const gtp1_ie_view_t* ie)
+{
+    v->data = ie->value;
+    v->len  = ie->len;
+}
+
+static void view_put_tlv(gtp1_wbuf_t* w, uint8_t type, gtp1_view_t v)
+{
+    if (v.data) gtp1_ie_put_tlv(w, type, v.data, v.len);
+}
+
+static int msg_hdr_put(gtp1_wbuf_t* w, uint8_t message_type, uint32_t teid,
+                       uint16_t sequence)
+{
+    const gtp1_hdr_t h = {
+        .version      = GTP1_VERSION,
+        .pt           = true,
+        .s            = true,
+        .message_type = message_type,
+        .teid         = teid,
+        .sequence     = sequence,
+    };
+    const int rc = gtp1_hdr_encode(w->buf, w->cap, &h);
+    if (rc < 0) return rc;
+    w->off = (size_t)rc;
+    return GTP1_OK;
+}
+
+static int msg_hdr_parse(const uint8_t* buf, size_t len, uint8_t message_type,
+                         gtp1_hdr_t* h)
+{
+    const int off = gtp1_hdr_decode(buf, len, h);
+    if (off < 0) return off;
+    if (TASK_UNLIKELY(h->message_type != message_type)) return GTP1_E_INVAL;
+    return off;
+}
+
+{{ range .Messages }}
+/* ---- {{.M.Name}} — §{{.M.Section}} ---- */
+
+int {{$.P}}_{{.Stem}}_encode(uint8_t* buf, size_t cap, const {{.CType}}* m)
+{
+    if (TASK_UNLIKELY(!buf || !m)) return GTP1_E_INVAL;
+{{- if .EncPre}}
+    if (TASK_UNLIKELY({{range $i, $e := .EncPre}}{{if $i}} || {{end}}{{$e}}{{end}}))
+        return GTP1_E_MISSING;
+{{- end}}
+
+    gtp1_wbuf_t w;
+    gtp1_wbuf_init(&w, buf, cap);
+
+    int rc = msg_hdr_put(&w, {{.MTEnum}}, m->teid, m->sequence);
+    if (rc) return rc;
+    (void)rc;
+{{range .Flds}}{{include (printf "%s_enc_%s" .P .Kind) .}}
+{{end}}
+    rc = gtp1_hdr_finalize(&w, 0);
+    if (rc) return rc;
+    return (int)w.off;
+}
+
+int {{$.P}}_{{.Stem}}_decode(const uint8_t* buf, size_t len, {{.CType}}* out)
+{
+    if (TASK_UNLIKELY(!buf || !out)) return GTP1_E_INVAL;
+
+    gtp1_hdr_t h;
+    const int hlen = msg_hdr_parse(buf, len, {{.MTEnum}}, &h);
+    if (hlen < 0) return hlen;
+
+    memset(out, 0, sizeof *out);
+    out->teid     = h.teid;
+    out->sequence = h.sequence;
+{{- if .OccVars}}
+{{range .OccVars}}    unsigned {{.}} = 0;
+{{end}}{{end}}
+    gtp1_ie_iter_t it;
+    gtp1_ie_iter_init(&it, buf + hlen, (size_t)h.length + 8 - (size_t)hlen,
+                      gtp1_tv_len);
+
+    gtp1_ie_view_t ie;
+    while (gtp1_ie_iter_next(&it, &ie)) {
+        switch (ie.type) {
+{{- range .Cases}}
+        case {{.IEEnum}}: {
+{{include "gtp1_case_body" .}}
+            break;
+        }
+{{- end}}
+        default:
+            break;
+        }
+    }
+{{- if .DecMiss}}
+    if ({{.DecMiss}}) return GTP1_E_MISSING;
+{{- end}}
+    return (int)h.length + 8;
+}
+{{ end }}
+
+{{- /* ---- decode case body: occurrence dispatch within one IE type ---- */ -}}
+
+{{define "gtp1_case_body"}}
+{{- $dv := .DV}}
+{{- if eq (len .Flds) 1}}
+{{- $f := withvar (index .Flds 0) $dv}}{{include (printf "%s_dec_%s" $f.P $f.Kind) $f}}
+{{- else}}            switch ({{.OccVar}}++) {
+{{- range $i, $f0 := .Flds}}{{$f := withvar $f0 $dv}}
+            case {{$i}}: {
+{{include (printf "%s_dec_%s" $f.P $f.Kind) $f}}
+                break;
+            }
+{{- end}}
+            default:
+                break;
+            }
+{{- end}}
+{{- end}}
+
+{{- /* ---- encode / decode blocks ---- */ -}}
+
+{{define "gtp1_enc_view"}}
+{{- if .TV}}    if ({{.V}}->{{.Field}}.data) {
+        if (TASK_UNLIKELY({{.V}}->{{.Field}}.len != {{.FixedLen}}))
+            return GTP1_E_INVAL;   /* TV value length is fixed */
+        gtp1_ie_put_tv({{.W}}, {{.IEEnum}}, {{.V}}->{{.Field}}.data, {{.FixedLen}});
+    }
+{{- else}}    view_put_tlv({{.W}}, {{.IEEnum}}, {{.V}}->{{.Field}});
+{{- end}}
+{{- end}}
+
+{{define "gtp1_dec_view"}}            view_set(&{{.V}}->{{.Field}}, &ie);
+{{- end}}
