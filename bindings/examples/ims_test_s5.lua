@@ -16,10 +16,12 @@
 --
 -- With both interfaces attached the script then drives the datapath and
 -- reads the per-TEID kernel counters back, confirming the encap path end
--- to end without needing the PGW to answer: an opaque datagram on the
--- default bearer, and on the IMS signalling bearer a real SIP REGISTER
--- addressed to the P-CSCF whose address the PGW returned in the Create
--- Session Response PCO (TS 24.008 container 0x000C).
+-- to end: a real SIP REGISTER sent from the UE toward the P-CSCF, whose
+-- address the PGW returned in the Create Session Response PCO (TS 24.008
+-- container 0x000C). IMS signalling rides the default bearer, so the
+-- REGISTER is steered onto it and the UPF routes it to the P-CSCF; the
+-- dedicated (media) bearer from the Create Bearer Request is accepted but
+-- not probed.
 --
 
 local gtp = require("gtp")
@@ -48,9 +50,8 @@ local impi = os.getenv("IMS_IMPI") or ("%s@%s"):format(imsi, ims_realm)
 local S5_UP_TEID = 0x200       -- our (SGW) S5/S8-U downlink tunnel endpoint id
 local T3_MS, N3  = 1000, 3     -- retransmission: 1s T3-RESPONSE, up to 3 sends
 
-local IPPROTO_UDP    = 17      -- inner protocol used by the confirmation probe
-local DEFAULT_UE_PORT = 4096   -- probe port for the default bearer (matches no TFT)
-local PCSCF_SIP_PORT  = 5060   -- IMS signalling bearer TFT: SIP toward the P-CSCF
+local IPPROTO_UDP   = 17       -- inner protocol used by the confirmation probe
+local PCSCF_SIP_PORT = 5060    -- IMS signalling bearer TFT: SIP toward the P-CSCF
 
 local PCO_PCSCF_IPV4 = 0x000c  -- TS 24.008 §10.5.6.3 P-CSCF IPv4 Address container
 
@@ -151,19 +152,6 @@ local function fteid_v4(if_type, teid, addr)
                        oct(teid, 0x1000000), oct(teid, 0x10000),
                        oct(teid, 0x100), oct(teid, 1),
                        tonumber(a), tonumber(b), tonumber(c), tonumber(d))
-end
-
--- Inverse of fteid_v4: pull the 32-bit TEID and the IPv4 address out of an
--- F-TEID IE value, used to learn a peer's data-plane endpoint from a raw
--- message. Returns teid, addr; addr is nil when the V4 flag is clear.
-local function fteid_v4_decode(v)
-    if #v < 5 then return nil end
-    local teid = ((v:byte(2) * 256 + v:byte(3)) * 256 + v:byte(4)) * 256 + v:byte(5)
-    local addr
-    if math.floor(v:byte(1) / 0x80) % 2 == 1 and #v >= 9 then   -- V4 flag set
-        addr = ("%d.%d.%d.%d"):format(v:byte(6), v:byte(7), v:byte(8), v:byte(9))
-    end
-    return teid, addr
 end
 
 -- A GTPv2-C Cause IE value (§8.4): the cause octet plus a spare/flags
@@ -292,41 +280,16 @@ local function attach_pdn_over_s5()
         line("GTP-U datapath", "unsupported (non-eBPF build or missing CAP_BPF/CAP_NET_ADMIN)")
     end
 
-    -- Program one bearer's forwarding entry into the datapath (a no-op when
-    -- it is not loaded). Downlink packets to the UE address are encapsulated
-    -- to remote_teid @ remote_addr; uplink from local_teid is decapsulated.
-    local function program_tunnel(ebi, local_teid, remote_teid, remote_addr)
-        if not up then return end
-        if not (st.ue_addr and remote_addr and remote_addr ~= "") then
-            line("GTP-U tunnel", ("EBI %d not programmed (missing UE/peer address)"):format(ebi))
-            return
-        end
-        local t = gtp.Tunnel()
-        t.local_teid, t.remote_teid = local_teid, remote_teid
-        t.ebi, t.ue_addr, t.remote_addr = ebi, st.ue_addr, remote_addr
-        local pok, perr = pcall(function() up:add_tunnel(t) end)
-        line("GTP-U tunnel", pok
-            and ("EBI %d  ul TEID %#x / dl TEID %#x @ %s programmed")
-                :format(ebi, local_teid, remote_teid, remote_addr)
-            or ("EBI %d add_tunnel failed: %s"):format(ebi, why(perr)))
-        if pok then
-            st.peers[remote_addr] = true                -- outer next hop to prime
-            st.bearers[#st.bearers + 1] =
-                { ebi = ebi, teid = local_teid, port = DEFAULT_UE_PORT,
-                  kind = "default", dst = st.ue_addr }
-        end
-    end
-
-    -- Program a dedicated bearer as a TFT (traffic filter) instead of a
-    -- second default-bearer tunnel. The filter steers inner packets with a
-    -- matching {proto, dst addr, dst port} onto this bearer's own TEID
-    -- pair. For the IMS signalling bearer that destination is the P-CSCF on
-    -- the SIP port, so uplink SIP toward the P-CSCF classifies onto it; the
-    -- TFT is probed before the default bearer's UE /32 LPM entry, so the
-    -- two coexist rather than colliding on the same key (which is why a
-    -- plain add_tunnel here returned "already installed"). The encap
-    -- datapath keys the TX maps on the inner *destination*, so dst_addr
-    -- fills the Tunnel's ue_addr (its classification-address) slot.
+    -- Steer a bearer's uplink onto the datapath as a TFT (traffic filter):
+    -- inner packets matching {proto, dst addr, dst port} are encapsulated
+    -- on this bearer's TEID pair (local_teid @ our side, remote_teid @ the
+    -- PGW/UPF). IMS SIP signalling rides the default bearer, so the match
+    -- is UDP toward the P-CSCF on the SIP port -- the UE's uplink SIP then
+    -- classifies onto the default bearer's TEID, which the UPF's uplink PDR
+    -- routes on to the P-CSCF. The encap datapath keys the TX maps on the
+    -- inner *destination*, so dst_addr fills the Tunnel's ue_addr (its
+    -- classification-address) slot; add_filter also installs the matching
+    -- decap (rx) entry keyed on local_teid.
     local function program_filter(ebi, local_teid, remote_teid, remote_addr,
                                   proto, dst_addr, dst_port)
         if not up then return end
@@ -350,20 +313,20 @@ local function attach_pdn_over_s5()
             st.peers[remote_addr] = true
             st.bearers[#st.bearers + 1] =
                 { ebi = ebi, teid = local_teid, port = dst_port,
-                  kind = "dedicated", dst = dst_addr }
+                  kind = "signalling", dst = dst_addr }
         end
     end
 
-    -- Confirm the eBPF encap path by driving one burst at each programmed
-    -- bearer. encap classifies on the inner *destination* (gtpu_kern.c keys
-    -- the TX maps on ip->daddr and, for a TFT, the dst port), so a packet
-    -- to a bearer's destination on its port is exactly what that bearer
-    -- tunnels towards the PGW: an opaque datagram to the UE address on the
-    -- default bearer, and a real SIP REGISTER to the P-CSCF on the IMS
-    -- signalling bearer. Counters are read per TEID: tx_pkts moving proves
-    -- classify + encapsulate + redirect ran on that bearer; err_tx_no_neigh
-    -- moving proves the classifier matched but the outer L2 could not be
-    -- resolved (prime the peer or set a static MAC).
+    -- Confirm the eBPF encap path with a real SIP REGISTER from the UE to
+    -- the P-CSCF. encap classifies on the inner *destination* (gtpu_kern.c
+    -- keys the TX maps on ip->daddr and, for a TFT, the dst port), so a
+    -- packet to the P-CSCF on 5060 is exactly what the IMS signalling
+    -- bearer's TFT tunnels towards the PGW. Counters are read per TEID:
+    -- tx_pkts moving proves classify + encapsulate + redirect ran on that
+    -- bearer; err_tx_no_neigh moving proves the classifier matched but the
+    -- outer L2 could not be resolved (prime the peer or set a static MAC).
+    -- Only the signalling (default) bearer is probed; the dedicated media
+    -- bearer carries no probe traffic here.
     local function confirm_user_plane()
         if not up then return end                       -- datapath not loaded
         if not st.ue_addr then
@@ -403,50 +366,43 @@ local function attach_pdn_over_s5()
         prime:close()
         loop:step(100)                                   -- let ARP complete
 
-        -- The IMS signalling bearer carries a real SIP REGISTER toward the
-        -- P-CSCF; every other bearer keeps an opaque datagram to the UE.
+        -- The confirmation packet is a real SIP REGISTER from the UE toward
+        -- the P-CSCF (dst = P-CSCF), which the UPF accepts as uplink on the
+        -- default (IMS signalling) bearer and routes onward. That is the
+        -- only probe: the dedicated bearer is media (its own SDF), and a UE
+        -- /32 downlink entry is untestable against a real UPF, so neither is
+        -- fired at.
         local register = st.pcscf and build_register(st.ue_addr)
 
-        -- Two sending sockets, because the two bearers need opposite inner
-        -- sources:
-        --   * SIP bearer -> the REGISTER must look like uplink traffic
-        --     *from the UE*, so its inner source has to be the PAA (not the
-        --     SGW address, which is also the outer GTP-U source -- the very
-        --     thing that looked wrong on the wire). The SGW does not own
-        --     the PAA, so open the socket with a non-local source (the
-        --     fourth UdpSocket arg -> IP_FREEBIND + IP_TRANSPARENT): the
-        --     kernel then binds and *sends* from an address it does not
-        --     own, without adding it, and being setsockopts it works where
-        --     /proc/sys is read-only (a default Docker mount). Needs
-        --     CAP_NET_ADMIN.
-        --   * default bearer -> its destination is the UE itself, so a
-        --     UE-sourced datagram would be UE->UE and the UPF would route
-        --     it straight back down the tunnel (a TTL-bounded loop). Keep
-        --     it SGW-sourced: the UPF drops it as source-spoofed, so it
-        --     confirms our encap without looping. Its payload is opaque, so
-        --     the "wrong" source there is immaterial.
-        local sgw_sock = net.UdpSocket("0.0.0.0", 0)     -- inner source = SGW
-        local ue_sock
-        local bok, s = pcall(function()
+        -- The REGISTER must look like uplink traffic *from the UE*: its
+        -- inner source has to be the PAA, not the SGW address (which is
+        -- also the outer GTP-U source -- the two coinciding is exactly what
+        -- looked wrong on the wire). The SGW does not own the PAA, so open
+        -- the socket with a non-local source (the fourth UdpSocket arg ->
+        -- IP_FREEBIND + IP_TRANSPARENT): the kernel then binds and *sends*
+        -- from an address it does not own, without adding it, and being
+        -- setsockopts it works where /proc/sys is read-only (a default
+        -- Docker mount). Needs CAP_NET_ADMIN; falls back to the SGW source
+        -- (which the UPF then drops as spoofed) when it is refused.
+        local ue_bound, s = pcall(function()
             return net.UdpSocket(st.ue_addr, 0, false, true)  -- non-local source = UE PAA
         end)
-        if bok then ue_sock = s end
-        line("user-plane probe", ue_sock
-            and ("SIP inner source %s (UE)"):format(st.ue_addr)
-            or  "SIP inner source = SGW (UE PAA bind refused; need CAP_NET_ADMIN)")
+        local sock = ue_bound and s or net.UdpSocket("0.0.0.0", 0)
 
         for _, b in ipairs(st.bearers) do
-            local dst     = b.dst or st.ue_addr
-            local sip_msg = (b.kind == "dedicated")
-            local payload = sip_msg and register or "pro2call gtp-u probe"
-            local sock    = (sip_msg and ue_sock) or sgw_sock
-            local what    = sip_msg and ("SIP REGISTER -> P-CSCF %s"):format(dst)
-                            or ("datagram -> UE %s"):format(dst)
-
-            if sip_msg and not payload then
+            if b.kind ~= "signalling" then
+                line("user-plane probe",
+                     ("EBI %d %s bearer programmed, not probed"):format(b.ebi, b.kind))
+            elseif not register then
                 line("user-plane probe",
                      ("EBI %d skipped (no P-CSCF address to REGISTER to)"):format(b.ebi))
             else
+                local dst  = b.dst or st.pcscf
+                local what = ("SIP REGISTER -> P-CSCF %s"):format(dst)
+                line("user-plane probe", ue_bound
+                    and ("inner source %s (UE)"):format(st.ue_addr)
+                    or  "inner source = SGW (UE PAA bind refused; need CAP_NET_ADMIN)")
+
                 local dev = route_dev(dst)
                 if dev and dev ~= inner_name then
                     line("user-plane probe", ("note: %s routes via %s, not %s -- add a "
@@ -455,7 +411,7 @@ local function attach_pdn_over_s5()
 
                 local s0 = up:stats(b.teid)
                 local sok, serr = pcall(function()
-                    for _ = 1, 3 do sock:sendto(payload, dst, b.port) end
+                    for _ = 1, 3 do sock:sendto(register, dst, b.port) end
                 end)
                 loop:step(50)                            -- let the TC program run
                 if not sok then
@@ -482,8 +438,7 @@ local function attach_pdn_over_s5()
                 end
             end
         end
-        sgw_sock:close()
-        if ue_sock then ue_sock:close() end
+        sock:close()
     end
 
     ep:set_handler({
@@ -504,13 +459,24 @@ local function attach_pdn_over_s5()
         end,
 
         -- One per bearer F-TEID in the accepted response: the PGW's
-        -- data-plane endpoint. Report it, then program the default bearer's
-        -- tunnel into the GTP-U datapath (a no-op if it is not loaded).
+        -- data-plane endpoint (the default bearer over S5/S8-U). IMS SIP
+        -- signalling rides the default bearer, so steer the UE's uplink SIP
+        -- toward the P-CSCF onto it with a TFT; the UPF's default-bearer
+        -- uplink PDR then accepts and routes it to the P-CSCF. A downlink
+        -- UE /32 entry is deliberately not programmed -- its destination is
+        -- the UE, which a real UPF rejects as uplink (a source-spoof drop,
+        -- or a UE->UE loop back down the tunnel).
         on_user_plane = function(sess, tun)
             line("user plane (S5/S8-U)",
                  ("EBI %d  SGW TEID %#x -> PGW TEID %#x @ %s")
                      :format(tun.ebi, tun.local_teid, tun.remote_teid, tun.remote_addr))
-            program_tunnel(tun.ebi, tun.local_teid, tun.remote_teid, tun.remote_addr)
+            if st.pcscf then
+                program_filter(tun.ebi, tun.local_teid, tun.remote_teid, tun.remote_addr,
+                               IPPROTO_UDP, st.pcscf, PCSCF_SIP_PORT)
+            else
+                line("GTP-U filter",
+                     ("EBI %d not programmed (no P-CSCF IPv4 in Create Session PCO)"):format(tun.ebi))
+            end
         end,
 
         -- With the default bearer up the PGW opens a dedicated bearer with
@@ -563,21 +529,13 @@ local function attach_pdn_over_s5()
             line("-> Create Bearer Resp",
                  ("seq %d, EBI %d, cause accepted"):format(req.sequence, NEW_EBI))
 
-            -- Program the dedicated bearer's tunnel too: our uplink TEID is
-            -- the one we just handed the PGW; its downlink endpoint is the
-            -- PGW F-TEID carried in the request. The TFT steers UDP toward
-            -- the P-CSCF (from the Create Session PCO) onto this bearer, so
-            -- the SIP REGISTER probe lands here rather than on the default.
-            if pgw_u and st.pcscf then
-                local rteid, raddr = fteid_v4_decode(pgw_u)
-                if rteid then
-                    program_filter(NEW_EBI, S5_UP_TEID + 1, rteid, raddr,
-                                   IPPROTO_UDP, st.pcscf, PCSCF_SIP_PORT)
-                end
-            elseif pgw_u then
-                line("GTP-U filter",
-                     ("EBI %d not programmed (no P-CSCF IPv4 in Create Session PCO)"):format(NEW_EBI))
-            end
+            -- The dedicated bearer is a media bearer: the SMF/PCRF installs
+            -- its own uplink SDF on the UPF (the negotiated media flow),
+            -- which SIP does not match. IMS signalling rides the default
+            -- bearer (programmed in on_user_plane), so we accept and report
+            -- this bearer but do not program a datapath entry or probe it.
+            line("note",
+                 ("dedicated bearer EBI %d accepted (media); not programmed/probed"):format(NEW_EBI))
             st.cbr_done = true
         end,
 
