@@ -78,6 +78,72 @@ std::string apn_decode(const Bytes& labels)
     return out;
 }
 
+/* One digit of a digit string, or throw. */
+static uint8_t plmn_digit(char c)
+{
+    if (c < '0' || c > '9') throw Error("PLMN: non-digit character");
+    return static_cast<uint8_t>(c - '0');
+}
+
+Bytes plmn_encode(const std::string& mcc, const std::string& mnc)
+{
+    if (mcc.size() != 3 || (mnc.size() != 2 && mnc.size() != 3))
+        throw Error("PLMN: MCC must be 3 digits and MNC 2 or 3");
+    const uint8_t n3 = (mnc.size() == 3) ? plmn_digit(mnc[2]) : 0x0f;
+    /* Nibble layout of TS 24.008 §10.5.1.3: octet 2's high nibble is the
+     * third MNC digit (0xF when the MNC has only two). */
+    return Bytes{
+        static_cast<uint8_t>(plmn_digit(mcc[1]) << 4 | plmn_digit(mcc[0])),
+        static_cast<uint8_t>(n3 << 4 | plmn_digit(mcc[2])),
+        static_cast<uint8_t>(plmn_digit(mnc[1]) << 4 | plmn_digit(mnc[0])),
+    };
+}
+
+Bytes uli_tai_ecgi(const std::string& mcc, const std::string& mnc,
+                   uint16_t tac, uint32_t eci)
+{
+    const Bytes pl = plmn_encode(mcc, mnc);
+    Bytes       out;
+    out.reserve(1 + 3 + 2 + 3 + 4);
+    out.push_back(0x18); /* flags: TAI (bit 3) + ECGI (bit 4) */
+    out.insert(out.end(), pl.begin(), pl.end());
+    out.push_back(static_cast<uint8_t>(tac >> 8));
+    out.push_back(static_cast<uint8_t>(tac));
+    out.insert(out.end(), pl.begin(), pl.end());
+    out.push_back(static_cast<uint8_t>(eci >> 24 & 0x0f)); /* 4 spare high bits */
+    out.push_back(static_cast<uint8_t>(eci >> 16));
+    out.push_back(static_cast<uint8_t>(eci >> 8));
+    out.push_back(static_cast<uint8_t>(eci));
+    return out;
+}
+
+std::string pco_pcscf_v4(const Bytes& pco)
+{
+    if (pco.size() < 4) return "";
+    size_t i = 1; /* skip the configuration-protocol/flags octet */
+    while (i + 2 < pco.size()) {
+        const uint16_t id  = static_cast<uint16_t>(pco[i] << 8 | pco[i + 1]);
+        const uint8_t  len = pco[i + 2];
+        const size_t   body = i + 3;
+        if (body + len > pco.size()) break; /* truncated container */
+        if (id == 0x000c && len >= 4) {
+            char b[INET_ADDRSTRLEN];
+            std::snprintf(b, sizeof b, "%u.%u.%u.%u", pco[body], pco[body + 1],
+                          pco[body + 2], pco[body + 3]);
+            return b;
+        }
+        i = body + len;
+    }
+    return "";
+}
+
+Bytes pco_request_pcscf()
+{
+    /* Configuration-protocol octet 0x80, then one empty P-CSCF IPv4
+     * Address Request container (id 0x000C, length 0). */
+    return Bytes{ 0x80, 0x00, 0x0c, 0x00 };
+}
+
 namespace intl
 {
 

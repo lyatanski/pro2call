@@ -31,8 +31,8 @@ end
 
 -- helpers -------------------------------------------------------------
 check(gtp.bcd_decode(gtp.bcd_encode("234150999999999")) == "234150999999999", "bcd roundtrip")
-check(gtp.bcd_encode("21") == "\x12", "bcd wire: low nibble first")
-check(gtp.bcd_encode("123") == "\x21\xf3", "bcd wire: odd length padded 0xF")
+check(gtp.bcd_encode("21") == string.char(0x12), "bcd wire: low nibble first")
+check(gtp.bcd_encode("123") == string.char(0x21, 0xf3), "bcd wire: odd length padded 0xF")
 check(raises(function() gtp.bcd_encode("12a") end), "bcd rejects non-digit")
 local apn = gtp.apn_encode("internet.mnc015.mcc234.gprs")
 check(apn:byte(1) == 8, "apn first label length")
@@ -85,12 +85,12 @@ local m = gtp.RawMessage()
 m.message_type = gtp.GTP2_MT_ECHO_REQUEST
 m.has_teid = false
 m.sequence = 7
-m:add_ie(gtp.Ie(gtp.GTP2_IE_RECOVERY, "\x2a"))
+m:add_ie(gtp.Ie(gtp.GTP2_IE_RECOVERY, string.char(0x2a)))
 local dm = gtp.RawMessage.decode(m:encode())
 check(dm.message_type == gtp.GTP2_MT_ECHO_REQUEST, "raw: message type")
 check(dm.has_teid == false, "raw: teid absent")
 check(dm:has(gtp.GTP2_IE_RECOVERY), "raw: has() finds IE")
-check(dm:find(gtp.GTP2_IE_RECOVERY).value == "\x2a", "raw: find() value")
+check(dm:find(gtp.GTP2_IE_RECOVERY).value == string.char(0x2a), "raw: find() value")
 
 local g = gtp.RawMessage()
 g.message_type = gtp.GTP2_MT_CREATE_BEARER_REQUEST
@@ -98,12 +98,12 @@ g.teid, g.sequence = 0x5511, 9
 local ctx = gtp.Ie()
 ctx.type = gtp.GTP2_IE_BEARER_CONTEXT
 ctx:add_child(gtp.Ie(gtp.GTP2_IE_EBI, "\6"))
-ctx:add_child(gtp.Ie(gtp.GTP2_IE_CHARGING_ID, "\0\0\0\x63"))
+ctx:add_child(gtp.Ie(gtp.GTP2_IE_CHARGING_ID, string.char(0, 0, 0, 0x63)))
 g:add_ie(ctx)
 local kids = gtp.RawMessage.decode(g:encode()):find(gtp.GTP2_IE_BEARER_CONTEXT).children
 check(kids:size() == 2, "raw: grouped IE recursed")
 check(kids[0].type == gtp.GTP2_IE_EBI and kids[0].value == "\6", "raw: first child")
-check(kids[1].value == "\0\0\0\x63", "raw: second child")
+check(kids[1].value == string.char(0, 0, 0, 0x63), "raw: second child")
 check(raises(function()
     gtp.RawMessage.decode(sample_cs_req():encode()):find(gtp.GTP2_IE_PRIVATE_EXTENSION)
 end), "raw: find() missing raises")

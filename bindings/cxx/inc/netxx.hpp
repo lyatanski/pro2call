@@ -127,6 +127,18 @@ class Loop
  * timers run on, for scheduling and elapsed-time measurements. */
 uint64_t now_ms();
 
+/* ---- interface helpers ---- */
+
+/* Interface name -> kernel ifindex (if_nametoindex); 0 when the name is
+ * empty or there is no such interface — the value the GTP-U datapath's
+ * attach() reads as "skip this direction". */
+uint32_t if_index(const std::string& name);
+
+/* An interface's first IPv4 address as a literal string, or "" when the
+ * name is empty/absent or the interface has no IPv4 address (getifaddrs).
+ * Used to derive a source address from the interface a tunnel egresses. */
+std::string if_addr4(const std::string& name);
+
 /* ---- UDP socket ---- */
 
 /* A datagram from UdpSocket::recv: data/host/port on success, or

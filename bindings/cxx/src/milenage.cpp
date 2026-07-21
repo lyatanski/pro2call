@@ -165,4 +165,28 @@ std::string md5(const std::string& data)
     return std::string(reinterpret_cast<char*>(out), n);
 }
 
+std::string aka_digest(const std::string& user, const std::string& realm,
+                       const std::string& res, const std::string& method,
+                       const std::string& uri, const std::string& nonce,
+                       const std::string& nc, const std::string& cnonce,
+                       const std::string& qop)
+{
+    auto md5hex = [](const std::string& s) {
+        static const char h[] = "0123456789abcdef";
+        std::string       d   = md5(s), o;
+        o.reserve(d.size() * 2);
+        for (unsigned char c : d) {
+            o.push_back(h[c >> 4]);
+            o.push_back(h[c & 0x0f]);
+        }
+        return o;
+    };
+    const std::string ha1 = md5hex(user + ":" + realm + ":" + res);
+    const std::string ha2 = md5hex(method + ":" + uri);
+    if (!qop.empty())
+        return md5hex(ha1 + ":" + nonce + ":" + nc + ":" + cnonce + ":" + qop +
+                      ":" + ha2);
+    return md5hex(ha1 + ":" + nonce + ":" + ha2);
+}
+
 } /* namespace ipsec */

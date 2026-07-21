@@ -98,6 +98,17 @@ AkaVector aka_verify(const std::string& k, const std::string& opc,
  * Authorization response from RES without a second crypto binding. */
 std::string md5(const std::string& data);
 
+/* HTTP Digest AKAv1-MD5 (RFC 3310 + RFC 2617): the `response` token for a
+ * REGISTER Authorization header. `res` is the raw RES bytes recovered from
+ * the AKA challenge (the digest password). An empty `qop` selects the
+ * RFC 2069 (no-qop) form; otherwise the RFC 2617 form folds in
+ * nc/cnonce/qop. Returns the 32-char lowercase hex digest. */
+std::string aka_digest(const std::string& user, const std::string& realm,
+                       const std::string& res, const std::string& method,
+                       const std::string& uri, const std::string& nonce,
+                       const std::string& nc, const std::string& cnonce,
+                       const std::string& qop);
+
 /* A Security Association. Set either enc_alg+auth_alg (cipher + HMAC)
  * or aead_alg (combined mode); AH SAs set auth_alg only. Keys are raw
  * bytes carried in a string. */

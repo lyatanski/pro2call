@@ -56,6 +56,10 @@ void EndpointHandler::on_delete_session_request(const DeleteSessionRequest&,
                                                 const std::string&, uint16_t)
 {
 }
+void EndpointHandler::on_create_bearer_request(const CreateBearerRequest&,
+                                               const std::string&, uint16_t)
+{
+}
 void EndpointHandler::on_message(int, const Bytes&, const std::string&,
                                  uint16_t)
 {
@@ -382,6 +386,13 @@ void Endpoint::send_delete_session_response(const DeleteSessionResponse& rsp,
     send_to(rsp.encode(), host, port);
 }
 
+void Endpoint::send_create_bearer_response(const CreateBearerResponse& rsp,
+                                           const std::string&          host,
+                                           uint16_t                    port)
+{
+    send_to(rsp.encode(), host, port);
+}
+
 void Endpoint::send_raw(const Bytes& wire, const std::string& host,
                         uint16_t port)
 {
@@ -481,6 +492,11 @@ void Endpoint::dispatch(const uint8_t* msg, size_t len, const gtp2_hdr_t& h,
         if (handler_)
             handler_->on_delete_session_request(
                 DeleteSessionRequest::decode(wire), host, port);
+        break;
+    case GTP2_MT_CREATE_BEARER_REQUEST:
+        if (handler_)
+            handler_->on_create_bearer_request(
+                CreateBearerRequest::decode(wire), host, port);
         break;
 
     default:

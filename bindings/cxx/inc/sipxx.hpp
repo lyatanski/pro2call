@@ -206,6 +206,20 @@ Uri  parse_uri(const std::string& s);
 Addr parse_addr(const std::string& value);
 Via  parse_via(const std::string& value);
 
+/* ---- auth-header helpers (RFC 2617 / RFC 3329) ---- */
+
+/* Pull one parameter out of an auth-style header value — WWW-Authenticate
+ * / Authorization (key="quoted" or key=bare) or a Security-Client /
+ * Security-Server list (spi-s=1234, port-c=5090). The key is matched only
+ * at a parameter boundary, so "nc" does not match inside "cnonce".
+ * Returns "" when the parameter is absent. */
+std::string auth_param(const std::string& header_value, const std::string& key);
+
+/* base64 decode (RFC 4648); non-alphabet bytes and '=' padding are
+ * ignored, so it handles the AKA nonce (base64 RAND||AUTN) in a 401
+ * WWW-Authenticate challenge. */
+std::string b64decode(const std::string& s);
+
 /* Name tables, for pretty-printing in scripts. */
 std::string method_name(int method);
 std::string hdr_name(int hdr);

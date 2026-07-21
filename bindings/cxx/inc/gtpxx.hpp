@@ -69,6 +69,25 @@ std::string bcd_decode(const Bytes& bcd);
 Bytes       apn_encode(const std::string& dotted);
 std::string apn_decode(const Bytes& labels);
 
+/* PLMN (TS 24.008 §10.5.1.3): MCC (3 digits) and MNC (2 or 3 digits) as
+ * digit strings -> the 3-octet encoding reused by the Serving Network IE
+ * (§8.18) and each ULI PLMN field. A 2-digit MNC leaves the spare nibble
+ * 0xF. */
+Bytes plmn_encode(const std::string& mcc, const std::string& mnc);
+
+/* User Location Information (§8.21) carrying a TAI and an ECGI, both with
+ * the serving PLMN. TAC is 16-bit, ECI 28-bit (its four spare high bits
+ * kept zero). Ready to drop into CreateSessionRequest::uli. */
+Bytes uli_tai_ecgi(const std::string& mcc, const std::string& mnc,
+                   uint16_t tac, uint32_t eci);
+
+/* Protocol Configuration Options (§8.13 / TS 24.008 §10.5.6.3).
+ * pco_pcscf_v4 returns the first P-CSCF IPv4 address (container 0x000C)
+ * as a dotted quad, or "" when absent. pco_request_pcscf builds the PCO
+ * that asks the PGW for its P-CSCF IPv4 address. */
+std::string pco_pcscf_v4(const Bytes& pco);
+Bytes       pco_request_pcscf();
+
 /* ---- Sub-IE value types (TS 29.274 §8) ---- */
 
 /* F-TEID §8.22. addr4/addr6 are literal strings; empty = that family
@@ -266,6 +285,45 @@ struct DeleteSessionResponse { /* §7.2.10 */
     static DeleteSessionResponse decode(const Bytes& wire);
 };
 
+struct CreateBearerRequest { /* §7.2.3 (network-initiated dedicated bearer) */
+    uint32_t teid     = 0;
+    uint32_t sequence = 0;
+
+    int   pti        = -1; /* Procedure Transaction Id; -1 = absent */
+    int   linked_ebi = -1; /* LBI: the default bearer's EBI          */
+    bool  has_ambr   = false;
+    Ambr  ambr;
+    Bytes pco;
+
+    std::vector<BearerContext> bearers; /* contexts to be created */
+    void                       add_bearer(const BearerContext& b)
+    {
+        bearers.push_back(b);
+    }
+
+    Bytes                      encode() const;
+    static CreateBearerRequest decode(const Bytes& wire);
+};
+
+struct CreateBearerResponse { /* §7.2.4 */
+    uint32_t teid     = 0;
+    uint32_t sequence = 0;
+
+    uint8_t cause    = GTP2_CAUSE_REQUEST_ACCEPTED;
+    int     pti      = -1;
+    int     recovery = -1;
+    Bytes   pco;
+
+    std::vector<BearerContext> bearers; /* each: EBI, cause, F-TEID(s) */
+    void                       add_bearer(const BearerContext& b)
+    {
+        bearers.push_back(b);
+    }
+
+    Bytes                       encode() const;
+    static CreateBearerResponse decode(const Bytes& wire);
+};
+
 /* ---- Raw message (full protocol coverage) ----
  *
  * Any GTPv2-C message as a header plus an IE tree. decode() recurses
@@ -375,6 +433,13 @@ class EndpointHandler
     virtual void on_delete_session_request(const DeleteSessionRequest& req,
                                            const std::string&          host,
                                            uint16_t                    port);
+
+    /* Network-initiated Create Bearer Request (§7.2.3): answer with
+     * Endpoint::send_create_bearer_response(), echoing req.sequence and
+     * addressing rsp.teid to the peer's control TEID. */
+    virtual void on_create_bearer_request(const CreateBearerRequest& req,
+                                          const std::string&         host,
+                                          uint16_t                   port);
 
     /* Anything else (and responses matching no transaction). */
     virtual void on_message(int message_type, const Bytes& wire,
@@ -488,6 +553,8 @@ class Endpoint
                                      const std::string& host, uint16_t port);
     void send_delete_session_response(const DeleteSessionResponse& rsp,
                                       const std::string& host, uint16_t port);
+    void send_create_bearer_response(const CreateBearerResponse& rsp,
+                                     const std::string& host, uint16_t port);
     void send_raw(const Bytes& wire, const std::string& host, uint16_t port);
 
     /* Retransmission (TS 29.274 §7.6): T3-RESPONSE wait, N3 sends. */

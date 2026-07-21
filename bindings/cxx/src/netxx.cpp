@@ -10,8 +10,10 @@
 
 #include <arpa/inet.h>
 #include <exception>
+#include <ifaddrs.h>
 #include <map>
 #include <memory>
+#include <net/if.h>
 
 namespace net
 {
@@ -179,6 +181,34 @@ void Loop::del_fd(int fd)
 uint64_t now_ms()
 {
     return net_now_ms();
+}
+
+/* ---- interface helpers ---- */
+
+uint32_t if_index(const std::string& name)
+{
+    if (name.empty()) return 0;
+    return if_nametoindex(name.c_str()); /* 0 when no such interface */
+}
+
+std::string if_addr4(const std::string& name)
+{
+    if (name.empty()) return "";
+    struct ifaddrs* ifas = nullptr;
+    if (getifaddrs(&ifas) != 0) return "";
+    std::string out;
+    for (struct ifaddrs* p = ifas; p; p = p->ifa_next) {
+        if (!p->ifa_addr || p->ifa_addr->sa_family != AF_INET) continue;
+        if (name != p->ifa_name) continue;
+        char  buf[INET_ADDRSTRLEN] = "";
+        auto* sin = reinterpret_cast<struct sockaddr_in*>(p->ifa_addr);
+        if (inet_ntop(AF_INET, &sin->sin_addr, buf, sizeof buf)) {
+            out = buf;
+            break;
+        }
+    }
+    freeifaddrs(ifas);
+    return out;
 }
 
 /* ---- UdpSocket ---- */
@@ -363,6 +393,8 @@ std::vector<DnsRecord> Resolver::resolve(const std::string& name, int type)
 
 std::string Resolver::resolve4(const std::string& name)
 {
+    struct in_addr v4; /* a literal address resolves to itself */
+    if (inet_pton(AF_INET, name.c_str(), &v4) == 1) return name;
     for (const auto& r : resolve(name, NET_DNS_A))
         if (r.type == NET_DNS_A) return r.addr;
     throw Error("no A record for " + name);
@@ -370,6 +402,8 @@ std::string Resolver::resolve4(const std::string& name)
 
 std::string Resolver::resolve6(const std::string& name)
 {
+    struct in6_addr v6;
+    if (inet_pton(AF_INET6, name.c_str(), &v6) == 1) return name;
     for (const auto& r : resolve(name, NET_DNS_AAAA))
         if (r.type == NET_DNS_AAAA) return r.addr;
     throw Error("no AAAA record for " + name);

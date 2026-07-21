@@ -720,6 +720,134 @@ DeleteSessionResponse DeleteSessionResponse::decode(const Bytes& wire)
     return m;
 }
 
+/* ---- Create Bearer Request ---- */
+
+Bytes CreateBearerRequest::encode() const
+{
+    Bytes       out(WIRE_MAX);
+    gtp2_wbuf_t w;
+    gtp2_wbuf_init(&w, out.data(), out.size());
+    const size_t off =
+        put_hdr(w, GTP2_MT_CREATE_BEARER_REQUEST, teid, sequence);
+
+    if (pti >= 0)
+        gtp2_ie_put_u8(&w, GTP2_IE_PTI, 0, static_cast<uint8_t>(pti));
+    if (linked_ebi >= 0)
+        gtp2_ie_put_u8(&w, GTP2_IE_EBI, 0,
+                       static_cast<uint8_t>(linked_ebi & 0x0f));
+    if (has_ambr) {
+        const gtp2_ambr_t a = { ambr.ul_kbps, ambr.dl_kbps };
+        gtp2_ambr_put(&w, 0, &a);
+    }
+    put_bytes(w, GTP2_IE_PCO, 0, pco);
+    for (const BearerContext& b : bearers)
+        put_bearer(w, b);
+
+    return finish(w, out, off, "encode Create Bearer Request");
+}
+
+CreateBearerRequest CreateBearerRequest::decode(const Bytes& wire)
+{
+    gtp2_hdr_t h;
+    const int  hl = open_msg(wire, GTP2_MT_CREATE_BEARER_REQUEST, h,
+                             "decode Create Bearer Request");
+
+    CreateBearerRequest m;
+    m.teid     = h.teid;
+    m.sequence = h.sequence;
+
+    IeWalk it (h, wire.data(), hl);
+    while (it.next()) {
+        const gtp2_ie_view_t& v = it.ie;
+        switch (v.type) {
+        case GTP2_IE_PTI:
+            if (v.len) m.pti = v.value[0];
+            break;
+        case GTP2_IE_EBI: /* top-level EBI is the Linked EPS Bearer ID */
+            if (v.len) m.linked_ebi = v.value[0] & 0x0f;
+            break;
+        case GTP2_IE_AMBR: {
+            gtp2_ambr_t a;
+            if (gtp2_ambr_decode(&v, &a) == GTP2_OK) {
+                m.has_ambr = true;
+                m.ambr     = { a.ul_kbps, a.dl_kbps };
+            }
+            break;
+        }
+        case GTP2_IE_PCO: m.pco = ie_bytes(v); break;
+        case GTP2_IE_BEARER_CONTEXT:
+            if (m.bearers.size() < CS_MAX_BEARERS)
+                m.bearers.push_back(bearer_from_view(v));
+            break;
+        default: break;
+        }
+    }
+    return m;
+}
+
+/* ---- Create Bearer Response ---- */
+
+Bytes CreateBearerResponse::encode() const
+{
+    Bytes       out(WIRE_MAX);
+    gtp2_wbuf_t w;
+    gtp2_wbuf_init(&w, out.data(), out.size());
+    const size_t off =
+        put_hdr(w, GTP2_MT_CREATE_BEARER_RESPONSE, teid, sequence);
+
+    put_cause(w, 0, cause);
+    if (pti >= 0)
+        gtp2_ie_put_u8(&w, GTP2_IE_PTI, 0, static_cast<uint8_t>(pti));
+    for (const BearerContext& b : bearers)
+        put_bearer(w, b);
+    put_bytes(w, GTP2_IE_PCO, 0, pco);
+    if (recovery >= 0)
+        gtp2_ie_put_u8(&w, GTP2_IE_RECOVERY, 0, static_cast<uint8_t>(recovery));
+
+    return finish(w, out, off, "encode Create Bearer Response");
+}
+
+CreateBearerResponse CreateBearerResponse::decode(const Bytes& wire)
+{
+    gtp2_hdr_t h;
+    const int  hl = open_msg(wire, GTP2_MT_CREATE_BEARER_RESPONSE, h,
+                             "decode Create Bearer Response");
+
+    CreateBearerResponse m;
+    m.teid          = h.teid;
+    m.sequence      = h.sequence;
+    bool have_cause = false;
+
+    IeWalk it (h, wire.data(), hl);
+    while (it.next()) {
+        const gtp2_ie_view_t& v = it.ie;
+        switch (v.type) {
+        case GTP2_IE_CAUSE:
+            if (v.len) {
+                m.cause    = v.value[0];
+                have_cause = true;
+            }
+            break;
+        case GTP2_IE_PTI:
+            if (v.len) m.pti = v.value[0];
+            break;
+        case GTP2_IE_PCO: m.pco = ie_bytes(v); break;
+        case GTP2_IE_RECOVERY:
+            if (v.len) m.recovery = v.value[0];
+            break;
+        case GTP2_IE_BEARER_CONTEXT:
+            if (m.bearers.size() < CS_MAX_BEARERS)
+                m.bearers.push_back(bearer_from_view(v));
+            break;
+        default: break;
+        }
+    }
+    if (!have_cause)
+        throw Error("decode Create Bearer Response: Cause is mandatory",
+                    GTP2_E_MISSING);
+    return m;
+}
+
 /* ---- Raw messages ---- */
 
 static bool is_grouped(uint8_t type)

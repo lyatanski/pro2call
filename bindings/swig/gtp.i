@@ -182,6 +182,13 @@ public:
         pstr(host); lua_pushinteger(L_, port);
         call(3);
     }
+    void on_create_bearer_request(const gtp::CreateBearerRequest& req,
+                                  const std::string& host, uint16_t port) override {
+        if (!begin("on_create_bearer_request")) return;
+        gtplua_owned(L_, new gtp::CreateBearerRequest(req), "gtp::CreateBearerRequest *");
+        pstr(host); lua_pushinteger(L_, port);
+        call(3);
+    }
     void on_message(int message_type, const gtp::Bytes& wire,
                     const std::string& host, uint16_t port) override {
         if (!begin("on_message")) return;

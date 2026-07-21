@@ -208,6 +208,60 @@ Via parse_via(const std::string& value)
     return out;
 }
 
+/* ---- auth-header helpers ---- */
+
+static bool param_boundary(char c)
+{
+    return c == ',' || c == ';' || c == ' ' || c == '\t';
+}
+
+std::string auth_param(const std::string& v, const std::string& key)
+{
+    const size_t n = v.size(), k = key.size();
+    if (k == 0) return "";
+    for (size_t i = 0; i + k <= n; i++) {
+        if (i != 0 && !param_boundary(v[i - 1])) continue; /* mid-token */
+        if (v.compare(i, k, key) != 0) continue;
+        size_t j = i + k;
+        while (j < n && (v[j] == ' ' || v[j] == '\t')) j++;
+        if (j >= n || v[j] != '=') continue;
+        j++;
+        while (j < n && (v[j] == ' ' || v[j] == '\t')) j++;
+        if (j < n && v[j] == '"') { /* quoted value */
+            size_t e = v.find('"', ++j);
+            return v.substr(j, (e == std::string::npos ? n : e) - j);
+        }
+        size_t e = j; /* bare token */
+        while (e < n && !param_boundary(v[e])) e++;
+        return v.substr(j, e - j);
+    }
+    return "";
+}
+
+std::string b64decode(const std::string& s)
+{
+    static const char alphabet[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    signed char map[256];
+    for (int i = 0; i < 256; i++) map[i] = -1;
+    for (int i = 0; i < 64; i++) map[(unsigned char)alphabet[i]] = (signed char)i;
+
+    std::string out;
+    uint32_t    acc   = 0;
+    int         nbits = 0;
+    for (unsigned char c : s) {
+        signed char v = map[c];
+        if (v < 0) continue; /* skip '=', whitespace, line breaks */
+        acc = acc << 6 | (uint32_t)v;
+        nbits += 6;
+        if (nbits >= 8) {
+            nbits -= 8;
+            out.push_back(static_cast<char>(acc >> nbits & 0xff));
+        }
+    }
+    return out;
+}
+
 /* ---- name tables ---- */
 
 std::string method_name(int method)

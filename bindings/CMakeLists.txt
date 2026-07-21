@@ -220,16 +220,4 @@ if(BUILD_TESTING AND Lua_FOUND AND LUA_INTERPRETER)
                      ${CMAKE_CURRENT_SOURCE_DIR}/test/test_net_bindings.lua)
     set_tests_properties(bindings_lua_net PROPERTIES
         ENVIRONMENT "LUA_CPATH=${CMAKE_CURRENT_BINARY_DIR}/lua/?.so")
-
-    # With no P-CSCF argument the IMS-AKA example runs its offline
-    # self-test (Milenage known-answer vector, AUTN round-trip, message
-    # and SA construction) and asserts along the way, so it doubles as
-    # the cross-module regression test (gtp + sip + ipsec in one
-    # interpreter). Given a P-CSCF address it instead registers and calls
-    # over the network against a live core.
-    add_test(NAME bindings_lua_ims_example
-             COMMAND ${LUA_INTERPRETER}
-                     ${CMAKE_CURRENT_SOURCE_DIR}/examples/ims_call_s5.lua)
-    set_tests_properties(bindings_lua_ims_example PROPERTIES
-        ENVIRONMENT "LUA_CPATH=${CMAKE_CURRENT_BINARY_DIR}/lua/?.so")
 endif()

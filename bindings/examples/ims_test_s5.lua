@@ -42,10 +42,10 @@
 -- instead of any blocking recv() or step() pump.
 --
 
-local gtp   = require("gtp")
-local net   = require("net")   -- event loop + UDP socket transport + DNS resolver
-local sip   = require("sip")   -- IMS REGISTER builder / response parser
-local ipsec = require("ipsec") -- Milenage (aka_verify) + md5 for the AKAv1-MD5 digest
+local gtp   = require("gtp")   -- GTPv2-C + typed Create Bearer + PLMN/ULI/PCO wire helpers
+local net   = require("net")   -- event loop + UDP socket + DNS resolver + interface lookup
+local sip   = require("sip")   -- IMS REGISTER builder / parser + auth_param / b64decode
+local ipsec = require("ipsec") -- Milenage (aka_verify) + AKAv1-MD5 digest (aka_digest)
 
 -- ---- configuration ----------------------------------------------------
 
@@ -82,8 +82,6 @@ local PCSCF_SIP_PORT = 5060    -- IMS signalling bearer TFT: SIP toward the P-CS
 local PORT_UC, PORT_US = 5088, 5090
 local SPI_UC,  SPI_US  = 0x2001, 0x2002
 
-local PCO_PCSCF_IPV4 = 0x000c  -- TS 24.008 §10.5.6.3 P-CSCF IPv4 Address container
-
 -- USIM secret (raw 16-byte hex). Defaults are 3GPP TS 35.207 Milenage
 -- Test Set 1; override IMS_K / IMS_OP (or IMS_OPC) for a real USIM. Used
 -- to answer the 401 AKA challenge (recover RES, the digest password).
@@ -109,29 +107,9 @@ local function attempt(what, fn)
     return ok
 end
 
--- Map an interface name to its kernel ifindex through sysfs (the binding
--- exposes no if_nametoindex). Returns nil when the name is unset or the
--- interface is absent, so attach can be skipped cleanly.
-local function iface_index(name)
-    if not name or name == "" then return nil end
-    local f = io.open("/sys/class/net/" .. name .. "/ifindex")
-    if not f then return nil end
-    local n = tonumber((f:read("*l") or ""):match("%d+"))
-    f:close()
-    return n
-end
-
--- Read an interface's first IPv4 address through `ip addr` (busybox or
--- iproute2). Returns a dotted-quad or nil. Used to fill SGW_IP from the
--- GTP-U interface so the outer source and the S5/S8 F-TEIDs carry a real
--- address. The name is validated so it cannot smuggle shell syntax.
-local function iface_ipv4(name)
-    if not name or not name:match("^[%w._-]+$") then return nil end
-    local p = io.popen(("ip addr show dev %s 2>/dev/null"):format(name))
-    if not p then return nil end
-    local out = p:read("*a") or ""; p:close()
-    return out:match("inet%s+(%d+%.%d+%.%d+%.%d+)")
-end
+-- Interface -> kernel ifindex (net.if_index) and -> first IPv4 address
+-- (net.if_addr4) come from the net module now; both return 0 / "" when the
+-- interface is absent, so callers can skip that direction cleanly.
 
 -- The interface `ip route get <dst>` would send <dst> out of. Used to warn
 -- when the P-CSCF would leave via an interface encap is not attached to.
@@ -154,120 +132,26 @@ local function ip_cmd(args)
     return (out == ""), out
 end
 
--- Resolve a host name to an IPv4 literal. A dotted-quad is returned
--- unchanged; otherwise the net module's own asynchronous DNS resolver
--- (net_dns: A/AAAA/SRV/NAPTR over UDP, driven by its private event loop)
--- takes the first A record. net.Resolver() reads /etc/resolv.conf for the
--- nameserver; resolve4() throws on NXDOMAIN or timeout. No external tools.
+-- Resolve a host name to an IPv4 literal via the net module's own resolver.
+-- resolve4() returns a dotted-quad unchanged and otherwise runs the
+-- asynchronous net_dns engine (first A record, /etc/resolv.conf nameserver,
+-- throwing on NXDOMAIN or timeout). This wrapper only adds a friendlier
+-- error naming the offending host. No external tools.
 local function resolve(name)
-    if name:match("^%d+%.%d+%.%d+%.%d+$") then return name end
     local ok, res = pcall(function() return net.Resolver():resolve4(name) end)
     assert(ok, ("cannot resolve PGW host name %q: %s"):format(name, why(res)))
     return res
 end
 
--- Encode an MCC/MNC pair into the 3-octet PLMN of TS 24.008 §10.5.1.3,
--- reused by the Serving Network IE (§8.18) and the PLMN inside each ULI
--- field. A two-digit MNC leaves the spare high nibble of octet 2 as 0xF.
--- Nibbles never overlap, so `hi*16 + lo` composes each octet without the
--- 5.3 bitwise operators (this runs under Lua 5.1 / LuaJIT too).
-local function plmn(m, n)
-    local function d(s, i) return s:byte(i) - 0x30 end
-    local n3 = (#n == 3) and d(n, 3) or 0xf
-    return string.char(
-        d(m, 2) * 16 + d(m, 1),
-        n3      * 16 + d(m, 3),
-        d(n, 2) * 16 + d(n, 1))
-end
-
--- User Location Information (§8.21): a TAI and an ECGI, each carrying the
--- serving PLMN. Flags 0x18 select TAI (bit 3) and ECGI (bit 4); the two
--- fields follow in the spec's fixed order. TAC is 16-bit, ECI 28-bit (its
--- four spare high bits kept zero). `oct(x, div)` slices byte `div` out of
--- an integer with plain arithmetic, so no 5.3 bitwise operators are used.
-local function uli_tai_ecgi(pl, tac, eci)
-    local function oct(x, div) return math.floor(x / div) % 256 end
-    return string.char(0x18)
-        .. pl .. string.char(oct(tac, 256), oct(tac, 1))
-        .. pl .. string.char(math.floor(eci / 0x1000000) % 16,
-                             oct(eci, 0x10000), oct(eci, 0x100), oct(eci, 1))
-end
-
--- Encode an F-TEID IE value (§8.22) for an IPv4 endpoint: the flags /
--- interface-type octet (V4 bit 0x80 set, interface type in the low six
--- bits), the 32-bit TEID, then the four address octets. Built by hand
--- because the facade only encodes F-TEIDs inside its typed messages, and
--- the Create Bearer Response is assembled from a raw IE tree.
-local function fteid_v4(if_type, teid, addr)
-    local function oct(x, div) return math.floor(x / div) % 256 end
-    local a, b, c, d = addr:match("^(%d+)%.(%d+)%.(%d+)%.(%d+)$")
-    return string.char(0x80 + if_type,
-                       oct(teid, 0x1000000), oct(teid, 0x10000),
-                       oct(teid, 0x100), oct(teid, 1),
-                       tonumber(a), tonumber(b), tonumber(c), tonumber(d))
-end
-
--- A GTPv2-C Cause IE value (§8.4): the cause octet plus a spare/flags
--- octet (CS/BCE/PCE bits, all zero here).
-local function cause_ie(cause) return string.char(cause, 0) end
-
--- Walk a Protocol Configuration Options field (§8.13 / TS 24.008
--- §10.5.6.3) for the first P-CSCF IPv4 address the PGW returned. Octet 1
--- is the configuration-protocol/flags byte; each container that follows
--- is {id_hi, id_lo, len, len octets}. Container 0x000C carries one or
--- more 4-octet P-CSCF IPv4 addresses. Returns a dotted quad or nil. Plain
--- byte arithmetic only, so it runs under Lua 5.1 / LuaJIT too.
-local function pco_pcscf_v4(pco)
-    if not pco or #pco < 4 then return nil end
-    local i = 2                                   -- skip the flags octet
-    while i + 2 <= #pco do
-        local id   = pco:byte(i) * 256 + pco:byte(i + 1)
-        local len  = pco:byte(i + 2)
-        local body = i + 3
-        if body + len - 1 > #pco then break end   -- truncated container
-        if id == PCO_PCSCF_IPV4 and len >= 4 then
-            return ("%d.%d.%d.%d"):format(pco:byte(body), pco:byte(body + 1),
-                                          pco:byte(body + 2), pco:byte(body + 3))
-        end
-        i = body + len
-    end
-    return nil
-end
+-- The PLMN (gtp.plmn_encode), ULI (gtp.uli_tai_ecgi) and PCO parse/build
+-- (gtp.pco_pcscf_v4 / gtp.pco_request_pcscf) wire encoders now live in the
+-- gtp module, and the F-TEID / Cause IEs are assembled by the typed Create
+-- Bearer Response below -- so none of that byte-arithmetic lives here.
 
 -- ---- IMS-AKA / HTTP Digest (RFC 3310 + RFC 2617) ----------------------
 
--- base64 decode, for the AKA nonce (RAND||AUTN) in the 401 challenge.
--- Plain arithmetic (no 5.3 bitwise operators) so it runs under Lua 5.1 /
--- LuaJIT; acc is masked back to its pending low bits each byte, so it
--- never exceeds a double's 53-bit range.
-local B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
-local function b64dec(s)
-    local map = {}; for i = 1, #B64 do map[B64:byte(i)] = i - 1 end
-    local acc, nbits, out = 0, 0, {}
-    for i = 1, #s do
-        local v = map[s:byte(i)]
-        if v then
-            acc = acc * 64 + v; nbits = nbits + 6      -- acc << 6 | v
-            if nbits >= 8 then
-                nbits = nbits - 8
-                local div = 2 ^ nbits
-                out[#out + 1] = string.char(math.floor(acc / div) % 256)  -- (acc >> nbits) & 0xff
-                acc = acc % div                        -- keep only the leftover low bits
-            end
-        end
-    end
-    return table.concat(out)
-end
-
--- pull one quoted or bare token out of an auth-style header
-local function auth_param(hdr, key)
-    return hdr:match(key .. '%s*=%s*"([^"]*)"') or hdr:match(key .. '%s*=%s*([^,%s]+)')
-end
-
--- pull one "spi-s=1234" / "port-s=5090" token out of a Security-* header
-local function sec_param(hdr, key)
-    return hdr:match((key:gsub("%-", "%%-")) .. "=([%w%.]+)")
-end
+-- base64 decode of the AKA nonce (sip.b64decode) and the AKAv1-MD5 digest
+-- (ipsec.aka_digest) are C helpers; only the policy bits stay in Lua.
 
 -- The challenge's qop is a quoted list (kamailio's ims_auth default is
 -- "auth,auth-int"); pick a single token for the response. Only "auth" is
@@ -291,17 +175,6 @@ local function security_client()
     return ("ipsec-3gpp; alg=hmac-sha-1-96; ealg=aes-cbc; " ..
             "spi-c=%d; spi-s=%d; port-c=%d; port-s=%d")
         :format(SPI_UC, SPI_US, PORT_UC, PORT_US)
-end
-
--- HTTP Digest AKAv1-MD5: the RES recovered from the challenge is the password.
-local function md5hex(s) return hex(ipsec.md5(s)) end
-local function digest_response(user, realm, res, method, uri, nonce, nc, cnonce, qop)
-    local ha1 = md5hex(user .. ":" .. realm .. ":" .. res)
-    local ha2 = md5hex(method .. ":" .. uri)
-    if qop then
-        return md5hex(ha1 .. ":" .. nonce .. ":" .. nc .. ":" .. cnonce .. ":" .. qop .. ":" .. ha2)
-    end
-    return md5hex(ha1 .. ":" .. nonce .. ":" .. ha2)
 end
 
 -- The Authorization header value: AKAv1-MD5 Digest. `realm` MUST be the one
@@ -353,23 +226,24 @@ end
 local function parse_challenge(msg)
     local wa = msg:header("WWW-Authenticate")
     assert(wa ~= "", "401 without WWW-Authenticate")
-    local nonce = auth_param(wa, "nonce")
-    assert(nonce and nonce ~= "", "401 WWW-Authenticate without nonce")
-    local blob = b64dec(nonce)
+    local nonce = sip.auth_param(wa, "nonce")
+    assert(nonce ~= "", "401 WWW-Authenticate without nonce")
+    local blob = sip.b64decode(nonce)
     assert(#blob >= 32, "AKA nonce shorter than RAND||AUTN")
+    local realm = sip.auth_param(wa, "realm")
     local ss = msg:header("Security-Server")
     ss = ss ~= "" and ss or nil
     return {
         nonce = nonce,
         rand  = blob:sub(1, 16),
         autn  = blob:sub(17, 32),
-        realm = auth_param(wa, "realm") or ims_realm,
-        qop   = pick_qop(auth_param(wa, "qop")),
+        realm = realm ~= "" and realm or ims_realm,
+        qop   = pick_qop(sip.auth_param(wa, "qop")),
         ss_raw   = ss,
-        p_spi_c  = ss and tonumber(sec_param(ss, "spi-c")),
-        p_spi_s  = ss and tonumber(sec_param(ss, "spi-s")),
-        p_port_c = ss and tonumber(sec_param(ss, "port-c")),
-        p_port_s = ss and tonumber(sec_param(ss, "port-s")),
+        p_spi_c  = ss and tonumber(sip.auth_param(ss, "spi-c")),
+        p_spi_s  = ss and tonumber(sip.auth_param(ss, "spi-s")),
+        p_port_c = ss and tonumber(sip.auth_param(ss, "port-c")),
+        p_port_s = ss and tonumber(sip.auth_param(ss, "port-s")),
     }
 end
 
@@ -431,8 +305,8 @@ local function attach_pdn_over_s5()
     local gtpu_ifname = os.getenv("GTPU_IFACE") or "eth0"
     local sgw_auto = false
     if sgw_ip == "0.0.0.0" then
-        local ip = iface_ipv4(gtpu_ifname)
-        if ip then sgw_ip, sgw_auto = ip, true end
+        local ip = net.if_addr4(gtpu_ifname)
+        if ip ~= "" then sgw_ip, sgw_auto = ip, true end
     end
 
     local pgw_ip = resolve(pgw_host)
@@ -471,20 +345,20 @@ local function attach_pdn_over_s5()
     local up
     local inner_name = os.getenv("GTPU_INNER_IFACE") or "eth0" -- access side (encap egress)
     if gtp.UserPlane.supported() then
-        local gi = iface_index(gtpu_ifname)        -- S5/S8-U (GTP-U) side
-        local ii = iface_index(inner_name)         -- access side
+        local gi = net.if_index(gtpu_ifname)       -- S5/S8-U (GTP-U) side; 0 if absent
+        local ii = net.if_index(inner_name)        -- access side; 0 if absent
         local cfg = gtp.UserPlaneConfig()
         cfg.pin_dir        = ""        -- no bpffs pinning: a fresh datapath each run
         cfg.local_v4       = sgw_ip    -- outer source address for encapsulated uplink
-        cfg.uplink_ifindex = gi or 0
+        cfg.uplink_ifindex = gi
         local made, obj = pcall(gtp.UserPlane, cfg)
         if made then
             up = obj
-            if gi or ii then
-                local aok, aerr = pcall(function() up:attach(gi or 0, ii or 0) end)
+            if gi ~= 0 or ii ~= 0 then
+                local aok, aerr = pcall(function() up:attach(gi, ii) end)
                 line("GTP-U datapath", aok
                     and ("attached (gtpu=%s inner=%s)")
-                        :format(gi and gtpu_ifname or "-", inner_name or "-")
+                        :format(gi ~= 0 and gtpu_ifname or "-", inner_name or "-")
                     or ("attach failed: " .. why(aerr)))
             else
                 line("GTP-U datapath", "loaded (set GTPU_IFACE/GTPU_INNER_IFACE to attach TC)")
@@ -706,8 +580,9 @@ local function attach_pdn_over_s5()
         -- AKAv1-MD5 digest: RES is the password (RFC 3310).
         reg_cseq = reg_cseq + 1
         local nc, cnonce = "00000001", hex(ipsec.md5(imsi .. tostring(reg_cseq)):sub(1, 8))
-        local response = digest_response(impi, ch.realm, keys.res, "REGISTER",
-                                         "sip:" .. ims_realm, ch.nonce, nc, cnonce, ch.qop)
+        local response = ipsec.aka_digest(impi, ch.realm, keys.res, "REGISTER",
+                                          "sip:" .. ims_realm, ch.nonce, nc, cnonce,
+                                          ch.qop or "")
         local authz = authz_hdr(ch.realm, ch.nonce, response,
                                 ch.qop and { qop = ch.qop, nc = nc, cnonce = cnonce })
 
@@ -833,7 +708,10 @@ local function attach_pdn_over_s5()
             end
             st.pgw_ctrl_teid = sess:remote_teid()  -- to address later responses to the PGW
             if rsp.has_paa then st.ue_addr = rsp.paa.addr4 end
-            if rsp.pco and #rsp.pco > 0 then st.pcscf = pco_pcscf_v4(rsp.pco) end
+            if rsp.pco and #rsp.pco > 0 then
+                local p = gtp.pco_pcscf_v4(rsp.pco)
+                st.pcscf = p ~= "" and p or nil
+            end
             st.session_up = true
             line("<- Create Session Resp", ("accepted; PGW ctrl TEID %#x"):format(sess:remote_teid()))
             if st.ue_addr then line("PAA (UE address)", st.ue_addr) end
@@ -866,52 +744,41 @@ local function attach_pdn_over_s5()
         end,
 
         -- With the default bearer up the PGW opens a dedicated bearer with
-        -- a Create Bearer Request (§7.2.3). The facade does not type it, so
-        -- it lands here as raw wire; accept it and answer with a Create
-        -- Bearer Response (§7.2.4). The response is addressed to the PGW's
-        -- control TEID and echoes the request's sequence.
-        on_message = function(mt, wire, host, port)
-            if mt ~= gtp.GTP2_MT_CREATE_BEARER_REQUEST then return end
-            local req = gtp.RawMessage.decode(wire)
-            if not req:has(gtp.GTP2_IE_BEARER_CONTEXT) then return end
-
-            -- The request's bearer context carries the PGW's S5/S8-U
-            -- F-TEID; grab its raw bytes to echo back so the PGW can
-            -- correlate the bearer.
-            local bc = req:find(gtp.GTP2_IE_BEARER_CONTEXT)
-            local pgw_u
-            for i = 0, bc.children:size() - 1 do
-                local ie = bc.children[i]
-                if ie.type == gtp.GTP2_IE_FTEID then pgw_u = ie.value; break end
-            end
+        -- a Create Bearer Request (§7.2.3); accept it and answer with a
+        -- typed Create Bearer Response (§7.2.4) addressed to the PGW's
+        -- control TEID, echoing the request's sequence.
+        on_create_bearer_request = function(req, host, port)
             line("<- Create Bearer Req",
                  ("seq %d; accepting dedicated bearer"):format(req.sequence))
+
+            -- The request's bearer context carries the PGW's S5/S8-U
+            -- F-TEID; echo it back so the PGW can correlate the bearer.
+            local pgw_u
+            if req.bearers:size() > 0 then
+                local fts = req.bearers[0].fteids
+                if fts:size() > 0 then pgw_u = fts[0].fteid end
+            end
 
             -- Response bearer context: the EBI we allocate for the new
             -- bearer, an accepted cause, our S5/S8-U SGW F-TEID (instance
             -- 2) and the echoed PGW F-TEID (instance 3).
             local NEW_EBI = 6
-            local rbc = gtp.Ie()
-            rbc.type = gtp.GTP2_IE_BEARER_CONTEXT
-            rbc:add_child(gtp.Ie(gtp.GTP2_IE_EBI, string.char(NEW_EBI)))
-            rbc:add_child(gtp.Ie(gtp.GTP2_IE_CAUSE,
-                                 cause_ie(gtp.GTP2_CAUSE_REQUEST_ACCEPTED)))
-            rbc:add_child(gtp.Ie(gtp.GTP2_IE_FTEID,
-                                 fteid_v4(gtp.GTP2_IF_S5S8U_SGW, S5_UP_TEID + 1, sgw_ip), 2))
-            if pgw_u then rbc:add_child(gtp.Ie(gtp.GTP2_IE_FTEID, pgw_u, 3)) end
+            local rbc = gtp.BearerContext()
+            rbc.ebi   = NEW_EBI
+            rbc.cause = gtp.GTP2_CAUSE_REQUEST_ACCEPTED
+            local u = gtp.Fteid()
+            u.if_type, u.teid, u.addr4 = gtp.GTP2_IF_S5S8U_SGW, S5_UP_TEID + 1, sgw_ip
+            rbc:add_fteid(2, u)
+            if pgw_u then rbc:add_fteid(3, pgw_u) end
 
-            local resp = gtp.RawMessage()
-            resp.message_type = gtp.GTP2_MT_CREATE_BEARER_RESPONSE
+            local resp = gtp.CreateBearerResponse()
             resp.teid     = st.pgw_ctrl_teid or 0    -- to the PGW's control TEID
             resp.sequence = req.sequence             -- echo the request's sequence
-            resp:add_ie(gtp.Ie(gtp.GTP2_IE_CAUSE,
-                               cause_ie(gtp.GTP2_CAUSE_REQUEST_ACCEPTED)))
-            if req:has(gtp.GTP2_IE_PTI) then    -- echo the PTI if the request had one
-                resp:add_ie(gtp.Ie(gtp.GTP2_IE_PTI, req:find(gtp.GTP2_IE_PTI).value))
-            end
-            resp:add_ie(rbc)
+            resp.cause    = gtp.GTP2_CAUSE_REQUEST_ACCEPTED
+            resp.pti      = req.pti                   -- echo the PTI (-1 => omitted)
+            resp:add_bearer(rbc)
 
-            ep:send_raw(resp:encode(), host, port)
+            ep:send_create_bearer_response(resp, host, port)
             line("-> Create Bearer Resp",
                  ("seq %d, EBI %d, cause accepted"):format(req.sequence, NEW_EBI))
 
@@ -947,8 +814,8 @@ local function attach_pdn_over_s5()
 
     -- Serving Network (§8.18) and UE Location (§8.21): the PGW treats both
     -- as mandatory on the S5/S8 Create Session. The PLMN matches the IMSI.
-    req.serving_network = plmn(mcc, mnc)
-    req.uli             = uli_tai_ecgi(plmn(mcc, mnc), 0x0001, 0x0000001)
+    req.serving_network = gtp.plmn_encode(mcc, mnc)
+    req.uli             = gtp.uli_tai_ecgi(mcc, mnc, 0x0001, 0x0000001)
 
     -- PDN Address Allocation (§8.14): offer 0.0.0.0 to request a dynamic
     -- IPv4 address; the PGW returns the one it assigned in its own PAA.
@@ -957,11 +824,9 @@ local function attach_pdn_over_s5()
     req.paa.addr4    = "0.0.0.0"
 
     -- Protocol Configuration Options (§8.13): request the IMS P-CSCF IPv4
-    -- address. Octet 1 flags the PPP/IP configuration protocol (0x80);
-    -- one empty container follows -- P-CSCF IPv4 Address Request (0x000C)
-    -- -- which the PGW echoes back carrying the address(es) it assigned.
-    req.pco = string.char(0x80, math.floor(PCO_PCSCF_IPV4 / 256),
-                          PCO_PCSCF_IPV4 % 256, 0x00)
+    -- address (container 0x000C) -- the PGW echoes it back carrying the
+    -- address(es) it assigned.
+    req.pco = gtp.pco_request_pcscf()
 
     local c = gtp.Fteid()
     c.if_type = gtp.GTP2_IF_S5S8C_SGW               -- sender F-TEID: SGW S5/S8-C
