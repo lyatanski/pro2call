@@ -36,6 +36,7 @@
 
 %include <stdint.i>
 %include <std_string.i>
+%include <std_vector.i>
 %include <exception.i>
 
 /* ---- Lua callback bridge ----------------------------------------------
@@ -209,9 +210,20 @@ struct NetLuaFn;
 %constant int NET_ERR     = -1;
 %constant int NET_TIMEOUT = -2;
 
+/* Record types for Resolver::resolve() (net_dns.h; SWIG does not parse
+ * the #included header, so mirror the enum here). */
+%constant int NET_DNS_A     = 1;
+%constant int NET_DNS_AAAA  = 28;
+%constant int NET_DNS_SRV   = 33;
+%constant int NET_DNS_NAPTR = 35;
+
 /* ---- the facade itself ---- */
 
 %include "netxx.hpp"
+
+/* Resolver::resolve() returns a vector of records (indexed list in Lua,
+ * as gtp's IeList / UserPlaneTunnelList). */
+%template(DnsRecordList) std::vector<net::DnsRecord>;
 
 /* ---- Lua-friendly callback entry points ----
  *

@@ -5,8 +5,10 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 #include "net.h"
+#include "net_dns.h"
 #include "net_loop.h"
 #include "net_sock.h"
 
@@ -177,6 +179,72 @@ class UdpSocket
   private:
     net_sock s_;
     bool     open_ = false;
+};
+
+/* ---- DNS resolver ---- */
+
+/* One record from Resolver::resolve. Only the fields that apply to `type`
+ * are populated: addr for A / AAAA; prio/weight/port/target for SRV;
+ * order/pref/flags/service/regexp/replace for NAPTR. */
+struct DnsRecord {
+    int         type = 0; /* NET_DNS_A / _AAAA / _SRV / _NAPTR */
+    uint32_t    ttl  = 0;
+
+    std::string addr; /* A / AAAA: address literal */
+
+    uint16_t    prio   = 0; /* SRV */
+    uint16_t    weight = 0; /* SRV */
+    uint16_t    port   = 0; /* SRV */
+    std::string target;     /* SRV */
+
+    uint16_t    order = 0; /* NAPTR */
+    uint16_t    pref  = 0; /* NAPTR */
+    std::string flags;     /* NAPTR */
+    std::string service;   /* NAPTR */
+    std::string regexp;    /* NAPTR */
+    std::string replace;   /* NAPTR */
+};
+
+/* Synchronous DNS resolver over the C net_dns engine (net/src/dns.c): A /
+ * AAAA / SRV / NAPTR over UDP with EDNS0. The engine is asynchronous and
+ * loop-driven; this facade owns a private event loop and steps it until
+ * each query completes, so resolve() reads as a plain blocking call for
+ * the linear flows scripts drive. It never blocks forever — the engine's
+ * own retransmit timer (default 500 ms, 3 tries) bounds every query, so a
+ * dead or silent server surfaces as a timeout Error.
+ *
+ * The private loop is separate from any the caller runs, so a Resolver
+ * can be created and discarded around a lookup without disturbing an
+ * application loop (and without the teardown-ordering hazards a borrowed
+ * loop would bring under a garbage collector). */
+class Resolver
+{
+  public:
+    /* server: "" (default) uses the first nameserver in /etc/resolv.conf;
+     * otherwise a numeric IPv4/IPv6 address, queried on port 53. Throws
+     * Error when the address is malformed or the engine cannot start. */
+    explicit Resolver(const std::string& server = "");
+    ~Resolver();
+    Resolver(const Resolver&)            = delete;
+    Resolver& operator=(const Resolver&) = delete;
+
+    /* Retransmit timeout (ms) and try count; a non-positive value leaves
+     * the corresponding default unchanged. */
+    void conf(int timeout_ms, int tries);
+
+    /* Resolve `name` for record `type` (NET_DNS_A / _AAAA / _SRV /
+     * _NAPTR). Returns the answers of that type — empty on NXDOMAIN or no
+     * data of the type. Throws Error on timeout or transport failure. */
+    std::vector<DnsRecord> resolve(const std::string& name, int type);
+
+    /* The first A / AAAA address as a literal string. Throws Error when
+     * the name has no address record of that family. */
+    std::string resolve4(const std::string& name);
+    std::string resolve6(const std::string& name);
+
+  private:
+    Loop     loop_;         /* private; driven synchronously by resolve() */
+    net_dns* d_ = nullptr;
 };
 
 } /* namespace net */

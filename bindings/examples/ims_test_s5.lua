@@ -3,8 +3,8 @@
 -- Usage:
 --   LUA_CPATH=<build>/bindings/lua/?.so [PGW_IP=smf] lua ims_test_s5.lua
 --
--- PGW_IP may be a host name (resolved through the system resolver) or a
--- literal IP address; it defaults to "smf".
+-- PGW_IP may be a host name (resolved with the net module's DNS resolver)
+-- or a literal IP address; it defaults to "smf".
 --
 -- GTP-U user plane: when the eBPF datapath is available (CAP_BPF +
 -- CAP_NET_ADMIN, eBPF build) the script programs each bearer's forwarding
@@ -25,7 +25,7 @@
 --
 
 local gtp = require("gtp")
-local net = require("net")     -- event loop + UDP socket transport
+local net = require("net")     -- event loop + UDP socket transport + DNS resolver
 local sip = require("sip")     -- IMS REGISTER builder for the user-plane probe
 
 -- ---- configuration ----------------------------------------------------
@@ -88,29 +88,15 @@ local function iface_ipv4(name)
 end
 
 -- Resolve a host name to an IPv4 literal. A dotted-quad is returned
--- unchanged; otherwise we shell out to the system resolver (the net
--- binding exposes none) and take the first A record — `getent` covers
--- glibc / musl-utils, busybox `nslookup` covers Alpine. The name is
--- validated first so it cannot smuggle shell syntax into the command.
+-- unchanged; otherwise the net module's own asynchronous DNS resolver
+-- (net_dns: A/AAAA/SRV/NAPTR over UDP, driven by its private event loop)
+-- takes the first A record. net.Resolver() reads /etc/resolv.conf for the
+-- nameserver; resolve4() throws on NXDOMAIN or timeout. No external tools.
 local function resolve(name)
     if name:match("^%d+%.%d+%.%d+%.%d+$") then return name end
-    assert(name:match("^[%w%.%-]+$"), "invalid PGW host name: " .. name)
-
-    local function run(cmd)
-        local p = io.popen(cmd .. " 2>/dev/null"); if not p then return "" end
-        local out = p:read("*a") or ""; p:close(); return out
-    end
-
-    -- getent prints only answer lines ("<ip>  STREAM <name>").
-    local ip = run("getent ahostsv4 " .. name):match("(%d+%.%d+%.%d+%.%d+)")
-    -- nslookup precedes the answer with the server's own address; the
-    -- answer section starts at "Name:", so scan only from there.
-    if not ip then
-        local tail = run("nslookup " .. name):match("Name:.*")
-        if tail then ip = tail:match("(%d+%.%d+%.%d+%.%d+)") end
-    end
-    assert(ip, "cannot resolve PGW host name: " .. name)
-    return ip
+    local ok, res = pcall(function() return net.Resolver():resolve4(name) end)
+    assert(ok, ("cannot resolve PGW host name %q: %s"):format(name, why(res)))
+    return res
 end
 
 -- Encode an MCC/MNC pair into the 3-octet PLMN of TS 24.008 §10.5.1.3,

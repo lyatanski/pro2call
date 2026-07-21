@@ -268,4 +268,111 @@ int UdpSocket::fd() const
     return s_.fd;
 }
 
+/* ---- Resolver ---- */
+
+namespace
+{
+/* Gathers the records net_dns delivers into a DnsRecord vector. Lives on
+ * the stack of Resolver::resolve for the duration of one query; net_dns
+ * invokes the callback exactly once (answer, rcode or timeout). */
+struct SyncCollect {
+    bool                   done   = false;
+    int                    status = 0;
+    std::vector<DnsRecord> rr;
+};
+
+void sync_dns_cb(void* ud, int status, const net_dns_rr* rr, size_t n)
+{
+    auto* c   = static_cast<SyncCollect*>(ud);
+    c->done   = true;
+    c->status = status;
+    for (size_t i = 0; i < n; i++) {
+        DnsRecord d;
+        d.type                     = rr[i].type;
+        d.ttl                      = rr[i].ttl;
+        char buf[INET6_ADDRSTRLEN] = "";
+        switch (rr[i].type) {
+        case NET_DNS_A:
+            if (inet_ntop(AF_INET, &rr[i].u.a, buf, sizeof buf)) d.addr = buf;
+            break;
+        case NET_DNS_AAAA:
+            if (inet_ntop(AF_INET6, &rr[i].u.aaaa, buf, sizeof buf))
+                d.addr = buf;
+            break;
+        case NET_DNS_SRV:
+            d.prio   = rr[i].u.srv.prio;
+            d.weight = rr[i].u.srv.weight;
+            d.port   = rr[i].u.srv.port;
+            d.target = rr[i].u.srv.target;
+            break;
+        case NET_DNS_NAPTR:
+            d.order   = rr[i].u.naptr.order;
+            d.pref    = rr[i].u.naptr.pref;
+            d.flags   = rr[i].u.naptr.flags;
+            d.service = rr[i].u.naptr.service;
+            d.regexp  = rr[i].u.naptr.regexp;
+            d.replace = rr[i].u.naptr.replace;
+            break;
+        default: continue;
+        }
+        c->rr.push_back(std::move(d));
+    }
+}
+} /* namespace */
+
+Resolver::Resolver(const std::string& server)
+{
+    net_addr  a;
+    net_addr* sp = nullptr;
+    if (!server.empty()) {
+        if (net_addr_from(&a, server.c_str(), 53) != NET_OK)
+            throw Error("bad DNS server address: " + server);
+        sp = &a;
+    }
+    d_ = net_dns_new(loop_.raw(), sp);
+    if (!d_) throw Error("cannot create DNS resolver");
+}
+
+Resolver::~Resolver()
+{
+    /* Free the engine (which deregisters its socket from loop_) while
+     * loop_ is still alive: members are destroyed only after this body
+     * returns, so the private loop outlives its DNS engine. */
+    if (d_) net_dns_free(d_);
+}
+
+void Resolver::conf(int timeout_ms, int tries)
+{
+    net_dns_conf(d_, timeout_ms, tries);
+}
+
+std::vector<DnsRecord> Resolver::resolve(const std::string& name, int type)
+{
+    SyncCollect c;
+    if (net_dns_query(d_, name.c_str(), static_cast<uint16_t>(type),
+                      sync_dns_cb, &c) != NET_OK)
+        throw Error("cannot start DNS query for " + name);
+    /* Bounded by the engine's retransmit timer: a silent server fires the
+     * timeout callback (which sets done) after the configured tries. */
+    while (!c.done)
+        loop_.step(-1);
+    if (c.status < 0)
+        throw Error("DNS resolve " + name + " timed out or failed", c.status);
+    return c.rr; /* status > 0 is a DNS rcode (e.g. NXDOMAIN): empty list */
+}
+
+std::string Resolver::resolve4(const std::string& name)
+{
+    for (const auto& r : resolve(name, NET_DNS_A))
+        if (r.type == NET_DNS_A) return r.addr;
+    throw Error("no A record for " + name);
+}
+
+std::string Resolver::resolve6(const std::string& name)
+{
+    for (const auto& r : resolve(name, NET_DNS_AAAA))
+        if (r.type == NET_DNS_AAAA) return r.addr;
+    throw Error("no AAAA record for " + name);
+}
+
 } /* namespace net */
