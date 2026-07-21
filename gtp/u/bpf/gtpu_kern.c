@@ -429,8 +429,10 @@ int gtpu_encap(struct __sk_buff* skb)
 
     __u8  family;
     __u8  proto;
-    __u8  ue_addr[16] = { 0 };
-    __u32 l4_off      = 0; /* 0 = no L4 header in this frame */
+    __u8  ue_addr[16]     = { 0 }; /* inner destination */
+    __u8  inner_saddr[16] = { 0 }; /* inner source, for the L4 pseudo-header */
+    __u32 l4_off          = 0;     /* 0 = no L4 header in this frame */
+    __u32 inner_l4_len    = 0;     /* L4 header + payload; 0 = do not checksum */
 
     if (eth->h_proto == bpf_htons(ETH_P_IP)) {
         struct iphdr* ip = (void*)(eth + 1);
@@ -439,16 +441,26 @@ int gtpu_encap(struct __sk_buff* skb)
         family = AF_INET;
         proto  = ip->protocol;
         __builtin_memcpy(ue_addr, &ip->daddr, 4);
+        __builtin_memcpy(inner_saddr, &ip->saddr, 4);
+        __u32 ihl_bytes = (__u32)ip->ihl * 4;
         /* Ports exist only in first fragments. */
         if (!(ip->frag_off & bpf_htons(0x1fff)))
-            l4_off = ETH_HLEN + (__u32)ip->ihl * 4;
+            l4_off = ETH_HLEN + ihl_bytes;
+        /* A complete L4 checksum only exists in a whole datagram (offset 0,
+         * MF clear); leave fragments to the offloaded/partial checksum. */
+        if (!(ip->frag_off & bpf_htons(0x3fff))) {
+            __u32 tot = bpf_ntohs(ip->tot_len);
+            if (tot > ihl_bytes) inner_l4_len = tot - ihl_bytes;
+        }
     } else if (eth->h_proto == bpf_htons(ETH_P_IPV6)) {
         struct ipv6hdr* ip6 = (void*)(eth + 1);
         if ((void*)(ip6 + 1) > data_end) return TC_ACT_OK;
         family = AF_INET6;
         proto  = ip6->nexthdr; /* no ext walk: ports stay wildcard then */
         __builtin_memcpy(ue_addr, &ip6->daddr, 16);
-        l4_off = ETH_HLEN + sizeof *ip6;
+        __builtin_memcpy(inner_saddr, &ip6->saddr, 16);
+        inner_l4_len = bpf_ntohs(ip6->payload_len); /* no ext headers assumed */
+        l4_off       = ETH_HLEN + sizeof *ip6;
     } else {
         return TC_ACT_OK;
     }
@@ -639,6 +651,77 @@ int gtpu_encap(struct __sk_buff* skb)
         if (bpf_skb_store_bytes(
                 skb, ETH_HLEN + outer_l3 + offsetof(struct udphdr, check),
                 &check, sizeof check, 0))
+            return TC_ACT_SHOT;
+    }
+
+    /* ---- Finalize the INNER L4 checksum in software ----
+     *
+     * A locally-generated UDP/TCP datagram reaches this egress hook with
+     * ip_summed == CHECKSUM_PARTIAL: the L4 checksum field holds only the
+     * pseudo-header partial sum, to be completed by the NIC (or
+     * skb_checksum_help) at transmit. But we prepend the outer headers and
+     * bpf_redirect the frame, so that completion never runs — the peer UPF
+     * then decapsulates and forwards the inner packet with a bogus checksum,
+     * and the P-CSCF's kernel drops it before any socket sees it (tcpdump
+     * still shows it arriving, which is exactly the "packet reaches the
+     * container but is never processed" symptom).
+     *
+     * Recompute the checksum from scratch here: pseudo-header sum plus a
+     * bounded walk over the L4 bytes with the check field zeroed. This is
+     * idempotent for packets that already carry a correct checksum, so it is
+     * safe to run unconditionally. The inner L4 sits at l4_off + outer_len
+     * once the room has grown. SCTP (CRC32c, not the internet checksum) is
+     * left to the stack; oversized inners keep the offloaded checksum (MTU
+     * keeps SIP well within CSUM_MAX_LEN). */
+    __u32 min_l4 = proto == IPPROTO_UDP ? sizeof(struct udphdr) : 20;
+    if (l4_off && (proto == IPPROTO_UDP || proto == IPPROTO_TCP) &&
+        inner_l4_len >= min_l4 && inner_l4_len <= CSUM_MAX_LEN) {
+        __u32 l4  = l4_off + outer_len; /* inner L4 offset after the growth */
+        __u32 ck  = l4 + (proto == IPPROTO_UDP ? offsetof(struct udphdr, check)
+                                               : 16 /* TCP checksum field */);
+        __u16 zero = 0;
+        if (bpf_skb_store_bytes(skb, ck, &zero, sizeof zero, 0))
+            return TC_ACT_SHOT;
+
+        __s64 isum;
+        if (family == AF_INET) {
+            struct {
+                __be32 src, dst;
+                __u8   zero, proto;
+                __be16 len;
+            } ph4;
+            __builtin_memcpy(&ph4.src, inner_saddr, 4);
+            __builtin_memcpy(&ph4.dst, ue_addr, 4);
+            ph4.zero  = 0;
+            ph4.proto = proto;
+            ph4.len   = bpf_htons((__u16)inner_l4_len);
+            isum      = bpf_csum_diff(0, 0, (__be32*)&ph4, sizeof ph4, 0);
+        } else {
+            struct {
+                __u8   src[16], dst[16];
+                __be32 len;
+                __u8   zero[3], nexthdr;
+            } ph6;
+            __builtin_memcpy(ph6.src, inner_saddr, 16);
+            __builtin_memcpy(ph6.dst, ue_addr, 16);
+            ph6.len     = bpf_htonl(inner_l4_len);
+            ph6.zero[0] = ph6.zero[1] = ph6.zero[2] = 0;
+            ph6.nexthdr                             = proto;
+            isum        = bpf_csum_diff(0, 0, (__be32*)&ph6, sizeof ph6, 0);
+        }
+        if (isum < 0) return TC_ACT_SHOT;
+
+        isum = csum_pkt_range(skb, l4, inner_l4_len, (__u64)isum);
+        if (isum < 0) return TC_ACT_SHOT;
+
+        __u32 s      = (__u32)isum;
+        s            = (s & 0xffff) + (s >> 16);
+        s            = (s & 0xffff) + (s >> 16);
+        __u16 icheck = (__u16)~s;
+        /* RFC 768: a computed 0 is transmitted as 0xffff so it is not read
+         * as "no checksum". A genuine TCP checksum of 0 is left as is. */
+        if (proto == IPPROTO_UDP && !icheck) icheck = 0xffff;
+        if (bpf_skb_store_bytes(skb, ck, &icheck, sizeof icheck, 0))
             return TC_ACT_SHOT;
     }
 
