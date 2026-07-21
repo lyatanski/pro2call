@@ -269,6 +269,21 @@ local function sec_param(hdr, key)
     return hdr:match((key:gsub("%-", "%%-")) .. "=([%w%.]+)")
 end
 
+-- The challenge's qop is a quoted list (kamailio's ims_auth default is
+-- "auth,auth-int"); pick a single token for the response. Only "auth" is
+-- supported here (HA2 = MD5(method:uri); auth-int would fold the body in),
+-- so prefer it and fall back to no-qop (RFC 2069) rather than claim a mode
+-- we do not compute. Echoing the whole list would both miscompute the digest
+-- and put a comma inside the qop value, which breaks the S-CSCF's header
+-- parsing ("qop specified with no nonce count").
+local function pick_qop(list)
+    if not list then return nil end
+    for tok in list:gmatch("[%w%-]+") do
+        if tok == "auth" then return "auth" end
+    end
+    return nil
+end
+
 -- The UE's Security-Client offer (RFC 3329 / TS 33.203): its two inbound
 -- SPIs, its protected client/server ports, and the integrity (hmac-sha-1-96)
 -- and cipher (aes-cbc) algorithms it supports for the ESP SAs.
@@ -349,7 +364,7 @@ local function parse_challenge(msg)
         rand  = blob:sub(1, 16),
         autn  = blob:sub(17, 32),
         realm = auth_param(wa, "realm") or ims_realm,
-        qop   = auth_param(wa, "qop"),
+        qop   = pick_qop(auth_param(wa, "qop")),
         ss_raw   = ss,
         p_spi_c  = ss and tonumber(sec_param(ss, "spi-c")),
         p_spi_s  = ss and tonumber(sec_param(ss, "spi-s")),
