@@ -27,6 +27,7 @@
 static const uint8_t UE[4]        = { 10, 45, 0, 2 };
 static const uint8_t UE2[4]       = { 10, 45, 0, 3 };
 static const uint8_t HOST[4]      = { 203, 0, 113, 10 };
+static const uint8_t PCSCF[4]     = { 203, 0, 113, 20 }; /* destination-steered filter target */
 static const uint8_t O_LOCAL[4]   = { 198, 51, 100, 1 };
 static const uint8_t O_PEER[4]    = { 198, 51, 100, 2 };
 static const uint8_t O_LOCAL6[16] = { 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0,
@@ -108,6 +109,16 @@ static size_t inner_udp4(uint8_t* p, const uint8_t dst[4], uint16_t sport,
     off += udp_push(p + off, sport, dport, (uint16_t)plen);
     memcpy(p + off, payload, plen);
     return off + plen;
+}
+
+/* Minimal ESP (IP proto 50) datagram src->dst; its body is irrelevant to
+ * classification (the encap keys on proto + inner dst, no ports for ESP). */
+static size_t inner_esp4(uint8_t* p, const uint8_t src[4], const uint8_t dst[4])
+{
+    static const uint8_t esp[8] = { 0x20, 0x01, 0, 0, 0, 0, 0, 1 }; /* SPI + seq */
+    size_t off = ipv4_push(p, src, dst, 50, (uint16_t)sizeof esp);
+    memcpy(p + off, esp, sizeof esp);
+    return off + sizeof esp;
 }
 
 /* Full outer frame: Eth + IPv4 + UDP:2152 + GTP-U (+ PSC ext). */
@@ -245,6 +256,26 @@ spec ("gtpu_bpf") {
             sig.proto              = 17;
             sig.ue_port            = 5060;
             check(gtpu_tft_add(g, &sig) == GTPU_OK);
+
+            /* Two filters on ONE bearer (TEID 0x1006): a UE's uplink SIP
+             * steered by inner dst = PCSCF on UDP:5060, and that same UE's
+             * ESP-protected traffic (proto 50) to PCSCF once its IPsec SAs
+             * are up. Both share the bearer's single decap entry. */
+            gtpu_tft_t sip_udp;
+            memset(&sip_udp, 0, sizeof sip_udp);
+            sip_udp.tunnel             = bearer_a;
+            sip_udp.tunnel.local_teid  = 0x1006;
+            sip_udp.tunnel.remote_teid = 0x2006;
+            sip_udp.tunnel.ebi         = 5;
+            memcpy(sip_udp.tunnel.inner_addr, PCSCF, 4);
+            sip_udp.proto              = 17;
+            sip_udp.ue_port            = 5060;
+            check(gtpu_tft_add(g, &sip_udp) == GTPU_OK);
+
+            gtpu_tft_t sip_esp = sip_udp; /* same bearer, ESP */
+            sip_esp.proto   = 50;
+            sip_esp.ue_port = 0;
+            check(gtpu_tft_add(g, &sip_esp) == GTPU_OK); /* 2nd filter, same TEID */
 
             /* IPv6 outer + QFI for a second UE. */
             gtpu_tunnel_t d = bearer_a;
@@ -428,6 +459,30 @@ spec ("gtpu_bpf") {
             const uint8_t* gtpu = out + 14 + 20 + 8;
             check(gtpu[4] == 0 && gtpu[5] == 0);
             check(be16g(gtpu + 6) == 0x2003); /* dedicated TEID */
+        }
+
+        it ("steers a bearer's UDP and ESP filters onto one TEID", !!g) {
+            uint8_t  inner[128], in[256], out[4096];
+            uint32_t ret;
+            size_t   olen;
+
+            /* Uplink SIP: UDP to PCSCF:5060 -> bearer 0x1006. */
+            size_t ilen = inner_udp4(inner, PCSCF, 5088, 5060, "register");
+            size_t ln   = eth_push(in, 0x0800);
+            memcpy(in + ln, inner, ilen);
+            ln += ilen;
+            check(run_prog(encap_fd, in, ln, out, &olen, &ret) == 0);
+            check(ret == TC_ACT_REDIRECT);
+            check(be16g(out + 14 + 20 + 8 + 6) == 0x2006);
+
+            /* Same UE's ESP (proto 50) to PCSCF -> the same bearer. */
+            ilen = inner_esp4(inner, UE, PCSCF);
+            ln   = eth_push(in, 0x0800);
+            memcpy(in + ln, inner, ilen);
+            ln += ilen;
+            check(run_prog(encap_fd, in, ln, out, &olen, &ret) == 0);
+            check(ret == TC_ACT_REDIRECT);
+            check(be16g(out + 14 + 20 + 8 + 6) == 0x2006);
         }
 
         it ("keeps non-matching traffic on the default bearer", !!g) {

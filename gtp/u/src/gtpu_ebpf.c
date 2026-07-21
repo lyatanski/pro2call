@@ -519,10 +519,20 @@ int gtpu_tft_add(gtpu_ebpf_t* g, const gtpu_tft_t* f)
     int tft_fd = bpf_map__fd(g->skel->maps.teid_tft_map);
 
     pthread_mutex_lock(&g->lock);
-    rc = bpf_map_update_elem(rx_fd, &f->tunnel.local_teid, &rx, BPF_NOEXIST);
+    /* Several filters may steer onto one bearer — e.g. a UE's plain SIP
+     * (UDP) and that same UE's ESP-protected traffic (proto 50) both ride
+     * the default bearer. They share the single decap (rx) entry keyed on
+     * the bearer's local_teid, so create-or-refresh it (BPF_ANY) rather than
+     * demanding it be absent; the tft entries are keyed on the distinct
+     * filter tuples. Roll the rx entry back on a tft failure only when this
+     * call created it, so a failed add cannot drop an entry another filter
+     * on the same bearer still needs. */
+    struct gtpu_rx_tun cur;
+    bool had_rx = bpf_map_lookup_elem(rx_fd, &f->tunnel.local_teid, &cur) == 0;
+    rc = bpf_map_update_elem(rx_fd, &f->tunnel.local_teid, &rx, BPF_ANY);
     if (!rc) {
         rc = bpf_map_update_elem(tft_fd, &k, &tx, BPF_NOEXIST);
-        if (rc) bpf_map_delete_elem(rx_fd, &f->tunnel.local_teid);
+        if (rc && !had_rx) bpf_map_delete_elem(rx_fd, &f->tunnel.local_teid);
     }
     pthread_mutex_unlock(&g->lock);
     return err_sys(rc);

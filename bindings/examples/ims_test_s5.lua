@@ -14,23 +14,28 @@
 -- map, but no interface is hooked. Without the datapath the tunnels are
 -- only reported.
 --
--- With both interfaces attached the script drives a full IMS registration
--- end to end over the encap path: a real SIP REGISTER from the UE toward
--- the P-CSCF (whose address the PGW returned in the Create Session
--- Response PCO, TS 24.008 container 0x000C), the P-CSCF's 401 IMS-AKA
--- challenge (RAND||AUTN), the authenticated REGISTER carrying the
--- AKAv1-MD5 digest response, and the 200 OK. IMS signalling rides the
--- default bearer, so the REGISTER is steered onto it (a UDP:5060 TFT) and
--- the UPF routes it to the P-CSCF; the 401/200 come back down the same
--- bearer's decap entry. Per-TEID kernel counters confirm the datapath in
--- both directions (tx on each send, rx on each response). The dedicated
+-- With both interfaces attached the script drives a full IMS-AKA
+-- registration end to end over the encap path (TS 33.203). The P-CSCF
+-- address comes from the Create Session Response PCO (TS 24.008 container
+-- 0x000C). The flow:
+--   1. REGISTER (unprotected, plain UDP:5060) with a Security-Client offer.
+--   2. 401 with the AKA challenge (RAND||AUTN) and the P-CSCF's
+--      Security-Server (its SPIs and protected ports).
+--   3. Verify AUTN, derive CK/IK, install four transport-mode ESP SAs.
+--   4. REGISTER (protected, ESP) to the P-CSCF's protected server port with
+--      the AKAv1-MD5 digest response and a Security-Verify; then 200 OK.
+--
+-- IMS signalling rides the default bearer, so both shapes are steered onto
+-- it -- the plain REGISTER by a UDP:5060 TFT and everything ESP-protected
+-- by a proto-50 TFT (two filters on the one bearer) -- and the UPF routes
+-- them to the P-CSCF; the 401/200 come back down the same bearer's decap
+-- entry, and the kernel's IPsec decrypts the protected ones. Per-TEID
+-- kernel counters confirm the datapath in both directions. The dedicated
 -- (media) bearer from the Create Bearer Request is accepted but not probed.
 --
--- IMS-AKA is done at the digest layer only (no IPsec ESP SAs): ESP would
--- turn the inner packet into IP protocol 50, which the UDP:5060 TFT this
--- datapath test verifies would no longer match. The USIM secret defaults
--- to the 3GPP TS 35.207 Milenage test set; override IMS_K / IMS_OP (or
--- IMS_OPC) for a real subscriber.
+-- The USIM secret defaults to a test set; override IMS_K / IMS_OPC (raw
+-- 16-byte hex) for a real subscriber. Installing ESP SAs needs
+-- CAP_NET_ADMIN; each kernel op degrades to a reported line when refused.
 --
 -- The whole scenario is a state machine advanced by socket and timer
 -- callbacks on one net.Loop, with a single loop:run() at the bottom
@@ -65,8 +70,17 @@ local S5_UP_TEID = 0x200       -- our (SGW) S5/S8-U downlink tunnel endpoint id
 local T3_MS, N3  = 1000, 3     -- GTP-C retransmission: 1s T3-RESPONSE, up to 3 sends
 local SIP_T_MS   = 5000        -- SIP response deadline per registration step
 
-local IPPROTO_UDP    = 17      -- inner protocol used by the SIP signalling flow
+local IPPROTO_UDP    = 17      -- unprotected REGISTER: plain UDP toward the P-CSCF
+local IPPROTO_ESP    = 50      -- protected traffic: ESP (IMS-AKA IPsec, TS 33.203)
 local PCSCF_SIP_PORT = 5060    -- IMS signalling bearer TFT: SIP toward the P-CSCF
+
+-- IMS-AKA IPsec (TS 33.203 / RFC 3329): the UE's protected client/server
+-- ports and the SPIs of its two inbound ESP SAs, advertised in the
+-- Security-Client offer; the P-CSCF's own ports/SPIs come back in the 401's
+-- Security-Server. The protected REGISTER is sent from the client port to
+-- the P-CSCF's protected server port and the kernel ESP-wraps it.
+local PORT_UC, PORT_US = 5088, 5090
+local SPI_UC,  SPI_US  = 0x2001, 0x2002
 
 local PCO_PCSCF_IPV4 = 0x000c  -- TS 24.008 §10.5.6.3 P-CSCF IPv4 Address container
 
@@ -86,6 +100,14 @@ local function line(k, v) print(("   %-22s %s"):format(k, v)) end
 
 -- Strip the leading "context: " a gtp/net Error carries, for one-line logs.
 local function why(e) return (tostring(e):gsub("^.-:%s*", "")) end
+
+-- Run a kernel op (ESP SA / policy install), turning a CAP_NET_ADMIN
+-- rejection into one reported line rather than aborting the run.
+local function attempt(what, fn)
+    local ok, err = pcall(fn)
+    line(what, ok and "ok" or ("skipped (" .. why(err) .. ")"))
+    return ok
+end
 
 -- Map an interface name to its kernel ifindex through sysfs (the binding
 -- exposes no if_nametoindex). Returns nil when the name is unset or the
@@ -242,6 +264,20 @@ local function auth_param(hdr, key)
     return hdr:match(key .. '%s*=%s*"([^"]*)"') or hdr:match(key .. '%s*=%s*([^,%s]+)')
 end
 
+-- pull one "spi-s=1234" / "port-s=5090" token out of a Security-* header
+local function sec_param(hdr, key)
+    return hdr:match((key:gsub("%-", "%%-")) .. "=([%w%.]+)")
+end
+
+-- The UE's Security-Client offer (RFC 3329 / TS 33.203): its two inbound
+-- SPIs, its protected client/server ports, and the integrity (hmac-sha-1-96)
+-- and cipher (aes-cbc) algorithms it supports for the ESP SAs.
+local function security_client()
+    return ("ipsec-3gpp; alg=hmac-sha-1-96; ealg=aes-cbc; " ..
+            "spi-c=%d; spi-s=%d; port-c=%d; port-s=%d")
+        :format(SPI_UC, SPI_US, PORT_UC, PORT_US)
+end
+
 -- HTTP Digest AKAv1-MD5: the RES recovered from the challenge is the password.
 local function md5hex(s) return hex(ipsec.md5(s)) end
 local function digest_response(user, realm, res, method, uri, nonce, nc, cnonce, qop)
@@ -253,13 +289,18 @@ local function digest_response(user, realm, res, method, uri, nonce, nc, cnonce,
     return md5hex(ha1 .. ":" .. nonce .. ":" .. ha2)
 end
 
--- The Authorization header value: AKAv1-MD5 Digest. An empty nonce/
--- response advertises IMS-AKA on the first (unprotected) REGISTER; the
+-- The Authorization header value: AKAv1-MD5 Digest. `realm` MUST be the one
+-- from the challenge (RFC 2617): the S-CSCF recomputes HA1 with the realm it
+-- reads back from this header, so it has to match the realm the digest was
+-- computed with — the two can differ from the UE's derived home domain (e.g.
+-- a two-digit-MNC realm), which would otherwise fail authentication. An empty
+-- nonce/response advertises IMS-AKA on the first (unprotected) REGISTER; the
 -- second carries the challenge's nonce and the computed response, plus
--- qop/nc/cnonce when the P-CSCF asked for qop.
-local function authz_hdr(nonce, response, qopset)
+-- qop/nc/cnonce when the P-CSCF asked for qop. The digest-uri stays the home
+-- domain (= the REGISTER Request-URI), independent of the realm.
+local function authz_hdr(realm, nonce, response, qopset)
     local a = ('Digest username="%s",realm="%s",uri="sip:%s",nonce="%s",response="%s",algorithm=AKAv1-MD5')
-        :format(impi, ims_realm, ims_realm, nonce or "", response or "")
+        :format(impi, realm, ims_realm, nonce or "", response or "")
     if qopset then
         a = a .. (',qop=%s,nc=%s,cnonce="%s"'):format(qopset.qop, qopset.nc, qopset.cnonce)
     end
@@ -267,30 +308,33 @@ local function authz_hdr(nonce, response, qopset)
 end
 
 -- Build the UE's IMS REGISTER toward the P-CSCF (TS 24.229 / RFC 3261):
--- the Request-URI is the home domain, Via/Contact carry the UE's own
--- (PAA) address at the SIP port, and `authz` is the AKAv1-MD5 credential.
--- Each REGISTER is a fresh non-INVITE transaction, so the branch and the
--- From tag are keyed on the CSeq; the Call-ID is stable across the pair.
-local function build_register(ue_addr, cseq, authz)
-    return sip.Builder()
+-- the Request-URI is the home domain, Via/Contact carry the UE's own (PAA)
+-- address at its protected client port, and `authz` is the AKAv1-MD5
+-- credential. Each REGISTER is a fresh non-INVITE transaction, so the branch
+-- and the From tag are keyed on the CSeq; the Call-ID is stable across the
+-- pair. `sec_name`/`sec_hdr`, when given, add a Security-Client (first
+-- REGISTER) or Security-Verify (protected REGISTER) header.
+local function build_register(ue_addr, cseq, authz, sec_name, sec_hdr)
+    local b = sip.Builder()
         :request(sip.REGISTER, "sip:" .. ims_realm)
         :header(sip.H_VIA,
-                ("SIP/2.0/UDP %s:%d;branch=z9hG4bK-%s-%d"):format(ue_addr, PCSCF_SIP_PORT, imsi, cseq))
+                ("SIP/2.0/UDP %s:%d;branch=z9hG4bK-%s-%d"):format(ue_addr, PORT_UC, imsi, cseq))
         :header_u32(sip.H_MAX_FORWARDS, 70)
         :header(sip.H_FROM, ("<%s>;tag=%s-%d"):format(impu, imsi, cseq))
         :header(sip.H_TO, ("<%s>"):format(impu))
         :header(sip.H_CALL_ID, ("%s@%s"):format(imsi, ue_addr))
         :header(sip.H_CSEQ, ("%d REGISTER"):format(cseq))
-        :header(sip.H_CONTACT, ("<sip:%s:%d>"):format(ue_addr, PCSCF_SIP_PORT))
+        :header(sip.H_CONTACT, ("<sip:%s:%d>"):format(ue_addr, PORT_UC))
         :header_u32(sip.H_EXPIRES, 600000)
         :header(sip.H_AUTHORIZATION, authz)
-        :done()
+    if sec_hdr then b:header_name(sec_name, sec_hdr) end
+    return b:done()
 end
 
--- Parse the 401: the AKA challenge from WWW-Authenticate. The nonce is
--- base64(RAND||AUTN); realm/qop steer the digest. No Security-Server is
--- parsed here — this datapath test authenticates at the digest layer and
--- keeps the flow plain UDP so the UDP:5060 TFT keeps matching.
+-- Parse the 401: the AKA challenge from WWW-Authenticate (nonce is
+-- base64(RAND||AUTN); realm/qop steer the digest) and, when present, the
+-- P-CSCF's Security-Server (its SPIs and protected ports). ss_raw is kept
+-- verbatim so the protected REGISTER can echo it back in Security-Verify.
 local function parse_challenge(msg)
     local wa = msg:header("WWW-Authenticate")
     assert(wa ~= "", "401 without WWW-Authenticate")
@@ -298,13 +342,68 @@ local function parse_challenge(msg)
     assert(nonce and nonce ~= "", "401 WWW-Authenticate without nonce")
     local blob = b64dec(nonce)
     assert(#blob >= 32, "AKA nonce shorter than RAND||AUTN")
+    local ss = msg:header("Security-Server")
+    ss = ss ~= "" and ss or nil
     return {
         nonce = nonce,
         rand  = blob:sub(1, 16),
         autn  = blob:sub(17, 32),
         realm = auth_param(wa, "realm") or ims_realm,
         qop   = auth_param(wa, "qop"),
+        ss_raw   = ss,
+        p_spi_c  = ss and tonumber(sec_param(ss, "spi-c")),
+        p_spi_s  = ss and tonumber(sec_param(ss, "spi-s")),
+        p_port_c = ss and tonumber(sec_param(ss, "port-c")),
+        p_port_s = ss and tonumber(sec_param(ss, "port-s")),
     }
+end
+
+-- Build and install the four transport-mode ESP SAs and their steering
+-- policies (TS 33.203 Annex I: IK integrity-protects, CK encrypts). The
+-- keys come straight from AKA. Best-effort: each kernel op reports and
+-- degrades on a CAP_NET_ADMIN rejection.
+local function establish_sas(xfrm, ch, keys, ue_addr, pcscf)
+    local function esp_sa(src, dst, spi, reqid)
+        local sa = ipsec.Sa()
+        sa.src, sa.dst, sa.spi = src, dst, spi
+        sa.proto, sa.mode, sa.reqid = ipsec.PROTO_ESP, ipsec.TRANSPORT, reqid
+        sa.enc_alg,  sa.enc_key  = "cbc(aes)",   keys.ck   -- confidentiality (CK)
+        sa.auth_alg, sa.auth_key = "hmac(sha1)", keys.ik   -- integrity (IK, SHA-1-96)
+        return sa
+    end
+    local function esp_policy(dir, src, dst, sport, dport, reqid)
+        local p = ipsec.Policy()
+        p.src, p.dst = src, dst
+        p.sel_proto, p.sport, p.dport = IPPROTO_UDP, sport, dport   -- UDP selector
+        p.dir, p.action = dir, ipsec.ALLOW
+        p.has_tmpl, p.tmpl_reqid = true, reqid
+        p.tmpl_proto, p.tmpl_mode = ipsec.PROTO_ESP, ipsec.TRANSPORT
+        return p
+    end
+    -- Four SAs keyed by the receiver's SPI: UE->P to the P-CSCF's server and
+    -- client ports (outbound), P->UE to the UE's client and server ports
+    -- (inbound). reqid = SPI ties each policy to its SA.
+    local sas = {
+        esp_sa(ue_addr, pcscf, ch.p_spi_s, ch.p_spi_s),
+        esp_sa(ue_addr, pcscf, ch.p_spi_c, ch.p_spi_c),
+        esp_sa(pcscf, ue_addr, SPI_UC,     SPI_UC),
+        esp_sa(pcscf, ue_addr, SPI_US,     SPI_US),
+    }
+    local pols = {
+        esp_policy(ipsec.DIR_OUT, ue_addr, pcscf, PORT_UC, ch.p_port_s, ch.p_spi_s),
+        esp_policy(ipsec.DIR_OUT, ue_addr, pcscf, PORT_US, ch.p_port_c, ch.p_spi_c),
+        esp_policy(ipsec.DIR_IN,  pcscf, ue_addr, ch.p_port_s, PORT_UC, SPI_UC),
+        esp_policy(ipsec.DIR_IN,  pcscf, ue_addr, ch.p_port_c, PORT_US, SPI_US),
+    }
+    line("ESP keys", ("enc(CK)=%s  auth(IK)=%s"):format(hex(keys.ck), hex(keys.ik)))
+    line("UE ports", ("client %d / server %d, SPIs %#x/%#x"):format(PORT_UC, PORT_US, SPI_UC, SPI_US))
+    for i, sa in ipairs(sas) do
+        attempt(("ESP SA %d (spi %#x)"):format(i, sa.spi), function() xfrm:sa_add(sa) end)
+    end
+    for i, p in ipairs(pols) do
+        attempt(("ESP policy %d (%s)"):format(i, p.dir == ipsec.DIR_OUT and "out" or "in"),
+                function() xfrm:policy_add(p) end)
+    end
 end
 
 -- ---- GTPv2-C over S5/S8 + IMS registration over GTP-U -----------------
@@ -382,42 +481,45 @@ local function attach_pdn_over_s5()
         line("GTP-U datapath", "unsupported (non-eBPF build or missing CAP_BPF/CAP_NET_ADMIN)")
     end
 
-    -- Steer a bearer's uplink onto the datapath as a TFT (traffic filter):
-    -- inner packets matching {proto, dst addr, dst port} are encapsulated
-    -- on this bearer's TEID pair (local_teid @ our side, remote_teid @ the
-    -- PGW/UPF). IMS SIP signalling rides the default bearer, so the match
-    -- is UDP toward the P-CSCF on the SIP port -- the UE's uplink SIP then
-    -- classifies onto the default bearer's TEID, which the UPF's uplink PDR
-    -- routes on to the P-CSCF. add_filter also installs the matching decap
-    -- (rx) entry keyed on local_teid, so the 401/200 the P-CSCF sends back
-    -- decapsulate on that same bearer and reach the UE. The encap datapath
-    -- keys the TX maps on the inner *destination*, so dst_addr fills the
-    -- Tunnel's ue_addr (classification-address) slot.
-    local function program_filter(ebi, local_teid, remote_teid, remote_addr,
-                                  proto, dst_addr, dst_port)
+    -- Steer the UE's SIP toward the P-CSCF onto the default bearer's datapath
+    -- entry (local_teid @ our side, remote_teid @ the PGW/UPF). It rides the
+    -- bearer in two shapes, so two TFTs are installed on the one bearer: the
+    -- initial unprotected REGISTER as plain UDP:5060, and — once the ESP SAs
+    -- are up — everything else as ESP (IP proto 50). The encap keys the TX
+    -- maps on the inner *destination*, so the P-CSCF fills the Tunnel's
+    -- ue_addr (classification address); add_filter also installs the shared
+    -- decap (rx) entry keyed on local_teid, so the 401/200 the P-CSCF sends
+    -- back decapsulate on that bearer and reach the UE (plain, then ESP which
+    -- the kernel decrypts).
+    local function program_filter(ebi, local_teid, remote_teid, remote_addr, pcscf)
         if not up then return end
-        if not (dst_addr and dst_addr ~= "" and remote_addr and remote_addr ~= "") then
+        if not (pcscf and pcscf ~= "" and remote_addr and remote_addr ~= "") then
             line("GTP-U filter", ("EBI %d not programmed (missing P-CSCF/peer address)"):format(ebi))
             return
         end
-        local t = gtp.Tunnel()
-        t.local_teid, t.remote_teid = local_teid, remote_teid
-        t.ebi, t.ue_addr, t.remote_addr = ebi, dst_addr, remote_addr
-        local f = gtp.TrafficFilter()
-        f.tunnel  = t
-        f.proto   = proto
-        f.ue_port = dst_port           -- inner dst port; host order, loader htons
-        local pok, perr = pcall(function() up:add_filter(f) end)
-        line("GTP-U filter", pok
-            and ("EBI %d  ul TEID %#x / dl TEID %#x @ %s  proto %d -> %s:%d")
-                :format(ebi, local_teid, remote_teid, remote_addr, proto, dst_addr, dst_port)
-            or ("EBI %d add_filter failed: %s"):format(ebi, why(perr)))
-        if pok then
+        local function add_tft(proto, ue_port, label)
+            local t = gtp.Tunnel()
+            t.local_teid, t.remote_teid = local_teid, remote_teid
+            t.ebi, t.ue_addr, t.remote_addr = ebi, pcscf, remote_addr
+            local f = gtp.TrafficFilter()
+            f.tunnel  = t
+            f.proto   = proto
+            f.ue_port = ue_port            -- inner dst port; host order, loader htons
+            local pok, perr = pcall(function() up:add_filter(f) end)
+            line("GTP-U filter", pok
+                and ("EBI %d  %s  ul/dl TEID %#x/%#x @ %s  proto %d -> %s%s")
+                    :format(ebi, label, local_teid, remote_teid, remote_addr, proto, pcscf,
+                            ue_port > 0 and (":" .. ue_port) or "")
+                or ("EBI %d %s add_filter failed: %s"):format(ebi, label, why(perr)))
+            return pok
+        end
+        local udp = add_tft(IPPROTO_UDP, PCSCF_SIP_PORT, "SIP")  -- unprotected REGISTER
+        local esp = add_tft(IPPROTO_ESP, 0,              "ESP")  -- protected traffic
+        if udp or esp then
             st.peers[remote_addr] = true
             st.sig_teid = local_teid   -- default bearer carries the signalling
             st.bearers[#st.bearers + 1] =
-                { ebi = ebi, teid = local_teid, port = dst_port,
-                  kind = "signalling", dst = dst_addr }
+                { ebi = ebi, teid = local_teid, kind = "signalling", dst = pcscf }
         end
     end
 
@@ -432,10 +534,11 @@ local function attach_pdn_over_s5()
     --
     -- Each SIP step arms a one-shot deadline (loop:after); the reply
     -- disarms it and the next step re-arms it. GTP-C has the endpoint's N3.
-    local sock                 -- UE SIP socket (non-local UE PAA source)
+    local sock                 -- UE SIP socket (non-local UE PAA source, protected client port)
     local ue_bound = false     -- did the transparent PAA bind succeed
     local uac, uac2            -- the two RFC 3261 non-INVITE client transactions
     local ch                   -- the parsed 401 challenge
+    local xfrm                 -- ipsec.Xfrm handle for the ESP SAs (nil until the 401)
     local sip_state = "idle"   -- which SIP response the socket is waiting for
     local reg_cseq = 0         -- REGISTER CSeq (bumped per request)
     local grace                -- post-200 wait for a late Create Bearer Request
@@ -466,15 +569,16 @@ local function attach_pdn_over_s5()
         grace = loop:after(3000, function() grace = nil; loop:stop() end)
     end
 
-    -- Send a REGISTER over the UE socket (which the datapath encapsulates)
-    -- and, when the datapath is up, confirm the encap ran by reading the
-    -- per-TEID tx counter a moment later (locally-generated traffic egresses
-    -- through TC just after sendto returns).
-    local function send_register(wire, label)
+    -- Send a REGISTER over the UE socket to the P-CSCF at `dport` (5060 for
+    -- the unprotected one, the protected server port for the ESP one — the
+    -- kernel ESP-wraps that per the OUT policy). When the datapath is up,
+    -- confirm the encap ran by reading the per-TEID tx counter a moment later
+    -- (locally-generated traffic egresses through TC just after sendto).
+    local function send_register(wire, label, dport)
         local before = (up and st.sig_teid) and up:stats(st.sig_teid) or nil
-        local sok, serr = pcall(function() sock:sendto(wire, st.pcscf, PCSCF_SIP_PORT) end)
+        local sok, serr = pcall(function() sock:sendto(wire, st.pcscf, dport) end)
         if not sok then return fail(("REGISTER send failed: %s"):format(why(serr))) end
-        line("-> REGISTER", ("%s, %d B -> P-CSCF %s:%d"):format(label, #wire, st.pcscf, PCSCF_SIP_PORT))
+        line("-> REGISTER", ("%s, %d B -> P-CSCF %s:%d"):format(label, #wire, st.pcscf, dport))
         if before then
             loop:after(50, function()                 -- let the TC egress program run
                 local a   = up:stats(st.sig_teid)
@@ -569,8 +673,11 @@ local function attach_pdn_over_s5()
         -- any other state (done / idle): ignore late datagrams
     end
 
-    -- Round 2: verify the AKA challenge, derive RES, and send the
-    -- authenticated REGISTER carrying the AKAv1-MD5 digest response.
+    -- Round 2: verify the AKA challenge and derive RES/CK/IK; with a
+    -- Security-Server, install the ESP SAs and send the protected REGISTER
+    -- (ESP, to the P-CSCF's protected server port) carrying the AKAv1-MD5
+    -- digest and a Security-Verify. Without one, fall back to an unprotected
+    -- authenticated REGISTER (digest only) so a non-IPsec core still works.
     on_401 = function(m401)
         local okc, res = pcall(parse_challenge, m401)
         if not okc then return fail("cannot parse 401 challenge: " .. why(res)) end
@@ -581,16 +688,34 @@ local function attach_pdn_over_s5()
         if not okv then return fail("AKA AUTN verification failed: " .. why(keys)) end
         line("AUTN verified", ("SQN %s, RES %s"):format(hex(keys.sqn), hex(keys.res)))
 
+        -- AKAv1-MD5 digest: RES is the password (RFC 3310).
         reg_cseq = reg_cseq + 1
         local nc, cnonce = "00000001", hex(ipsec.md5(imsi .. tostring(reg_cseq)):sub(1, 8))
         local response = digest_response(impi, ch.realm, keys.res, "REGISTER",
                                          "sip:" .. ims_realm, ch.nonce, nc, cnonce, ch.qop)
-        local authz = authz_hdr(ch.nonce, response,
+        local authz = authz_hdr(ch.realm, ch.nonce, response,
                                 ch.qop and { qop = ch.qop, nc = nc, cnonce = cnonce })
 
-        local reg2 = build_register(st.ue_addr, reg_cseq, authz)
+        -- Protected path when the P-CSCF offered a Security-Server: raise the
+        -- ESP SAs, then aim the REGISTER at the protected server port (the
+        -- kernel ESP-wraps it, so it egresses as proto 50 and the ESP TFT
+        -- steers it) and echo the Security-Server in a Security-Verify.
+        local dport, sec_name, sec_hdr = PCSCF_SIP_PORT, nil, nil
+        if ch.ss_raw and ch.p_spi_s and ch.p_port_s then
+            banner("IPsec — establishing ESP SAs (transport mode)")
+            line("P-CSCF ports", ("client %s / server %d, SPIs %#x/%#x")
+                :format(ch.p_port_c or 0, ch.p_port_s, ch.p_spi_c or 0, ch.p_spi_s))
+            xfrm = ipsec.Xfrm()
+            establish_sas(xfrm, ch, keys, st.ue_addr, st.pcscf)
+            dport, sec_name, sec_hdr = ch.p_port_s, "Security-Verify", ch.ss_raw
+            banner("IMS-AKA registration — protected REGISTER over ESP")
+        else
+            line("Security-Server", "absent -- unprotected authenticated REGISTER (digest only)")
+        end
+
+        local reg2 = build_register(st.ue_addr, reg_cseq, authz, sec_name, sec_hdr)
         uac2 = sip.Transaction(sip.NON_INVITE_CLIENT)
-        send_register(reg2, "AKAv1-MD5 authenticated")
+        send_register(reg2, sec_hdr and "AKAv1-MD5 over ESP" or "AKAv1-MD5 (digest only)", dport)
         pcall(function() uac2:send(sip.parse(reg2)) end)
         sip_state = "reg2"
         arm(SIP_T_MS, function() fail("timed out waiting for 200 OK") end)
@@ -641,11 +766,11 @@ local function attach_pdn_over_s5()
         -- CAP_NET_ADMIN; falls back to the SGW source (which the UPF then
         -- drops as spoofed, and no reply can return) when it is refused.
         local okb, s = pcall(function()
-            return net.UdpSocket(st.ue_addr, PCSCF_SIP_PORT, false, true)
+            return net.UdpSocket(st.ue_addr, PORT_UC, false, true)  -- protected client port
         end)
         if okb then
             sock, ue_bound = s, true
-            line("UE SIP socket", ("%s:%d (UE PAA, transparent)"):format(st.ue_addr, PCSCF_SIP_PORT))
+            line("UE SIP socket", ("%s:%d (UE PAA, transparent)"):format(st.ue_addr, PORT_UC))
         else
             sock, ue_bound = net.UdpSocket("0.0.0.0", 0), false
             line("UE SIP socket",
@@ -670,8 +795,11 @@ local function attach_pdn_over_s5()
 
         reg_cseq = reg_cseq + 1
         uac = sip.Transaction(sip.NON_INVITE_CLIENT)
-        local reg1 = build_register(st.ue_addr, reg_cseq, authz_hdr("", ""))
-        send_register(reg1, "unprotected")
+        -- Unprotected REGISTER (plain UDP:5060) advertising IMS-AKA and the
+        -- UE's Security-Client offer (realm is the UE's home domain guess).
+        local reg1 = build_register(st.ue_addr, reg_cseq, authz_hdr(ims_realm, "", ""),
+                                    "Security-Client", security_client())
+        send_register(reg1, "unprotected", PCSCF_SIP_PORT)
         pcall(function() uac:send(sip.parse(reg1)) end)
         sip_state = "reg1"
         arm(SIP_T_MS, function() fail("timed out waiting for 401 challenge") end)
@@ -714,8 +842,8 @@ local function attach_pdn_over_s5()
                  ("EBI %d  SGW TEID %#x -> PGW TEID %#x @ %s")
                      :format(tun.ebi, tun.local_teid, tun.remote_teid, tun.remote_addr))
             if st.pcscf then
-                program_filter(tun.ebi, tun.local_teid, tun.remote_teid, tun.remote_addr,
-                               IPPROTO_UDP, st.pcscf, PCSCF_SIP_PORT)
+                program_filter(tun.ebi, tun.local_teid, tun.remote_teid,
+                               tun.remote_addr, st.pcscf)
             else
                 line("GTP-U filter",
                      ("EBI %d not programmed (no P-CSCF IPv4 in Create Session PCO)"):format(tun.ebi))
@@ -842,8 +970,12 @@ local function attach_pdn_over_s5()
     -- terminal step calls loop:stop() (registered, rejected, or timed out).
     local rok, rerr = pcall(function() loop:run() end)
 
-    -- Teardown that needs no loop: drop the SIP socket and the UE-PAA local
-    -- route. Runs whether the flow completed or aborted.
+    -- Teardown that needs no loop: drop the ESP SA state, the SIP socket and
+    -- the UE-PAA local route. Runs whether the flow completed or aborted.
+    if xfrm then
+        attempt("flush ESP policies", function() xfrm:flush_policy() end)
+        attempt("flush ESP SAs",      function() xfrm:flush_sa(ipsec.PROTO_ESP) end)
+    end
     if sock then
         pcall(function() loop:del_fd(sock:fd()) end)
         sock:close()
