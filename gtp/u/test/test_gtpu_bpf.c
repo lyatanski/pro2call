@@ -230,6 +230,22 @@ spec ("gtpu_bpf") {
             f.remote_port        = 5004;
             check(gtpu_tft_add(g, &f) == GTPU_OK);
 
+            /* Destination-steered TFT: classifies uplink by its inner dst
+             * (a remote signalling peer, HOST), so tunnel.inner_addr is that
+             * remote address, not the UE. Its decap rx entry must therefore
+             * NOT gate the downlink (whose inner dst is the UE) on
+             * inner_addr, or the reply is dropped as malformed. */
+            gtpu_tft_t sig;
+            memset(&sig, 0, sizeof sig);
+            sig.tunnel             = bearer_a;
+            sig.tunnel.local_teid  = 0x1005;
+            sig.tunnel.remote_teid = 0x2005;
+            sig.tunnel.ebi         = 5;
+            memcpy(sig.tunnel.inner_addr, HOST, 4); /* classify on dst = HOST */
+            sig.proto              = 17;
+            sig.ue_port            = 5060;
+            check(gtpu_tft_add(g, &sig) == GTPU_OK);
+
             /* IPv6 outer + QFI for a second UE. */
             gtpu_tunnel_t d = bearer_a;
             d.local_teid    = 0x1004;
@@ -329,6 +345,27 @@ spec ("gtpu_bpf") {
             struct gtpu_stats st;
             check(gtpu_stats_read(g, 0x1001, &st) == GTPU_OK);
             check(st.err_malformed == 1);
+        }
+
+        it ("delivers downlink on a destination-steered TFT bearer", !!g) {
+            /* The reply rides the TEID (0x1005) whose filter address is the
+             * remote peer (HOST), but its inner dst is the UE. The TEID
+             * identifies the bearer; the inner dst must not be gated on the
+             * filter address, or a legitimate reply is dropped. */
+            uint8_t inner[128], in[256], out[4096];
+            size_t  ilen = inner_udp4(inner, UE, 5060, 40000, "downlink-sig");
+            size_t  ln   = gpdu4(in, GTPU_MT_GPDU, 0x1005, 0, inner, ilen);
+
+            uint32_t ret;
+            size_t   olen;
+            check(run_prog(decap_fd, in, ln, out, &olen, &ret) == 0);
+            check(ret == TC_ACT_OK);
+            check(olen == 14 + ilen);
+            check(memcmp(out + 14, inner, ilen) == 0);
+
+            struct gtpu_stats st;
+            check(gtpu_stats_read(g, 0x1005, &st) == GTPU_OK);
+            check(st.rx_pkts == 1);
         }
     }
 

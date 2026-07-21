@@ -23,11 +23,15 @@
 -- Response carries the UE address the PGW allocated (PAA) and the PGW's
 -- user-plane F-TEID. The session is deleted again during teardown.
 --
--- Transport is net.UdpSocket (the transport layer's non-blocking UDP
--- socket); the kernel applies ESP underneath, so the script still sends
--- plain SIP from the UE's protected client port. Crypto is
--- ipsec.aka_* (Milenage) and ipsec.md5. SIP is built/parsed with sip,
--- and a sip.Transaction tracks each RFC 3261 transaction.
+-- Everything runs on one net.Loop. The GTP-C endpoint owns its socket,
+-- and the UE's SIP UDP socket is registered with the same loop so its
+-- datagrams arrive as callbacks (net.UdpSocket is the transport layer's
+-- non-blocking UDP socket; the kernel applies ESP underneath, so the
+-- script still sends plain SIP from the UE's protected client port). The
+-- flow is a state machine advanced by those callbacks, with a single
+-- loop:run() at the bottom instead of any blocking recv() or pump().
+-- Crypto is ipsec.aka_* (Milenage) and ipsec.md5. SIP is built/parsed
+-- with sip, and a sip.Transaction tracks each RFC 3261 transaction.
 --
 -- Manipulating SAs needs CAP_NET_ADMIN; each kernel op is wrapped so an
 -- unprivileged run reports it "skipped" rather than aborting.
@@ -81,7 +85,10 @@ local function banner(t) print(("\n== %s"):format(t)) end
 local function line(k, v) print(("   %-22s %s"):format(k, v)) end
 local function fsm(label, m) print(("       [fsm] %-28s -> %s"):format(label, m:state_name())) end
 
--- base64 decode, for the AKA nonce (RAND||AUTN) in the 401 challenge
+-- base64 decode, for the AKA nonce (RAND||AUTN) in the 401 challenge.
+-- Plain arithmetic (no 5.3 bitwise operators) so it runs under the Lua
+-- 5.1 / LuaJIT the examples are driven with; acc is masked back to its
+-- pending low bits each byte, so it never exceeds a double's 53-bit range.
 local B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
 local function b64dec(s)
     local map = {}; for i = 1, #B64 do map[B64:byte(i)] = i - 1 end
@@ -89,8 +96,13 @@ local function b64dec(s)
     for i = 1, #s do
         local v = map[s:byte(i)]
         if v then
-            acc = (acc << 6) | v; nbits = nbits + 6
-            if nbits >= 8 then nbits = nbits - 8; out[#out + 1] = string.char((acc >> nbits) & 0xff) end
+            acc = acc * 64 + v; nbits = nbits + 6      -- acc << 6 | v
+            if nbits >= 8 then
+                nbits = nbits - 8
+                local div = 2 ^ nbits
+                out[#out + 1] = string.char(math.floor(acc / div) % 256)  -- (acc >> nbits) & 0xff
+                acc = acc % div                        -- keep only the leftover low bits
+            end
         end
     end
     return table.concat(out)
@@ -156,7 +168,8 @@ end
 
 -- Parse the 401: the AKA challenge from WWW-Authenticate and the
 -- P-CSCF's Security-Server. Returns rand, autn, realm, and the P-CSCF
--- security parameters.
+-- security parameters (ss_raw keeps the Security-Server value verbatim so
+-- the protected REGISTER can echo it back in Security-Verify).
 local function parse_challenge(msg)
     local wa = msg:header("WWW-Authenticate")
     assert(wa ~= "", "401 without WWW-Authenticate")
@@ -170,6 +183,7 @@ local function parse_challenge(msg)
         autn   = blob:sub(17, 32),
         realm  = auth_param(wa, "realm") or REALM,
         qop    = auth_param(wa, "qop"),
+        ss_raw = ss,
         p_spi_c = tonumber(sec_param(ss, "spi-c")),
         p_spi_s = tonumber(sec_param(ss, "spi-s")),
         p_port_c = tonumber(sec_param(ss, "port-c")),
@@ -240,64 +254,16 @@ end
 -- back, then runs the IMS-AKA registration over Gm as before.
 --
 -- gtp.Endpoint drives the transaction on its own GTP-C socket over the
--- net_loop (sequence numbers, T3/N3 retransmission, response matching);
--- we register callbacks for the PGW's responses and step the loop until
--- one lands (or the retransmissions time out).
+-- shared net.Loop (sequence numbers, T3/N3 retransmission, response
+-- matching); the on_create_session_response callback kicks off the SIP
+-- registration, so no phase blocks the loop.
 
 local S5_UP_TEID = 0x200   -- our (SGW) S5/S8-U downlink tunnel endpoint id
 
--- Step the loop until the in-flight transaction resolves: a response
--- sets st.done, an N3 timeout or a rejection sets st.err. The endpoint's
--- own retransmission timer guarantees step() cannot block forever.
-local function pump(loop, st)
-    while not (st.done or st.err) do loop:step(-1) end
-    assert(not st.err, st.err)
-end
-
--- Raise the UE's PDN connection over S5/S8 and return a handle
--- {loop, ep, sess, st, ue_addr}; the handler reports each PGW response.
-local function attach_pdn_over_s5()
-    banner(("GTPv2-C — PDN connection over S5/S8: SGW %s -> PGW %s"):format(sgw_ip, pgw_ip))
-    local loop = net.Loop()
-    local ep   = gtp.Endpoint(loop, sgw_ip)         -- binds sgw_ip:2123 (GTP-C)
-    local st   = { done = false, err = nil, ue_addr = nil }
-
-    ep:set_handler({
-        -- The PGW answered the Create Session: read the cause, the
-        -- allocated UE address (PAA) and the PGW's control TEID.
-        on_create_session_response = function(sess, rsp)
-            if rsp.cause ~= gtp.GTP2_CAUSE_REQUEST_ACCEPTED then
-                st.err = ("Create Session rejected, cause %d"):format(rsp.cause)
-                return
-            end
-            if rsp.has_paa then st.ue_addr = rsp.paa.addr4 end
-            line("<- Create Session Resp", ("accepted; PGW ctrl TEID %#x"):format(sess:remote_teid()))
-            if st.ue_addr then line("PAA (UE address)", st.ue_addr) end
-            st.done = true
-        end,
-
-        -- One per bearer F-TEID in the accepted response: the PGW's
-        -- data-plane endpoint. A real SGW would program its GTP-U
-        -- datapath (gtp.UserPlane) here; we just report it.
-        on_user_plane = function(sess, tun)
-            line("user plane (S5/S8-U)",
-                 ("EBI %d  SGW TEID %#x -> PGW TEID %#x @ %s")
-                     :format(tun.ebi, tun.local_teid, tun.remote_teid, tun.remote_addr))
-        end,
-
-        on_delete_session_response = function(sess, rsp)
-            line("<- Delete Session Resp", ("cause %d"):format(rsp.cause))
-            st.done = true
-        end,
-
-        on_timeout = function(sess, mt)
-            st.err = ("PGW did not answer message type %d"):format(mt)
-        end,
-    })
-
-    -- Create Session Request: attach the UE's default bearer over S5/S8.
-    -- The SGW S5/S8-C sender F-TEID's TEID and address are filled in by
-    -- create_session (a fresh control TEID, the endpoint's bound address).
+-- The Create Session Request that attaches the UE's default bearer over
+-- S5/S8. The SGW S5/S8-C sender F-TEID's TEID and address are filled in
+-- by create_session (a fresh control TEID, the endpoint's bound address).
+local function build_csr()
     local req = gtp.CreateSessionRequest()
     req.imsi     = imsi
     req.apn      = apn
@@ -316,148 +282,287 @@ local function attach_pdn_over_s5()
     u.if_type, u.teid, u.addr4 = gtp.GTP2_IF_S5S8U_SGW, S5_UP_TEID, sgw_ip
     bc:add_fteid(0, u)
     req:add_bearer(bc)
-
-    local sess = ep:create_session(req, pgw_ip)     -- request sent, transaction tracked
-    line("-> Create Session Req", ("SGW ctrl TEID %#x, IMSI %s, APN %s")
-        :format(sess:local_teid(), imsi, apn))
-    pump(loop, st)
-
-    return { loop = loop, ep = ep, sess = sess, st = st, ue_addr = st.ue_addr }
+    return req
 end
 
--- ---- online run -------------------------------------------------------
-
-local function recv_msg(sock, timeout_ms, what)
-    local d = sock:recv(timeout_ms or 5000)
-    assert(not d.timed_out, ("timed out waiting for %s"):format(what or "a response"))
-    return sip.parse(d.data), d
-end
+-- ---- online run: one event loop drives GTP-C and SIP ------------------
+--
+-- A single net.Loop carries both the GTP-C endpoint and the UE's SIP
+-- socket. The whole scenario is a state machine advanced by callbacks:
+--
+--   [PDN attach] -> start_registration
+--     REGISTER (unprotected)  --401-->  on_401
+--       establish SAs, REGISTER (protected)  --200-->  on_registered
+--         INVITE  --final-->  on_invite_final  (ACK)
+--           de-register  --2xx / timeout-->  teardown_pdn
+--             delete session  --resp / timeout-->  loop:stop
+--
+-- Each SIP step arms a one-shot deadline (loop:after); the reply disarms
+-- it and the next step re-arms it. GTP-C has the endpoint's own N3 timer.
 
 local function run_online()
-    -- Optional: raise the PDN connection over S5/S8 to the PGW first, so
-    -- the IMS registration below runs "behind" a real EPC bearer. The
-    -- PAA is the address the PGW assigned; the SIP socket still binds
-    -- ue_ip (the PGW address may not be configured on this host).
-    local pdn
-    if pgw_ip then
-        pdn = attach_pdn_over_s5()
-        if pdn.ue_addr then
-            line("note", ("PGW assigned %s; IMS signalling binds %s"):format(pdn.ue_addr, ue_ip))
+    local loop = net.Loop()
+
+    -- Cross-phase state, filled as the callbacks fire and read by later
+    -- ones (forward-declared so the closures below share one set).
+    local sock, xfrm                 -- the SIP socket; the Xfrm handle for the SAs
+    local uac, uac2, ic              -- the three RFC 3261 client transactions
+    local ch, keys                   -- the parsed 401 challenge and AKA output
+    local wa_nonce, resp             -- the WWW-Authenticate nonce and digest response
+    local callee_uri                 -- the INVITE target (for the ACK)
+    local ep, sess                   -- GTP-C endpoint / session (when a PDN is raised)
+    local ue_addr                    -- PGW-assigned address (PAA), reported only
+    local sip_state = "idle"         -- which SIP response the socket is waiting for
+    local teardown_started = false   -- teardown_pdn runs once
+    local tearing = false            -- in GTP delete: a timeout then just stops
+    local run_err                    -- fatal error, re-raised after the loop unwinds
+
+    -- One deadline for the in-flight SIP step; a reply disarms it, the
+    -- next step re-arms it. Firing either fails (a registration step) or
+    -- advances (a best-effort teardown step).
+    local timer
+    local function disarm() if timer then loop:cancel(timer); timer = nil end end
+    local function arm(ms, on_expire)
+        disarm()
+        timer = loop:after(ms, function() timer = nil; on_expire() end)
+    end
+    local function fail(msg) run_err = msg; disarm(); loop:stop() end
+
+    -- forward declarations for the mutually-referring phase steps
+    local start_registration, handle_sip, on_401, on_registered,
+          on_invite_final, deregister, teardown_pdn
+
+    -- ---- SIP receive: drain the socket, dispatch by phase ----
+    local function on_sip_readable()
+        while true do
+            local dg = sock:recv(-1)               -- non-blocking drain of the fd
+            if dg.timed_out then return end
+            handle_sip(sip.parse(dg.data))
         end
     end
 
-    banner(("IMS-AKA registration — %s -> P-CSCF %s (Gm)"):format(impi, pcscf_ip))
-    local sock = net.UdpSocket(ue_ip, PORT_UC)     -- protected client port
-    line("bound", ("%s:%d"):format(ue_ip, sock:local_port()))
+    handle_sip = function(m)
+        if sip_state == "reg1" then
+            disarm(); uac:recv(m)
+            assert(m.status == 401, ("expected 401, got %d"):format(m.status))
+            line("<- 401", "AKA challenge + Security-Server"); fsm(name .. " UAC", uac)
+            on_401(m)
+        elseif sip_state == "reg2" then
+            disarm(); uac2:recv(m)
+            assert(m.status == 200, ("registration failed: %d %s"):format(m.status, m.reason))
+            line("<- 200 OK", "registered"); fsm(name .. " UAC", uac2)
+            on_registered()
+        elseif sip_state == "invite" then
+            ic:recv(m)
+            line(("<- %d"):format(m.status), m.reason); fsm(name .. " UAC", ic)
+            if m.status >= 200 then
+                disarm(); on_invite_final(m)
+            else
+                arm(10000, function() fail("timed out waiting for an INVITE response") end)
+            end
+        elseif sip_state == "dereg" then
+            disarm()
+            line(("<- %d"):format(m.status), "de-register acknowledged")
+            teardown_pdn()
+        end
+        -- any other state: teardown in progress, ignore late datagrams
+    end
 
     -- Round 1: unprotected REGISTER carrying the Security-Client offer.
-    local uac = sip.Transaction(sip.NON_INVITE_CLIENT)
-    local reg1 = register(next_cseq(),
-        ('Digest username="%s",realm="%s",uri="sip:%s",nonce="",response="",algorithm=AKAv1-MD5')
-        :format(impi, REALM, REALM),
-        security_client(), "Security-Client")
-    sock:sendto(reg1, pcscf_ip, PCSCF_SIP_PORT)
-    uac:send(sip.parse(reg1))
-    line("-> REGISTER", ("unprotected, %d B"):format(#reg1)); fsm(name .. " UAC", uac)
+    start_registration = function()
+        banner(("IMS-AKA registration — %s -> P-CSCF %s (Gm)"):format(impi, pcscf_ip))
+        sock = net.UdpSocket(ue_ip, PORT_UC)       -- protected client port
+        line("bound", ("%s:%d"):format(ue_ip, sock:local_port()))
+        loop:add_fd(sock:fd(), net.NET_RD, on_sip_readable)
 
-    local m401 = recv_msg(sock, 5000, "401")
-    uac:recv(m401)
-    assert(m401.status == 401, ("expected 401, got %d"):format(m401.status))
-    line("<- 401", "AKA challenge + Security-Server"); fsm(name .. " UAC", uac)
+        uac = sip.Transaction(sip.NON_INVITE_CLIENT)
+        local reg1 = register(next_cseq(),
+            ('Digest username="%s",realm="%s",uri="sip:%s",nonce="",response="",algorithm=AKAv1-MD5')
+            :format(impi, REALM, REALM),
+            security_client(), "Security-Client")
+        sock:sendto(reg1, pcscf_ip, PCSCF_SIP_PORT)
+        uac:send(sip.parse(reg1))
+        line("-> REGISTER", ("unprotected, %d B"):format(#reg1)); fsm(name .. " UAC", uac)
+        sip_state = "reg1"
+        arm(5000, function() fail("timed out waiting for 401") end)
+    end
 
-    -- Round 2: verify the challenge, derive the keys, raise the SAs.
-    local ch = parse_challenge(m401)
-    line("RAND", hex(ch.rand)); line("AUTN", hex(ch.autn))
-    local v = ipsec.aka_verify(K, OPc, ch.rand, ch.autn)   -- throws on MAC failure
-    line("AUTN verified", ("SQN %s, RES %s"):format(hex(v.sqn), hex(v.res)))
-
-    banner("IPsec — establishing ESP SAs (transport mode)")
-    local xfrm = ipsec.Xfrm()
-    establish_sas(xfrm, ch, v)
-
+    -- Round 2: verify the challenge, derive the keys, raise the SAs, then
     -- Round 3: protected REGISTER with the AKAv1-MD5 digest response.
-    banner("IMS-AKA registration — protected REGISTER over ESP")
-    local cseq = next_cseq()
-    local nc, cnonce = "00000001", hex(ipsec.md5(name .. tostring(cseq)):sub(1, 8))
-    local resp = digest_response(impi, ch.realm, v.res, "REGISTER",
-                                 "sip:" .. REALM, auth_param(m401:header("WWW-Authenticate"), "nonce"),
-                                 nc, cnonce, ch.qop)
-    local authz = ('Digest username="%s",realm="%s",uri="sip:%s",nonce="%s",response="%s",algorithm=AKAv1-MD5')
-        :format(impi, ch.realm, REALM, auth_param(m401:header("WWW-Authenticate"), "nonce"), resp)
-    if ch.qop then authz = authz .. (',qop=%s,nc=%s,cnonce="%s"'):format(ch.qop, nc, cnonce) end
+    on_401 = function(m401)
+        ch = parse_challenge(m401)
+        line("RAND", hex(ch.rand)); line("AUTN", hex(ch.autn))
+        keys = ipsec.aka_verify(K, OPc, ch.rand, ch.autn)   -- throws on MAC failure
+        line("AUTN verified", ("SQN %s, RES %s"):format(hex(keys.sqn), hex(keys.res)))
 
-    local uac2 = sip.Transaction(sip.NON_INVITE_CLIENT)
-    local reg2 = register(cseq, authz, security_client() .. "; q=0.1", "Security-Verify")
-    sock:sendto(reg2, pcscf_ip, ch.p_port_s)       -- to the protected server port; kernel ESP-wraps it
-    uac2:send(sip.parse(reg2))
-    line("-> REGISTER", ("protected (ESP), %d B"):format(#reg2)); fsm(name .. " UAC", uac2)
+        banner("IPsec — establishing ESP SAs (transport mode)")
+        xfrm = ipsec.Xfrm()
+        establish_sas(xfrm, ch, keys)
 
-    local m200 = recv_msg(sock, 5000, "200 OK")
-    uac2:recv(m200)
-    assert(m200.status == 200, ("registration failed: %d %s"):format(m200.status, m200.reason))
-    line("<- 200 OK", "registered"); fsm(name .. " UAC", uac2)
+        banner("IMS-AKA registration — protected REGISTER over ESP")
+        local cseq = next_cseq()
+        wa_nonce = auth_param(m401:header("WWW-Authenticate"), "nonce")
+        local nc, cnonce = "00000001", hex(ipsec.md5(name .. tostring(cseq)):sub(1, 8))
+        resp = digest_response(impi, ch.realm, keys.res, "REGISTER",
+                               "sip:" .. REALM, wa_nonce, nc, cnonce, ch.qop)
+        local authz = ('Digest username="%s",realm="%s",uri="sip:%s",nonce="%s",response="%s",algorithm=AKAv1-MD5')
+            :format(impi, ch.realm, REALM, wa_nonce, resp)
+        if ch.qop then authz = authz .. (',qop=%s,nc=%s,cnonce="%s"'):format(ch.qop, nc, cnonce) end
 
-    -- A call, protected end to end (media/RTP would ride its own bearer).
-    banner(("Call — %s INVITEs %s (over ESP)"):format(name, callee))
-    local callee_uri = ("sip:%s@%s"):format(callee, REALM)
-    local offer = ("v=0\r\no=%s 1 1 IN IP4 %s\r\ns=-\r\nc=IN IP4 %s\r\nt=0 0\r\n" ..
-                   "m=audio 4000 RTP/AVP 96\r\na=rtpmap:96 AMR/8000\r\n"):format(name, ue_ip, ue_ip)
-    local invite = sip.Builder()
-        :request(sip.INVITE, callee_uri)
-        :header(sip.H_VIA, ("SIP/2.0/UDP %s:%d;branch=z9hG4bK-call-1"):format(ue_ip, PORT_UC))
-        :header_u32(sip.H_MAX_FORWARDS, 70)
-        :header(sip.H_FROM, ("<%s>;tag=caller-1"):format(impu))
-        :header(sip.H_TO, ("<%s>"):format(callee_uri))
-        :header(sip.H_CALL_ID, "call-1@" .. ue_ip)
-        :header(sip.H_CSEQ, "1 INVITE")
-        :header(sip.H_CONTACT, ("<sip:%s:%d>"):format(ue_ip, PORT_UC))
-        :header(sip.H_CONTENT_TYPE, "application/sdp")
-        :done(offer)
-    local ic = sip.Transaction(sip.INVITE_CLIENT)
-    sock:sendto(invite, pcscf_ip, ch.p_port_s)
-    ic:send(sip.parse(invite))
-    line("-> INVITE", ("SDP offer, %d B"):format(#invite)); fsm(name .. " UAC", ic)
+        uac2 = sip.Transaction(sip.NON_INVITE_CLIENT)
+        -- Security-Verify echoes the P-CSCF's Security-Server verbatim
+        -- (RFC 3329): it proves both ends agreed on the same parameters.
+        local reg2 = register(cseq, authz, ch.ss_raw, "Security-Verify")
+        sock:sendto(reg2, pcscf_ip, ch.p_port_s)   -- to the protected server port; kernel ESP-wraps it
+        uac2:send(sip.parse(reg2))
+        line("-> REGISTER", ("protected (ESP), %d B"):format(#reg2)); fsm(name .. " UAC", uac2)
+        sip_state = "reg2"
+        arm(5000, function() fail("timed out waiting for 200 OK") end)
+    end
 
-    -- Read provisional/final responses until a final (>=200) arrives.
-    local final
-    repeat
-        local m = recv_msg(sock, 10000, "an INVITE response")
-        ic:recv(m)
-        line(("<- %d"):format(m.status), m.reason); fsm(name .. " UAC", ic)
-        if m.status >= 200 then final = m end
-    until final
-    if final.status < 300 then
-        local ack = sip.Builder()
-            :request(sip.ACK, callee_uri)
-            :header(sip.H_VIA, ("SIP/2.0/UDP %s:%d;branch=z9hG4bK-call-ack"):format(ue_ip, PORT_UC))
+    -- Registered: a call, protected end to end (media/RTP would ride its
+    -- own bearer).
+    on_registered = function()
+        banner(("Call — %s INVITEs %s (over ESP)"):format(name, callee))
+        callee_uri = ("sip:%s@%s"):format(callee, REALM)
+        local offer = ("v=0\r\no=%s 1 1 IN IP4 %s\r\ns=-\r\nc=IN IP4 %s\r\nt=0 0\r\n" ..
+                       "m=audio 4000 RTP/AVP 96\r\na=rtpmap:96 AMR/8000\r\n"):format(name, ue_ip, ue_ip)
+        local invite = sip.Builder()
+            :request(sip.INVITE, callee_uri)
+            :header(sip.H_VIA, ("SIP/2.0/UDP %s:%d;branch=z9hG4bK-call-1"):format(ue_ip, PORT_UC))
             :header_u32(sip.H_MAX_FORWARDS, 70)
             :header(sip.H_FROM, ("<%s>;tag=caller-1"):format(impu))
-            :header(sip.H_TO, final:header("To"))
+            :header(sip.H_TO, ("<%s>"):format(callee_uri))
             :header(sip.H_CALL_ID, "call-1@" .. ue_ip)
-            :header(sip.H_CSEQ, "1 ACK")
-            :done()
-        sock:sendto(ack, pcscf_ip, ch.p_port_s)
-        line("-> ACK", "call up")
+            :header(sip.H_CSEQ, "1 INVITE")
+            :header(sip.H_CONTACT, ("<sip:%s:%d>"):format(ue_ip, PORT_UC))
+            :header(sip.H_CONTENT_TYPE, "application/sdp")
+            :done(offer)
+        ic = sip.Transaction(sip.INVITE_CLIENT)
+        sock:sendto(invite, pcscf_ip, ch.p_port_s)
+        ic:send(sip.parse(invite))
+        line("-> INVITE", ("SDP offer, %d B"):format(#invite)); fsm(name .. " UAC", ic)
+        sip_state = "invite"
+        arm(10000, function() fail("timed out waiting for an INVITE response") end)
     end
 
-    -- Teardown: de-register, then tear the SAs down.
-    banner("Teardown")
-    local dereg = register(next_cseq(),
-        ('Digest username="%s",realm="%s",uri="sip:%s",nonce="%s",response="%s",algorithm=AKAv1-MD5')
-        :format(impi, ch.realm, REALM, auth_param(m401:header("WWW-Authenticate"), "nonce"), resp))
-    dereg = dereg:gsub("Expires: 600000", "Expires: 0")
-    sock:sendto(dereg, pcscf_ip, ch.p_port_s)
-    line("-> REGISTER", "de-register (Expires: 0)")
-    pcall(function() recv_msg(sock, 3000, "de-register 200") end)
-    attempt("flush policies", function() xfrm:flush_policy() end)
-    attempt("flush ESP SAs",  function() xfrm:flush_sa(ipsec.PROTO_ESP) end)
-    if pdn then
-        pdn.st.done, pdn.st.err = false, nil
-        pdn.sess:delete_session()                  -- DSReq with the default bearer's EBI
-        line("-> Delete Session Req", "S5/S8 PDN teardown")
-        pcall(function() pump(pdn.loop, pdn.st) end)
+    -- The INVITE reached a final response: ACK a 2xx (the ACK for a
+    -- non-2xx is generated below the TU), then start teardown.
+    on_invite_final = function(final)
+        if final.status < 300 then
+            local ack = sip.Builder()
+                :request(sip.ACK, callee_uri)
+                :header(sip.H_VIA, ("SIP/2.0/UDP %s:%d;branch=z9hG4bK-call-ack"):format(ue_ip, PORT_UC))
+                :header_u32(sip.H_MAX_FORWARDS, 70)
+                :header(sip.H_FROM, ("<%s>;tag=caller-1"):format(impu))
+                :header(sip.H_TO, final:header("To"))
+                :header(sip.H_CALL_ID, "call-1@" .. ue_ip)
+                :header(sip.H_CSEQ, "1 ACK")
+                :done()
+            sock:sendto(ack, pcscf_ip, ch.p_port_s)
+            line("-> ACK", "call up")
+        end
+        banner("Teardown")
+        deregister()
     end
-    sock:close()
+
+    -- De-register (Expires: 0), still protected over ESP. Best-effort: on
+    -- a 2xx the socket callback advances, on silence the timer does.
+    deregister = function()
+        local dereg = register(next_cseq(),
+            ('Digest username="%s",realm="%s",uri="sip:%s",nonce="%s",response="%s",algorithm=AKAv1-MD5')
+            :format(impi, ch.realm, REALM, wa_nonce, resp))
+        dereg = dereg:gsub("Expires: 600000", "Expires: 0")
+        sock:sendto(dereg, pcscf_ip, ch.p_port_s)
+        line("-> REGISTER", "de-register (Expires: 0)")
+        sip_state = "dereg"
+        arm(3000, teardown_pdn)                    -- proceed to PDN teardown on timeout
+    end
+
+    -- Tear the PDN down (or just stop, when none was raised). The SAs and
+    -- the socket are dropped after the loop unwinds, below.
+    teardown_pdn = function()
+        if teardown_started then return end
+        teardown_started = true
+        disarm()
+        sip_state = "done"
+        if ep then
+            tearing = true
+            sess:delete_session()                  -- DSReq with the default bearer's EBI
+            line("-> Delete Session Req", "S5/S8 PDN teardown")
+            -- on_delete_session_response / on_timeout stop the loop
+        else
+            loop:stop()
+        end
+    end
+
+    -- ---- kick off: the PDN attach (if a PGW was given), else SIP ----
+    if pgw_ip then
+        banner(("GTPv2-C — PDN connection over S5/S8: SGW %s -> PGW %s"):format(sgw_ip, pgw_ip))
+        ep = gtp.Endpoint(loop, sgw_ip)            -- binds sgw_ip:2123 (GTP-C)
+        ep:set_handler({
+            -- The PGW answered the Create Session: read the cause, the
+            -- allocated UE address (PAA) and the PGW's control TEID, then
+            -- start the IMS registration over Gm.
+            on_create_session_response = function(s, rsp)
+                if rsp.cause ~= gtp.GTP2_CAUSE_REQUEST_ACCEPTED then
+                    return fail(("Create Session rejected, cause %d"):format(rsp.cause))
+                end
+                if rsp.has_paa then ue_addr = rsp.paa.addr4 end
+                line("<- Create Session Resp", ("accepted; PGW ctrl TEID %#x"):format(s:remote_teid()))
+                if ue_addr then
+                    line("PAA (UE address)", ue_addr)
+                    line("note", ("PGW assigned %s; IMS signalling binds %s"):format(ue_addr, ue_ip))
+                end
+                start_registration()
+            end,
+
+            -- One per bearer F-TEID in the accepted response: the PGW's
+            -- data-plane endpoint. A real SGW would program its GTP-U
+            -- datapath (gtp.UserPlane) here; we just report it.
+            on_user_plane = function(s, tun)
+                line("user plane (S5/S8-U)",
+                     ("EBI %d  SGW TEID %#x -> PGW TEID %#x @ %s")
+                         :format(tun.ebi, tun.local_teid, tun.remote_teid, tun.remote_addr))
+            end,
+
+            on_delete_session_response = function(s, rsp)
+                line("<- Delete Session Resp", ("cause %d"):format(rsp.cause))
+                loop:stop()
+            end,
+
+            on_timeout = function(s, mt)
+                if tearing then
+                    line("note", ("PGW did not answer delete (message type %d); stopping"):format(mt))
+                    loop:stop()
+                else
+                    fail(("PGW did not answer message type %d"):format(mt))
+                end
+            end,
+        })
+        sess = ep:create_session(build_csr(), pgw_ip)  -- request sent, transaction tracked
+        line("-> Create Session Req", ("SGW ctrl TEID %#x, IMSI %s, APN %s")
+            :format(sess:local_teid(), imsi, apn))
+    else
+        start_registration()
+    end
+
+    -- One dispatcher for every socket and timer in the scenario.
+    local ok, err = pcall(function() loop:run() end)
+
+    -- Teardown that needs no loop: drop the SA state and the socket. Runs
+    -- whether the flow completed or aborted, so a failed run cleans up too.
+    if xfrm then
+        attempt("flush policies", function() xfrm:flush_policy() end)
+        attempt("flush ESP SAs",  function() xfrm:flush_sa(ipsec.PROTO_ESP) end)
+    end
+    if sock then
+        pcall(function() loop:del_fd(sock:fd()) end)
+        sock:close()
+    end
+
+    if not ok then error(err, 0) end               -- a loop/callback exception
+    if run_err then error(run_err, 0) end           -- a phase-level failure
     print("\nregistration + call complete")
 end
 
@@ -466,10 +571,4 @@ if not pcscf_ip then
     io.stderr:write("usage: ims_call_s5.lua PCSCF_IP [UE_IP] [CALLEE] [PGW_IP]\n")
     os.exit(1)
 end
--- run_online()
-if pgw_ip then
-    pdn = attach_pdn_over_s5()
-    if pdn.ue_addr then
-        line("note", ("PGW assigned %s; IMS signalling binds %s"):format(pdn.ue_addr, ue_ip))
-    end
-end
+run_online()

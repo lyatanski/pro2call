@@ -502,6 +502,19 @@ int gtpu_tft_add(gtpu_ebpf_t* g, const gtpu_tft_t* f)
     struct gtpu_tx_tun tx;
     tun_to_rx(&f->tunnel, &rx);
     tun_to_tx(&f->tunnel, &tx);
+
+    /* tunnel.inner_addr is the filter's inner-dst *classification* address
+     * (teid_tft_map key ue_addr), which is not necessarily the bearer's own
+     * UE address: a filter may steer uplink by its remote destination (the
+     * TS 24.008 packet filter matches inner dst = the remote side), in which
+     * case inner_addr is that remote address, not the UE. The decap rx entry
+     * must therefore not gate the downlink on it — the downlink's inner dst
+     * is the UE, which would mismatch and be dropped as malformed. The TEID
+     * alone identifies the bearer on decap, so clear the rx inner-dst check
+     * (all-zero = no check). A default-bearer tunnel (gtpu_teid_add), whose
+     * inner_addr really is the UE, keeps its check. */
+    memset(rx.inner_addr, 0, sizeof rx.inner_addr);
+
     int rx_fd  = bpf_map__fd(g->skel->maps.teid_rx_map);
     int tft_fd = bpf_map__fd(g->skel->maps.teid_tft_map);
 
