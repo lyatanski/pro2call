@@ -406,4 +406,242 @@ Transaction& Transaction::recv(const Msg& m)
                            : status_event(m, false));
 }
 
+/* ---- Dialog ---- */
+
+Dialog::Dialog() : fsm_(sip_dialog_fsm())
+{
+    if (!fsm_) throw Error("Dialog: out of memory");
+}
+
+Dialog::~Dialog()
+{
+    fsm_destroy(fsm_);
+}
+
+int Dialog::state() const
+{
+    return fsm_get_current_state(fsm_);
+}
+
+std::string Dialog::state_name() const
+{
+    return sip_dialog_state_name(fsm_get_current_state(fsm_));
+}
+
+bool Dialog::early() const
+{
+    return fsm_get_current_state(fsm_) == SIP_DIALOG_ST_EARLY;
+}
+
+bool Dialog::confirmed() const
+{
+    return fsm_get_current_state(fsm_) == SIP_DIALOG_ST_CONFIRMED;
+}
+
+bool Dialog::terminated() const
+{
+    return fsm_terminated(fsm_);
+}
+
+Dialog& Dialog::event(int ev)
+{
+    int rc = fsm_act(fsm_, ev, NULL, NULL);
+    if (rc != FSM_OK)
+        throw Error(std::string("event: ") + sip_dialog_event_name(ev) +
+                        " is illegal in state " + state_name(),
+                    rc);
+    return *this;
+}
+
+/* The To-tag / CSeq accessors throw when the header is absent; a dialog
+ * being driven from real traffic tolerates that, so read them softly. */
+static std::string soft_to_tag(const Msg& m)
+{
+    try {
+        return m.to_().tag;
+    } catch (const Error&) {
+        return "";
+    }
+}
+
+static int soft_cseq_method(const Msg& m)
+{
+    try {
+        return m.cseq().method;
+    } catch (const Error&) {
+        return M_UNKNOWN;
+    }
+}
+
+/* Message -> dialog event; -1 for messages that do not move the dialog
+ * (a mid-dialog request, a 100 Trying, a re-INVITE failure once
+ * confirmed). Works for both directions: a UAS sending a 2xx confirms
+ * and sending/receiving a BYE terminates, just as a UAC receiving them
+ * does. */
+static int dialog_event(const Msg& m, int state)
+{
+    if (m.request)
+        return m.method == SIP_M_BYE ? SIP_DIALOG_EV_TERMINATE : -1;
+
+    if (soft_cseq_method(m) != SIP_M_INVITE) return -1; /* only INVITE forms it */
+    if (m.status >= 200 && m.status < 300) return SIP_DIALOG_EV_CONFIRM;
+    if (m.status > 100 && m.status < 200)
+        return soft_to_tag(m).empty() ? -1 : SIP_DIALOG_EV_EARLY;
+    if (m.status >= 300) /* a confirmed dialog survives a re-INVITE failure */
+        return state == SIP_DIALOG_ST_CONFIRMED ? -1 : SIP_DIALOG_EV_TERMINATE;
+    return -1;
+}
+
+Dialog& Dialog::send(const Msg& m)
+{
+    const int ev = dialog_event(m, state());
+    return ev < 0 ? *this : event(ev);
+}
+
+Dialog& Dialog::recv(const Msg& m)
+{
+    const int ev = dialog_event(m, state());
+    return ev < 0 ? *this : event(ev);
+}
+
+/* ---- Registration ---- */
+
+Registration::Registration() : fsm_(sip_reg_fsm())
+{
+    if (!fsm_) throw Error("Registration: out of memory");
+}
+
+Registration::~Registration()
+{
+    fsm_destroy(fsm_);
+}
+
+int Registration::state() const
+{
+    return fsm_get_current_state(fsm_);
+}
+
+std::string Registration::state_name() const
+{
+    return sip_reg_state_name(fsm_get_current_state(fsm_));
+}
+
+bool Registration::registered() const
+{
+    return fsm_get_current_state(fsm_) == SIP_REG_ST_REGISTERED;
+}
+
+bool Registration::done() const
+{
+    return fsm_get_current_state(fsm_) == SIP_REG_ST_DONE;
+}
+
+bool Registration::failed() const
+{
+    return fsm_terminated(fsm_);
+}
+
+Registration& Registration::event(int ev)
+{
+    int rc = fsm_act(fsm_, ev, NULL, NULL);
+    if (rc != FSM_OK)
+        throw Error(std::string("event: ") + sip_reg_event_name(ev) +
+                        " is illegal in state " + state_name(),
+                    rc);
+    return *this;
+}
+
+/* A REGISTER is a de-registration when it removes the binding: Expires: 0,
+ * a wildcard "Contact: *", or a Contact carrying expires=0. */
+static bool is_deregister(const Msg& m)
+{
+    if (m.header("Expires") == "0") return true;
+    const std::string c = m.header("Contact");
+    if (c == "*") return true;
+    return auth_param(c, "expires") == "0";
+}
+
+Registration& Registration::send(const Msg& m)
+{
+    if (!m.request || m.method != SIP_M_REGISTER) return *this;
+    switch (state()) {
+    case SIP_REG_ST_IDLE:       return event(SIP_REG_EV_SEND);
+    case SIP_REG_ST_CHALLENGED: return event(SIP_REG_EV_AUTH);
+    case SIP_REG_ST_REGISTERED:
+        return event(is_deregister(m) ? SIP_REG_EV_DEREGISTER
+                                      : SIP_REG_EV_REFRESH);
+    default: return *this; /* a retransmission while a REGISTER is in flight */
+    }
+}
+
+Registration& Registration::recv(const Msg& m)
+{
+    if (m.request) return *this;
+    if (m.status == 401 || m.status == 407) return event(SIP_REG_EV_CHALLENGE);
+    if (m.status >= 200 && m.status < 300) return event(SIP_REG_EV_OK);
+    if (m.status >= 300) return event(SIP_REG_EV_FAIL);
+    return *this; /* 1xx */
+}
+
+/* ---- AuthChallenge ---- */
+
+AuthChallenge::AuthChallenge() : fsm_(sip_auth_fsm())
+{
+    if (!fsm_) throw Error("AuthChallenge: out of memory");
+}
+
+AuthChallenge::~AuthChallenge()
+{
+    fsm_destroy(fsm_);
+}
+
+int AuthChallenge::state() const
+{
+    return fsm_get_current_state(fsm_);
+}
+
+std::string AuthChallenge::state_name() const
+{
+    return sip_auth_state_name(fsm_get_current_state(fsm_));
+}
+
+bool AuthChallenge::challenged() const
+{
+    return fsm_get_current_state(fsm_) == SIP_AUTH_ST_CHALLENGED;
+}
+
+bool AuthChallenge::authenticated() const
+{
+    return fsm_get_current_state(fsm_) == SIP_AUTH_ST_AUTHENTICATED;
+}
+
+bool AuthChallenge::failed() const
+{
+    return fsm_terminated(fsm_);
+}
+
+AuthChallenge& AuthChallenge::event(int ev)
+{
+    int rc = fsm_act(fsm_, ev, NULL, NULL);
+    if (rc != FSM_OK)
+        throw Error(std::string("event: ") + sip_auth_event_name(ev) +
+                        " is illegal in state " + state_name(),
+                    rc);
+    return *this;
+}
+
+AuthChallenge& AuthChallenge::send(const Msg& m)
+{
+    return m.request ? event(SIP_AUTH_EV_SEND) : *this;
+}
+
+AuthChallenge& AuthChallenge::recv(const Msg& m)
+{
+    if (m.request) return *this;
+    if (m.status == 401 || m.status == 407) return event(SIP_AUTH_EV_CHALLENGE);
+    if (m.status >= 200 && m.status < 300) return event(SIP_AUTH_EV_SUCCESS);
+    if (m.status >= 300) return event(SIP_AUTH_EV_FAILURE);
+    return *this; /* 1xx */
+}
+
 } /* namespace sip */

@@ -29,7 +29,7 @@ include(UseSWIG)
 
 # Everything linked into an extension module must be PIC. Applied here so
 # the C libraries pay for it only when bindings build.
-foreach(dep task net gtp2 gtpu xfrm sip diam)
+foreach(dep task net gtp2 gtpu xfrm rtnl sip diam)
     set_target_properties(${dep} PROPERTIES POSITION_INDEPENDENT_CODE ON)
 endforeach()
 
@@ -73,9 +73,11 @@ endif()
 # The event loop and UDP socket the gtp module embeds, exposed as a
 # standalone module: net.Loop + net.UdpSocket for scripts that only need
 # transport (put SIP/Diameter bytes on the wire, drive their own loop).
+# It also fronts the rtnl netlink module (netlink/rtnl) for the interface
+# address helpers (net.addr_add / net.addr_del), beside if_index/if_addr4.
 add_library(netxx STATIC cxx/src/netxx.cpp)
 target_include_directories(netxx PUBLIC cxx/inc)
-target_link_libraries(netxx PUBLIC net)
+target_link_libraries(netxx PUBLIC net rtnl)
 set_target_properties(netxx PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 set_property(SOURCE swig/net.i PROPERTY CPLUSPLUS ON)
@@ -135,7 +137,13 @@ set_target_properties(sipxx PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 set_property(SOURCE swig/sip.i PROPERTY CPLUSPLUS ON)
 set_property(SOURCE swig/sip.i PROPERTY USE_TARGET_INCLUDE_DIRECTORIES ON)
-set_property(SOURCE swig/sip.i PROPERTY DEPENDS cxx/inc/sipxx.hpp)
+# sipxx.hpp %includes the facade; the SIP state-machine headers it pulls
+# in (sip_fsm.h transactions, sip_dialog.h dialog/usage machines) are not
+# tracked automatically, so declare them or their edits are missed.
+set_property(SOURCE swig/sip.i PROPERTY DEPENDS
+    cxx/inc/sipxx.hpp
+    ${CMAKE_SOURCE_DIR}/sip/inc/sip_fsm.h
+    ${CMAKE_SOURCE_DIR}/sip/inc/sip_dialog.h)
 # The CMake target is sip_lua because `sip` is the C library; the
 # loadable module is still sip.so for `require("sip")`.
 swig_add_library(sip_lua

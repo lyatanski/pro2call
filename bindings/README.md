@@ -294,11 +294,39 @@ t:recv(sip.parse(ok200))             -- Proceeding -> Terminated
 print(t:state_name(), t:terminated())
 ```
 
-The `ipsec` module (same pattern over [`xfrm/`](../xfrm)) is described
-in `swig/ipsec.i`: `ipsec.Xfrm` for SAs and policies, plus the IMS-AKA
-primitives its ESP keys come from — `ipsec.aka_opc`, `ipsec.aka_milenage`
-and `ipsec.aka_verify` (Milenage, TS 35.206) and `ipsec.md5` (for the
-HTTP Digest AKAv1-MD5 response).
+The layers above transactions (`sip/inc/sip_dialog.h`) wrap the same
+way, state-only and driven from the traffic:
+
+- `sip.Dialog` — the RFC 3261 §12 dialog (Init → Early → Confirmed →
+  Terminated): `recv`/`send` read an INVITE's dialog-forming 1xx (a
+  To-tag present), its 2xx, or a BYE; `early()`/`confirmed()`/
+  `terminated()` report where it is.
+- `sip.Registration` — the RFC 3261 §10 / TS 24.229 §5.1 registration
+  usage: `send(register)` registers, `recv` splits the reply (401/407
+  challenges, 2xx advances, else fails), and once `registered()` a
+  further `send` refreshes — or de-registers when the REGISTER carries
+  `Expires: 0`, ending in `done()`.
+- `sip.AuthChallenge` — the RFC 3261 §22 / RFC 2617 digest challenge-
+  response the registration delegates to; IMS-AKA (RFC 3310) drives the
+  same machine.
+
+```lua
+local reg  = sip.Registration()
+local auth = sip.AuthChallenge()
+local txn  = sip.Transaction(sip.NON_INVITE_CLIENT)  -- one per REGISTER
+
+reg:send(sip.parse(register1)); auth:send(sip.parse(register1)); txn:send(sip.parse(register1))
+reg:recv(sip.parse(challenge)); auth:recv(sip.parse(challenge))  -- -> Challenged
+reg:send(sip.parse(register2)); auth:send(sip.parse(register2))  -- credentialed
+reg:recv(sip.parse(ok200));     auth:recv(sip.parse(ok200))      -- -> Registered
+print(reg:state_name(), reg:registered(), auth:authenticated())
+```
+
+The `ipsec` module (same pattern over [`netlink/xfrm/`](../netlink/xfrm))
+is described in `swig/ipsec.i`: `ipsec.Xfrm` for SAs and policies, plus the
+IMS-AKA primitives its ESP keys come from — `ipsec.aka_opc`,
+`ipsec.aka_milenage` and `ipsec.aka_verify` (Milenage, TS 35.206) and
+`ipsec.md5` (for the HTTP Digest AKAv1-MD5 response).
 
 ## Lua: diam
 
@@ -382,6 +410,13 @@ loop:after(1000, function() loop:stop() end)        -- bound the wait
 loop:run()
 ```
 
+The module also exposes a few interface helpers: `net.if_index(name)` and
+`net.if_addr4(name)` (introspection), and `net.addr_add(name, addr,
+prefixlen)` / `net.addr_del(...)` — the `ip addr add/del` equivalents over
+RTNETLINK ([`netlink/rtnl/`](../netlink/rtnl)), so a script can make an
+address locally deliverable without shelling out to `ip` (they need
+CAP_NET_ADMIN and raise on failure).
+
 ## Examples
 
 All in Lua; run each with `LUA_CPATH=<build>/bindings/lua/?.so lua …`.
@@ -396,6 +431,13 @@ All in Lua; run each with `LUA_CPATH=<build>/bindings/lua/?.so lua …`.
   UE and install the GTP-U tunnel.
 - [`examples/sip_transaction.lua`](examples/sip_transaction.lua) — a
   full INVITE transaction, both sides, offline.
+- [`examples/sip_register.lua`](examples/sip_register.lua) — the RFC 3261
+  §10 registration procedure, both sides, offline: a UAC composes
+  `sip.Registration` (the §10 usage), `sip.AuthChallenge` (the §22 Digest
+  challenge) and a per-REGISTER `sip.Transaction` against a stub registrar
+  that challenges once and validates the digest, walking initial REGISTER
+  → 401 → authenticated REGISTER → 200 → refresh → de-register and
+  printing all three machines' states at each step.
 - [`examples/sip_dump.lua`](examples/sip_dump.lua) — parse and dump a
   SIP message with resolved header ids.
 - [`examples/ipsec_sa.lua`](examples/ipsec_sa.lua) — install and tear

@@ -107,31 +107,6 @@ local function attempt(what, fn)
     return ok
 end
 
--- Interface -> kernel ifindex (net.if_index) and -> first IPv4 address
--- (net.if_addr4) come from the net module now; both return 0 / "" when the
--- interface is absent, so callers can skip that direction cleanly.
-
--- The interface `ip route get <dst>` would send <dst> out of. Used to warn
--- when the P-CSCF would leave via an interface encap is not attached to.
-local function route_dev(dst)
-    local p = io.popen(("ip route get %s 2>/dev/null"):format(dst))
-    if not p then return nil end
-    local out = p:read("*a") or ""; p:close()
-    return out:match("dev%s+(%S+)")
-end
-
--- Run an `ip ...` command, returning ok and its combined output. `ip` is
--- silent on success, so empty output is the success signal (this reads the
--- same on busybox and iproute2, and needs no version-specific exit-code
--- handling). Used for the best-effort UE-PAA local route below.
-local function ip_cmd(args)
-    local p = io.popen("ip " .. args .. " 2>&1")
-    if not p then return false, "cannot run ip" end
-    local out = (p:read("*a") or ""):gsub("%s+$", "")
-    p:close()
-    return (out == ""), out
-end
-
 -- Resolve a host name to an IPv4 literal via the net module's own resolver.
 -- resolve4() returns a dotted-quad unchanged and otherwise runs the
 -- asynchronous net_dns engine (first A record, /etc/resolv.conf nameserver,
@@ -460,55 +435,34 @@ local function attach_pdn_over_s5()
 
     -- Send a REGISTER over the UE socket to the P-CSCF at `dport` (5060 for
     -- the unprotected one, the protected server port for the ESP one — the
-    -- kernel ESP-wraps that per the OUT policy). When the datapath is up,
-    -- confirm the encap ran by reading the per-TEID tx counter a moment later
-    -- (locally-generated traffic egresses through TC just after sendto).
+    -- kernel ESP-wraps that per the OUT policy).
     local function send_register(wire, label, dport)
-        local before = (up and st.sig_teid) and up:stats(st.sig_teid) or nil
         local sok, serr = pcall(function() sock:sendto(wire, st.pcscf, dport) end)
         if not sok then return fail(("REGISTER send failed: %s"):format(why(serr))) end
         line("-> REGISTER", ("%s, %d B -> P-CSCF %s:%d"):format(label, #wire, st.pcscf, dport))
-        if before then
-            loop:after(50, function()                 -- let the TC egress program run
-                local a   = up:stats(st.sig_teid)
-                local dtx = a.tx_pkts - before.tx_pkts
-                local dby = a.tx_bytes - before.tx_bytes
-                local dng = a.err_tx_no_neigh - before.err_tx_no_neigh
-                if dtx > 0 then
-                    line("GTP-U encap", ("REGISTER encapsulated on TEID %#x (+%d pkt / %d B)")
-                        :format(st.sig_teid, dtx, dby))
-                elseif dng > 0 then
-                    line("GTP-U encap", ("matched but no outer L2 (err_tx_no_neigh +%d); "
-                        .. "prime the peer or set a static MAC"):format(dng))
-                else
-                    line("GTP-U encap", "no tx counter movement (REGISTER not steered onto the bearer?)")
-                end
-            end)
-        end
     end
 
     -- Make the UE PAA locally deliverable so the decapped downlink (the
     -- P-CSCF's 401/200, whose inner dst is the PAA) reaches the UE socket.
     -- The rx decap entry hands the inner packet to the local stack, but the
     -- PAA is an address this host does not own, so without a local route the
-    -- kernel would try to forward -- and drop -- it. `ip addr add <PAA>/32
-    -- dev lo` puts it in the local routing table (delivered whatever
-    -- interface it arrives on) without answering ARP for it on the wire.
-    -- Best-effort and only meaningful with the decap datapath up, so it is
-    -- attempted only then (needs CAP_NET_ADMIN); it degrades to a reported
-    -- line and is removed again in teardown. The PAA is matched as a
-    -- dotted-quad before it reaches the shell, so it cannot smuggle syntax.
+    -- kernel would try to forward -- and drop -- it. net.addr_add (RTNETLINK
+    -- RTM_NEWADDR, the netlink/rtnl module) adds <PAA>/32 to `lo`, which puts
+    -- it in the local routing table (delivered whatever interface it arrives
+    -- on) without answering ARP for it on the wire -- and needs no external
+    -- `ip` tool. Best-effort and only meaningful with the decap datapath up,
+    -- so it is attempted only then (needs CAP_NET_ADMIN); the add is
+    -- idempotent, degrades to a reported line, and is removed in teardown.
     local function add_paa_route()
         if not (up and st.ue_addr and st.ue_addr:match("^%d+%.%d+%.%d+%.%d+$")) then return end
-        local ok, out = ip_cmd(("addr add %s/32 dev lo"):format(st.ue_addr))
-        if not ok and out:find("[Ee]xists") then ok = true end   -- already present
+        local ok, err = pcall(function() net.addr_add("lo", st.ue_addr, 32) end)
         paa_route_added = ok
         line("PAA local route", ok
             and ("%s/32 dev lo (decapsulated downlink now deliverable)"):format(st.ue_addr)
-            or  ("could not add %s/32 (need CAP_NET_ADMIN?): %s"):format(st.ue_addr, out))
+            or  ("could not add %s/32 (need CAP_NET_ADMIN?): %s"):format(st.ue_addr, why(err)))
     end
     local function del_paa_route()
-        if paa_route_added then ip_cmd(("addr del %s/32 dev lo"):format(st.ue_addr)) end
+        if paa_route_added then pcall(function() net.addr_del("lo", st.ue_addr, 32) end) end
     end
 
     -- Confirm a downlink response reached us through the decap entry by
@@ -668,16 +622,6 @@ local function attach_pdn_over_s5()
                   .. "no reply can return"):format(why(s)))
         end
         loop:add_fd(sock:fd(), net.NET_RD, on_sip_readable)
-
-        -- The P-CSCF is reached through the tunnel, so it should egress the
-        -- interface encap is attached to; warn if the FIB would send it
-        -- elsewhere (encap classifies on the inner headers, so the L2 next
-        -- hop is irrelevant, but the frame must physically leave via inner).
-        local dev = route_dev(st.pcscf)
-        if dev and inner_name and inner_name ~= "" and dev ~= inner_name then
-            line("note", ("%s routes via %s, not %s -- add a route so it reaches encap")
-                :format(st.pcscf, dev, inner_name))
-        end
 
         -- Baseline the downlink counter so report_rx can show the 401/200
         -- arriving through the decap entry.

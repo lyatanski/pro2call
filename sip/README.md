@@ -148,3 +148,38 @@ The RFC's timers arrive from the caller, collapsed by role:
 `TIMER_TERMINATE` (D/I/J/K). Illegal moves return `FSM_E_NOMATCH` and
 leave the state alone; the retransmissions the RFC absorbs are legal
 self-transitions.
+
+## Dialog and usage state machines
+
+`sip_dialog.h` adds the two layers that ride above transactions, built
+the same way — tables on `task/inc/fsm.h`, one state/event vocabulary
+each, state-only (no messages, no timers). Each transcribes one
+specification, cited beside its builder:
+
+| Builder | Specification | States |
+| ------- | ------------- | ------ |
+| `sip_dialog_fsm` | dialog, RFC 3261 §12 | Init → Early → Confirmed → Terminated |
+| `sip_reg_fsm` | registration usage, RFC 3261 §10 / 3GPP TS 24.229 §5.1 | Idle → Registering → Challenged → Authenticating → Registered → Refreshing / Deregistering → Done / Failed |
+| `sip_auth_fsm` | digest challenge-response, RFC 3261 §22 / RFC 2617 / RFC 7616 | Init → Pending → Challenged → Authenticated / Failed |
+
+They **compose downward**: a registration drives non-INVITE client
+transactions (above) and delegates its 401/407 handshake to the digest
+machine, which IMS-AKA (RFC 3310) reuses verbatim — only the credential
+the caller derives from the challenge differs. This is
+`bindings/examples/ims_test_s5.lua` (and `sip_register.lua`) generalized
+out of the script into a reusable layer; see `sip_state_machines.md`.
+
+```c
+fsm_t* r = sip_reg_fsm();                            /* Idle          */
+fsm_act(r, SIP_REG_EV_SEND, NULL, NULL);             /* -> Registering */
+fsm_act(r, SIP_REG_EV_CHALLENGE, NULL, NULL);        /* -> Challenged  */
+fsm_act(r, SIP_REG_EV_AUTH, NULL, NULL);             /* -> Authenticating */
+fsm_act(r, SIP_REG_EV_OK, NULL, NULL);               /* -> Registered  */
+fsm_destroy(r);
+```
+
+`Registered` is a resting state, not terminal (it refreshes or
+de-registers); a clean de-registration ends in `Done`, any rejection or
+timeout in `Failed`. As with transactions, a stale-nonce re-challenge is
+a legal transition back to `Challenged` and the caller bounds the retry
+loop.

@@ -17,7 +17,7 @@ subdirectory; the deeper per-module READMEs carry the usage detail.
 | [`sip/`](sip) | SIP message codec — zero-copy parse, buffer-writing encode, enum-resolved methods and headers — plus the RFC 3261 transaction state machines. |
 | [`sdp/`](sdp) | SDP session-description codec — zero-copy single-pass parse, enum-resolved attributes. |
 | [`rtp/`](rtp) | RTP/RTCP codec with the RFC 3550 receiver-side source tracker (sequence validation, loss, jitter). |
-| [`xfrm/`](xfrm) | IPsec SA/policy management over the kernel's XFRM netlink interface. |
+| [`nlmsg/`](netlink) | Kernel configuration over netlink: IPsec SA/policy management (`xfrm`, NETLINK_XFRM) and interface address add/del (`rtnl`, RTNETLINK `RTM_*ADDR`). |
 | [`bindings/`](bindings) | SWIG bindings (Lua) over C++ facades of the C libraries. |
 
 ## Specifications
@@ -51,9 +51,9 @@ subdirectory; the deeper per-module READMEs carry the usage detail.
 - RFC 3550 — RTP: transport for real-time applications (SR/RR/SDES/BYE, source tracker).
 - RFC 3551 — RTP profile for audio/video (payload-type constants).
 
-### xfrm
-- RFC 4301 — Security Architecture for the Internet Protocol (IPsec).
-- RFC 3549 — Linux netlink as an IP services protocol (XFRM wire layout).
+### netlink
+- RFC 4301 — Security Architecture for the Internet Protocol (IPsec) (`xfrm`).
+- RFC 3549 — Linux netlink as an IP services protocol (XFRM and RTNETLINK wire layout).
 
 ### bindings
 - Follows the specs of whichever module is wrapped (GTP, SIP, Diameter, IPsec).

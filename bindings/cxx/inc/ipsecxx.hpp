@@ -7,8 +7,8 @@
 
 #include "xfrm.h"
 
-/* ipsecxx — C++ facade over the C XFRM module (xfrm/inc/xfrm.h), written
- * to be wrapped by SWIG (bindings/swig/ipsec.i) and driven from a
+/* ipsecxx — C++ facade over the C XFRM module (netlink/xfrm/inc/xfrm.h),
+ * written to be wrapped by SWIG (bindings/swig/ipsec.i) and driven from a
  * scripting language. It follows the same rules as the gtpxx facade:
  *
  *   - value types: Sa/Policy carry their own copies of everything;

@@ -26,7 +26,7 @@ add_subdirectory(diam)
 add_subdirectory(net)
 add_subdirectory(sip)
 add_subdirectory(rtp)
-add_subdirectory(xfrm)
+add_subdirectory(nlmsg)
 
 # Scripting bindings: gtpxx C++ facade + SWIG Python module. Optional;
 # skipped with a status message when SWIG or the Python development

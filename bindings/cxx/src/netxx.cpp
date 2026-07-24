@@ -7,8 +7,11 @@
  * from Loop::step()/run(). */
 
 #include "netxx.hpp"
+#include "rtnl.h"
 
 #include <arpa/inet.h>
+#include <cerrno>
+#include <cstring>
 #include <exception>
 #include <ifaddrs.h>
 #include <map>
@@ -209,6 +212,53 @@ std::string if_addr4(const std::string& name)
     }
     freeifaddrs(ifas);
     return out;
+}
+
+/* Run one RTNETLINK address op on a throwaway socket, turning a non-OK
+ * return into a net::Error. Interface-address ops are rare and stateless,
+ * so a per-call socket keeps this a pair of free functions beside
+ * if_index/if_addr4, with no handle for the script to own. */
+static void rtnl_addr_op(const char* doing, const std::string& name,
+                         const std::string& addr, uint8_t prefixlen, bool add)
+{
+    uint32_t idx = name.empty() ? 0 : if_nametoindex(name.c_str());
+    if (idx == 0) throw Error(std::string(doing) + ": no such interface");
+
+    rtnl_sock s;
+    if (rtnl_open(&s) != RTNL_OK)
+        throw Error(std::string("rtnl_open: ") + std::strerror(errno),
+                    RTNL_E_SYS);
+
+    rtnl_addr a;
+    std::memset(&a, 0, sizeof a);
+    a.addr      = addr.c_str();
+    a.prefixlen = prefixlen;
+    a.ifindex   = idx;
+
+    int rc = add ? rtnl_addr_add(&s, &a) : rtnl_addr_del(&s, &a);
+    int nl = s.nl_errno;
+    rtnl_close(&s);
+    if (rc == RTNL_OK) return;
+
+    std::string what = doing;
+    if (rc == RTNL_E_ACK)
+        what += std::string(": kernel rejected it (") + std::strerror(nl) + ")";
+    else if (rc == RTNL_E_SYS) what += std::string(": ") + std::strerror(errno);
+    else if (rc == RTNL_E_INVAL) what += ": invalid argument";
+    else what += ": error";
+    throw Error(what, rc);
+}
+
+void addr_add(const std::string& name, const std::string& addr,
+              uint8_t prefixlen)
+{
+    rtnl_addr_op("addr_add", name, addr, prefixlen, true);
+}
+
+void addr_del(const std::string& name, const std::string& addr,
+              uint8_t prefixlen)
+{
+    rtnl_addr_op("addr_del", name, addr, prefixlen, false);
 }
 
 /* ---- UdpSocket ---- */

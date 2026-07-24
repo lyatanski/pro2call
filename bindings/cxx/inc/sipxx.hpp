@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "sip.h"
+#include "sip_dialog.h"
 #include "sip_fsm.h"
 
 /* sipxx — C++ facade over the C SIP codec (sip/inc/sip.h), written to
@@ -328,6 +329,188 @@ class Transaction
   private:
     fsm_t* fsm_;
     int    kind_;
+};
+
+/* ---- Dialog state machine (RFC 3261 §12) ---- */
+
+enum DialogState {
+    DS_INIT       = SIP_DIALOG_ST_INIT,
+    DS_EARLY      = SIP_DIALOG_ST_EARLY,
+    DS_CONFIRMED  = SIP_DIALOG_ST_CONFIRMED,
+    DS_TERMINATED = SIP_DIALOG_ST_TERMINATED
+};
+
+/* Non-message events for event(); message events come from
+ * send()/recv(). */
+enum DialogEvent {
+    DE_EARLY     = SIP_DIALOG_EV_EARLY,
+    DE_CONFIRM   = SIP_DIALOG_EV_CONFIRM,
+    DE_TERMINATE = SIP_DIALOG_EV_TERMINATE
+};
+
+/* A §12 dialog's lifecycle over the task FSM engine
+ * (sip/inc/sip_dialog.h): Init -> Early -> Confirmed -> Terminated.
+ * Tracks state only — the dialog id, CSeq, route set and remote target
+ * are yours to keep. send(msg)/recv(msg) derive the event from a parsed
+ * message: an INVITE's dialog-forming 1xx (a to-tag present) opens the
+ * early dialog, its 2xx confirms it, a non-2xx final ends a not-yet-
+ * confirmed dialog, and a BYE ends a confirmed one — every other message
+ * is a no-op. event() injects a raw DE_*. An illegal move throws Error.
+ *
+ *   local d = sip.Dialog()
+ *   d:recv(sip.parse(ringing_with_totag))  -- Init -> Early
+ *   d:recv(sip.parse(ok200))               -- Early -> Confirmed
+ *   d:send(sip.parse(bye))                 -- Confirmed -> Terminated
+ */
+class Dialog
+{
+  public:
+    Dialog();
+    ~Dialog();
+    Dialog(const Dialog&)            = delete;
+    Dialog& operator=(const Dialog&) = delete;
+
+    int         state() const;
+    std::string state_name() const;
+    bool        early() const;
+    bool        confirmed() const;
+    bool        terminated() const;
+
+    /* Inject a raw DE_* event. Throws Error on an illegal move. */
+    Dialog& event(int ev);
+
+    /* Derive the event from a message this side sends / receives. */
+    Dialog& send(const Msg& m);
+    Dialog& recv(const Msg& m);
+
+  private:
+    fsm_t* fsm_;
+};
+
+/* ---- Registration usage (RFC 3261 §10, 3GPP TS 24.229 §5.1) ---- */
+
+enum RegState {
+    RS_IDLE           = SIP_REG_ST_IDLE,
+    RS_REGISTERING    = SIP_REG_ST_REGISTERING,
+    RS_CHALLENGED     = SIP_REG_ST_CHALLENGED,
+    RS_AUTHENTICATING = SIP_REG_ST_AUTHENTICATING,
+    RS_REGISTERED     = SIP_REG_ST_REGISTERED,
+    RS_REFRESHING     = SIP_REG_ST_REFRESHING,
+    RS_DEREGISTERING  = SIP_REG_ST_DEREGISTERING,
+    RS_DONE           = SIP_REG_ST_DONE,
+    RS_FAILED         = SIP_REG_ST_FAILED
+};
+
+enum RegEvent {
+    RE_SEND       = SIP_REG_EV_SEND,
+    RE_CHALLENGE  = SIP_REG_EV_CHALLENGE,
+    RE_AUTH       = SIP_REG_EV_AUTH,
+    RE_OK         = SIP_REG_EV_OK,
+    RE_FAIL       = SIP_REG_EV_FAIL,
+    RE_REFRESH    = SIP_REG_EV_REFRESH,
+    RE_DEREGISTER = SIP_REG_EV_DEREGISTER
+};
+
+/* The UAC registration procedure over the task FSM engine
+ * (sip/inc/sip_dialog.h): idle -> registering -> challenged ->
+ * authenticating -> registered, then refresh or de-register. Tracks
+ * state only. send(msg) reads the current state to place a REGISTER:
+ * the first one registers, one after a challenge carries credentials,
+ * and one while registered refreshes — unless it de-registers (Expires:0,
+ * Contact "*", or a Contact with expires=0). recv(msg) splits the reply:
+ * 401/407 challenges, a 2xx advances, any other final fails. Compose the
+ * challenge with sip.AuthChallenge and the transaction with
+ * sip.Transaction(sip.NON_INVITE_CLIENT). event() injects a raw RE_*.
+ *
+ *   local r = sip.Registration()
+ *   r:send(sip.parse(register1))  -- Idle -> Registering
+ *   r:recv(sip.parse(challenge))  -- Registering -> Challenged
+ *   r:send(sip.parse(register2))  -- Challenged -> Authenticating
+ *   r:recv(sip.parse(ok200))      -- Authenticating -> Registered
+ */
+class Registration
+{
+  public:
+    Registration();
+    ~Registration();
+    Registration(const Registration&)            = delete;
+    Registration& operator=(const Registration&) = delete;
+
+    int         state() const;
+    std::string state_name() const;
+    bool        registered() const;  /* a live binding                  */
+    bool        done() const;        /* de-registered cleanly           */
+    bool        failed() const;      /* terminal failure                */
+
+    /* Inject a raw RE_* event. Throws Error on an illegal move. */
+    Registration& event(int ev);
+
+    /* Derive the event from a message this side sends / receives. */
+    Registration& send(const Msg& m);
+    Registration& recv(const Msg& m);
+
+  private:
+    fsm_t* fsm_;
+};
+
+/* ---- Digest authentication (RFC 3261 §22, RFC 2617 / RFC 7616) ---- */
+
+enum AuthState {
+    AS_INIT          = SIP_AUTH_ST_INIT,
+    AS_PENDING       = SIP_AUTH_ST_PENDING,
+    AS_CHALLENGED    = SIP_AUTH_ST_CHALLENGED,
+    AS_AUTHENTICATED = SIP_AUTH_ST_AUTHENTICATED,
+    AS_FAILED        = SIP_AUTH_ST_FAILED
+};
+
+enum AuthEvent {
+    AE_SEND      = SIP_AUTH_EV_SEND,
+    AE_CHALLENGE = SIP_AUTH_EV_CHALLENGE,
+    AE_SUCCESS   = SIP_AUTH_EV_SUCCESS,
+    AE_FAILURE   = SIP_AUTH_EV_FAILURE,
+    AE_GIVE_UP   = SIP_AUTH_EV_GIVE_UP
+};
+
+/* The digest challenge-response sub-FSM over the task FSM engine
+ * (sip/inc/sip_dialog.h): a request, a 401/407, the same request re-sent
+ * with credentials, a final. The reusable core of any authenticated
+ * request — a registration delegates its challenge to it. send(msg)
+ * marks a request going out, recv(msg) reads the reply (401/407
+ * challenges, 2xx authenticates, any other final fails); a repeated
+ * challenge returns to Challenged so the caller can retry a stale nonce,
+ * and event(sip.AE_GIVE_UP) aborts when a retry cap is hit. IMS-AKA
+ * (RFC 3310) drives this same machine — only the credential the caller
+ * derives from the challenge differs. An illegal move throws Error.
+ *
+ *   local a = sip.AuthChallenge()
+ *   a:send(sip.parse(req))        -- Init -> Pending
+ *   a:recv(sip.parse(challenge))  -- Pending -> Challenged
+ *   a:send(sip.parse(req_creds))  -- Challenged -> Pending
+ *   a:recv(sip.parse(ok200))      -- Pending -> Authenticated
+ */
+class AuthChallenge
+{
+  public:
+    AuthChallenge();
+    ~AuthChallenge();
+    AuthChallenge(const AuthChallenge&)            = delete;
+    AuthChallenge& operator=(const AuthChallenge&) = delete;
+
+    int         state() const;
+    std::string state_name() const;
+    bool        challenged() const;
+    bool        authenticated() const;
+    bool        failed() const;
+
+    /* Inject a raw AE_* event. Throws Error on an illegal move. */
+    AuthChallenge& event(int ev);
+
+    /* Derive the event from a message this side sends / receives. */
+    AuthChallenge& send(const Msg& m);
+    AuthChallenge& recv(const Msg& m);
+
+  private:
+    fsm_t* fsm_;
 };
 
 } /* namespace sip */

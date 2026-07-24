@@ -119,6 +119,23 @@ end
 check(raises(function() net.UdpSocket("not-an-ip", 0) end),
     "bad bind address raises")
 
+-- interface helpers ---------------------------------------------------
+do
+    -- introspection over the always-present loopback interface
+    check(net.if_index("lo") ~= 0, "if_index resolves lo")
+    check(net.if_index("nosuchif0") == 0, "if_index is 0 for an absent interface")
+    check(net.if_addr4("lo"):match("^%d+%.%d+%.%d+%.%d+$") ~= nil,
+        "if_addr4 reports the loopback address")
+
+    -- addr_add/addr_del validate the interface before any privileged
+    -- netlink op, so an unknown name raises without CAP_NET_ADMIN. The
+    -- live add/del round-trip is covered by netlink/rtnl's C test.
+    check(raises(function() net.addr_add("nosuchif0", "10.0.0.1", 32) end),
+        "addr_add raises for an unknown interface")
+    check(raises(function() net.addr_del("nosuchif0", "10.0.0.1", 32) end),
+        "addr_del raises for an unknown interface")
+end
+
 if failed == 0 then
     print(string.format("ok - %d checks passed", tests))
     os.exit(0)

@@ -139,6 +139,20 @@ uint32_t if_index(const std::string& name);
  * Used to derive a source address from the interface a tunnel egresses. */
 std::string if_addr4(const std::string& name);
 
+/* Add or remove an interface address, as `ip addr add`/`ip addr del
+ * <addr>/<prefixlen> dev <name>` do, over RTNETLINK (netlink/rtnl) — so a
+ * script needs no external `ip` tool. Adding makes the address locally
+ * deliverable (the kernel installs its `local` route), which lets a
+ * socket bound to an address this host does not otherwise own — e.g. a
+ * simulated UE's PDN address on `lo` — receive traffic destined to it.
+ * addr_add is idempotent (an address already present is left in place).
+ * Both need CAP_NET_ADMIN and throw net::Error on failure, including an
+ * unknown interface name. */
+void addr_add(const std::string& name, const std::string& addr,
+              uint8_t prefixlen);
+void addr_del(const std::string& name, const std::string& addr,
+              uint8_t prefixlen);
+
 /* ---- UDP socket ---- */
 
 /* A datagram from UdpSocket::recv: data/host/port on success, or
