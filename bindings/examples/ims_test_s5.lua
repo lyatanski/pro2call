@@ -63,8 +63,14 @@ local ims_realm = os.getenv("IMS_REALM")
     or ("ims.mnc%s.mcc%s.3gppnetwork.org"):format(mnc3(mnc), mcc)
 
 local T3_MS, N3  = 1000, 3     -- GTP-C retransmission: 1s T3-RESPONSE, up to 3 sends
-local SIP_T_MS   = 5000        -- SIP response deadline per registration step
+local SIP_T_MS   = tonumber(os.getenv("SIP_T_MS") or "5000")  -- SIP response deadline per registration step
 local AUTH_CAP   = 2           -- give up after this many 401 challenges
+
+-- Ramp the attach: space each subscriber's Create Session by RAMP_MS so a large
+-- IMS_SUBS arrives as a smooth stream, not a single burst that overruns the core
+-- (SMF Create Session, the CSCF chain and the one net.Loop) past SIP_T_MS. 0 =
+-- fire everything up front (the original behaviour).
+local RAMP_MS    = tonumber(os.getenv("RAMP_MS") or "0")
 
 local IPPROTO_UDP    = 17      -- unprotected REGISTER: plain UDP toward the P-CSCF
 local IPPROTO_ESP    = 50      -- protected traffic: ESP (IMS-AKA IPsec, TS 33.203)
@@ -135,6 +141,8 @@ local function make_sub(i)
         sig_teid = nil, remote_addr = nil, rx0 = nil,
         sock = nil, timer = nil, txn = nil, ch = nil,
         registered = false, done = false, paa_added = false, err = nil,
+        stage = "session", fail_stage = nil,   -- how far it got / where it gave up
+        sess = nil, deleted = false, del_ok = false,  -- GTP-C session + teardown state
     }
 end
 
@@ -321,6 +329,7 @@ local function run()
     local xfrm                         -- shared ipsec.Xfrm handle (SAs distinct per subscriber)
     local subs, by_imsi, by_teid = {}, {}, {}
     local pending, grace = NSUBS, nil
+    local dpending, tguard = 0, nil     -- outstanding Delete Session txns (teardown)
 
     -- Per-subscriber SIP deadline over the shared loop.
     local function disarm(sub) if sub.timer then loop:cancel(sub.timer); sub.timer = nil end end
@@ -328,6 +337,7 @@ local function run()
 
     -- forward declarations for the mutually-referring phase steps
     local begin_registration, on_sip_readable, handle_sip, on_401, on_registered
+    local begin_teardown, del_done
 
     -- A subscriber reached a terminal state; when the last one does, wait a
     -- little for late Create Bearer Requests, then stop the loop.
@@ -338,17 +348,61 @@ local function run()
         pending = pending - 1
         if pending > 0 then return end
         if grace then return end
-        grace = loop:after(3000, function() grace = nil; loop:stop() end)
+        -- All subscribers terminal: wait briefly for late Create Bearer Requests,
+        -- then tear the PDN connections down (Delete Session) before stopping.
+        grace = loop:after(3000, function() grace = nil; begin_teardown() end)
     end
     local function fail(sub, msg)
         sub.err = msg
+        sub.fail_stage = sub.stage       -- snapshot the stage reached at give-up
         slog(sub, "result", "FAILED: " .. msg)
         finish(sub)
     end
     local function succeed(sub)
         sub.registered = true
+        sub.stage = "done"
         slog(sub, "result", ("registered at P-CSCF %s"):format(sub.pcscf or "?"))
         finish(sub)
+    end
+
+    -- One Delete Session transaction resolved (response, timeout or send failure);
+    -- when the last one settles, stop the loop.
+    del_done = function(sub, ok, note)
+        if sub.deleted then return end
+        sub.deleted, sub.del_ok = true, ok and true or false
+        if note then slog(sub, "Delete Session", note) end
+        dpending = dpending - 1
+        if dpending <= 0 then
+            if tguard then loop:cancel(tguard); tguard = nil end
+            loop:stop()
+        end
+    end
+
+    -- Teardown: send a Delete Session Request for every established PDN connection
+    -- and wait for the responses (T3/N3 retransmission), so the PGW/SMF frees each
+    -- session-pool entry instead of leaking it until timeout. Ramped like the attach.
+    begin_teardown = function()
+        local del = {}
+        for _, s in ipairs(subs) do
+            if s.sess and s.pgw_ctrl_teid then del[#del + 1] = s end
+        end
+        if #del == 0 then return loop:stop() end
+        banner(("Delete Session Requests — tearing down %d PDN connection(s)"):format(#del))
+        dpending = #del
+        -- overall deadline so a lost response cannot hang teardown forever
+        tguard = loop:after(#del * math.max(RAMP_MS, 1) + T3_MS * N3 + 2000,
+                            function() tguard = nil; loop:stop() end)
+        for i, s in ipairs(del) do
+            local function fire_del()
+                local dok, derr = pcall(function() s.sess:delete_session() end)
+                if dok then
+                    slog(s, "-> Delete Session Req", ("linked EBI -> PGW ctrl TEID %#x"):format(s.pgw_ctrl_teid))
+                else
+                    del_done(s, false, "send failed: " .. why(derr))
+                end
+            end
+            if RAMP_MS > 0 then loop:after((i - 1) * RAMP_MS, fire_del) else fire_del() end
+        end
     end
 
     -- Steer a subscriber's SIP onto its default bearer with two TFTs (UDP for
@@ -426,6 +480,7 @@ local function run()
     end
 
     handle_sip = function(sub, m)
+        if sub.done then return end   -- ignore late replies once terminal
         disarm(sub)
         pcall(function() if sub.txn then sub.txn:recv(m) end end)
         pcall(function() sub.auth:recv(m) end)
@@ -455,6 +510,7 @@ local function run()
     -- kernel ESP-wraps it, egressing as proto 50) with a Security-Verify.
     -- Without one, fall back to an unprotected authenticated REGISTER.
     on_401 = function(sub, m401)
+        sub.stage = "auth"           -- challenged; now authenticating toward 200 OK
         local okc, ch = pcall(parse_challenge, m401)
         if not okc then return fail(sub, "cannot parse 401 challenge: " .. why(ch)) end
         sub.ch = ch
@@ -490,8 +546,7 @@ local function run()
     -- transparent UE socket and send the unprotected REGISTER.
     begin_registration = function(sub)
         if not (sub.pcscf and sub.ue_addr) then
-            slog(sub, "registration", "skipped (no P-CSCF/UE address)")
-            return finish(sub)
+            return fail(sub, "no P-CSCF/UE address from Create Session")
         end
         add_paa_route(sub)
 
@@ -523,6 +578,7 @@ local function run()
         if up and sub.sig_teid then sub.rx0 = up:stats(sub.sig_teid) end
 
         sub.cseq = sub.cseq + 1
+        sub.stage = "register"       -- driving the initial REGISTER / 401 exchange
         local reg1 = build_register(sub, authz_hdr(sub, ims_realm, "", ""),
                                     "Security-Client", security_client(sub))
         send_register(sub, reg1, "unprotected", PCSCF_SIP_PORT)
@@ -587,9 +643,22 @@ local function run()
             if sub then slog(sub, "<> Create Bearer", ("seq %d, EBI %d accepted (media)"):format(req.sequence, NEW_EBI)) end
         end,
 
+        -- A Delete Session Request was answered: this PDN connection is torn down.
+        on_delete_session_response = function(sess, rsp)
+            local sub = by_imsi[sess:imsi()]
+            if not sub then return end
+            slog(sub, "<- Delete Session Resp", ("cause %d"):format(rsp.cause))
+            del_done(sub, true)
+        end,
+
         on_timeout = function(sess, mt)
             local sub = by_imsi[sess:imsi()]
-            if sub then fail(sub, ("PGW did not answer message type %d (after %d sends)"):format(mt, N3)) end
+            if not sub then return end
+            if mt == gtp.GTP2_MT_DELETE_SESSION_REQUEST then
+                del_done(sub, false, ("no Delete Session response (%d sends)"):format(N3))
+            else
+                fail(sub, ("PGW did not answer message type %d (after %d sends)"):format(mt, N3))
+            end
         end,
     })
 
@@ -625,9 +694,14 @@ local function run()
         bc:add_fteid(2, u)
         req:add_bearer(bc)
 
-        local sess = ep:create_session(req, pgw_ip)
-        by_teid[sess:local_teid()] = sub
-        slog(sub, "-> Create Session Req", ("SGW ctrl TEID %#x, IMSI %s"):format(sess:local_teid(), sub.imsi))
+        -- Send now, or stagger by RAMP_MS * index so the attach is a stream.
+        local function fire()
+            local sess = ep:create_session(req, pgw_ip)
+            sub.sess = sess
+            by_teid[sess:local_teid()] = sub
+            slog(sub, "-> Create Session Req", ("SGW ctrl TEID %#x, IMSI %s"):format(sess:local_teid(), sub.imsi))
+        end
+        if RAMP_MS > 0 then loop:after((i - 1) * RAMP_MS, fire) else fire() end
     end
 
     -- One dispatcher for every socket and timer until the last subscriber is
@@ -651,8 +725,53 @@ local function run()
 end
 
 -- main
+local t0 = net.now_ms()
 local subs = run()
-local ok = 0
-for _, sub in ipairs(subs) do if sub.registered then ok = ok + 1 end end
-banner(("Summary: %d / %d subscriber(s) registered over S5/S8"):format(ok, #subs))
+local elapsed = (net.now_ms() - t0) / 1000
+
+-- Tally registrations and, for the rest, the stage each subscriber reached when
+-- it gave up: session setup (GTP-C Create Session), the initial REGISTER / 401
+-- challenge, or authentication (AKA verify + the authenticated REGISTER / 200 OK).
+local STAGES = {
+    { key = "session",  label = "session setup (GTP-C)" },
+    { key = "register", label = "REGISTER / 401 challenge" },
+    { key = "auth",     label = "authentication / 200 OK" },
+    { key = "other",    label = "other / incomplete" },
+}
+local ok, tally = 0, {}
+for _, sub in ipairs(subs) do
+    if sub.registered then
+        ok = ok + 1
+    else
+        local k = sub.fail_stage or "other"
+        local t = tally[k]
+        if not t then t = { n = 0, reasons = {} }; tally[k] = t end
+        t.n = t.n + 1
+        local r = sub.err or "unknown"
+        t.reasons[r] = (t.reasons[r] or 0) + 1
+    end
+end
+
+-- Teardown accounting: Delete Session responses received / PDN connections established.
+local est, torn = 0, 0
+for _, sub in ipairs(subs) do
+    if sub.pgw_ctrl_teid then est = est + 1; if sub.del_ok then torn = torn + 1 end end
+end
+
+banner(("Summary: %d / %d subscriber(s) registered over S5/S8 in %.2fs"):format(ok, #subs, elapsed))
+if est > 0 then line("sessions torn down", ("%d / %d (Delete Session)"):format(torn, est)) end
+if ok < #subs then
+    line("failed", tostring(#subs - ok))
+    for _, s in ipairs(STAGES) do
+        local t = tally[s.key]
+        if t then
+            print(("     %-28s %d"):format(s.label, t.n))
+            -- distinct reasons within the stage, most frequent first
+            local rs = {}
+            for r, n in pairs(t.reasons) do rs[#rs + 1] = { r = r, n = n } end
+            table.sort(rs, function(a, b) return a.n > b.n end)
+            for _, e in ipairs(rs) do print(("        %-45s %d"):format(e.r, e.n)) end
+        end
+    end
+end
 os.exit(ok == #subs and 0 or 1)

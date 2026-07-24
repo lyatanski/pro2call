@@ -527,7 +527,13 @@ bool Endpoint::handle_response(const Bytes& wire, const gtp2_hdr_t& h,
         CreateSessionResponse rsp = CreateSessionResponse::decode(wire);
         if (rsp.cause == GTP2_CAUSE_REQUEST_ACCEPTED) {
             s->state_ = Session::ACTIVE;
+            /* Peer control TEID for subsequent Modify/Delete: the Sender
+             * F-TEID (instance 0) when present, else the PGW-C F-TEID
+             * (instance 1) — open5gs' S5/S8 Create Session Response carries
+             * only the latter, so without this fallback remote_teid_ stays 0
+             * and a Delete Session is answered "Context Not Found" (cause 64). */
             if (rsp.has_sender_fteid) s->remote_teid_ = rsp.sender_fteid.teid;
+            else if (rsp.has_pgw_fteid) s->remote_teid_ = rsp.pgw_fteid.teid;
             s->tunnels_ = tunnels_from(
                 CreateSessionRequest::decode(t->wire).bearers, rsp.bearers);
         } else {
