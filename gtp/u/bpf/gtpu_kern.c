@@ -331,13 +331,47 @@ malformed:
  * Egress: GTP-U encapsulation (§13.4)
  * ===================================================================== */
 
+/* Probe the four port tiers of a TFT key whose family/proto/addresses are
+ * already filled: {ue_port, remote_port}, {ue_port, 0}, {0, remote_port},
+ * {0, 0} (see gtpu_abi.h). Mutates k->ue_port/remote_port; returns the
+ * matched tunnel or NULL. */
+static __always_inline struct gtpu_tx_tun*
+tft_probe_ports(struct gtpu_tft_key* k, __be16 ue_port, __be16 remote_port)
+{
+    struct gtpu_tx_tun* tun;
+
+    k->ue_port     = ue_port;
+    k->remote_port = remote_port;
+    tun            = bpf_map_lookup_elem(&teid_tft_map, k);
+    if (tun) return tun;
+
+    if (remote_port) {
+        k->remote_port = 0;
+        tun            = bpf_map_lookup_elem(&teid_tft_map, k);
+        if (tun) return tun;
+    }
+    if (ue_port) {
+        k->ue_port     = 0;
+        k->remote_port = remote_port;
+        tun            = bpf_map_lookup_elem(&teid_tft_map, k);
+        if (tun) return tun;
+    }
+    if (ue_port || remote_port) {
+        k->ue_port     = 0;
+        k->remote_port = 0;
+        tun            = bpf_map_lookup_elem(&teid_tft_map, k);
+        if (tun) return tun;
+    }
+    return NULL;
+}
+
 /* Bearer classification: dedicated-bearer TFT filters first (exact
  * match with wildcard tiers, see gtpu_abi.h), then the default-bearer
  * LPM trie for the inner family. Returns NULL when the packet belongs
  * to no tunnel. */
 static __always_inline struct gtpu_tx_tun*
-tx_classify(__u8 family, const __u8* ue_addr, __u8 proto, __be16 ue_port,
-            __be16 remote_port)
+tx_classify(__u8 family, const __u8* ue_addr, const __u8* ue_saddr, __u8 proto,
+            __be16 ue_port, __be16 remote_port)
 {
     struct gtpu_tft_key k;
     __builtin_memset(&k, 0, sizeof k);
@@ -347,28 +381,16 @@ tx_classify(__u8 family, const __u8* ue_addr, __u8 proto, __be16 ue_port,
 
     struct gtpu_tx_tun* tun;
 
-    k.ue_port     = ue_port;
-    k.remote_port = remote_port;
-    tun           = bpf_map_lookup_elem(&teid_tft_map, &k);
+    /* Source-specific filters first (a per-UE filter keyed on the UE's own
+     * inner source keeps several UEs to one destination distinct), then
+     * source-wildcard filters (ue_saddr all-zero = any source). */
+    __builtin_memcpy(k.ue_saddr, ue_saddr, 16);
+    tun = tft_probe_ports(&k, ue_port, remote_port);
     if (tun) return tun;
 
-    if (remote_port) {
-        k.remote_port = 0;
-        tun           = bpf_map_lookup_elem(&teid_tft_map, &k);
-        if (tun) return tun;
-    }
-    if (ue_port) {
-        k.ue_port     = 0;
-        k.remote_port = remote_port;
-        tun           = bpf_map_lookup_elem(&teid_tft_map, &k);
-        if (tun) return tun;
-    }
-    if (ue_port || remote_port) {
-        k.ue_port     = 0;
-        k.remote_port = 0;
-        tun           = bpf_map_lookup_elem(&teid_tft_map, &k);
-        if (tun) return tun;
-    }
+    __builtin_memset(k.ue_saddr, 0, sizeof k.ue_saddr);
+    tun = tft_probe_ports(&k, ue_port, remote_port);
+    if (tun) return tun;
 
     if (family == AF_INET) {
         struct gtpu_lpm4_key lk;
@@ -477,7 +499,7 @@ int gtpu_encap(struct __sk_buff* skb)
     }
 
     struct gtpu_tx_tun* tun =
-        tx_classify(family, ue_addr, proto, ue_port, remote_port);
+        tx_classify(family, ue_addr, inner_saddr, proto, ue_port, remote_port);
     if (!tun) return TC_ACT_OK; /* not tunnel traffic — pass through */
 
     struct gtpu_stats*  st  = stats_slot(tun->local_teid);

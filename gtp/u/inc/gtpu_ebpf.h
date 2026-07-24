@@ -89,13 +89,16 @@ typedef struct {
 /* Dedicated bearer: its own TEID pair plus the traffic filter that
  * steers inner packets onto it (subset of a TS 24.008 TFT packet
  * filter — protocol and single ports, 0 = wildcard; ranges expand to
- * multiple filters). tunnel.inner_addr selects the UE; matching is on
- * the inner header with dst = UE side. */
+ * multiple filters). tunnel.inner_addr is the inner dst matched (for
+ * uplink to a remote peer this is that peer, not the UE). inner_saddr,
+ * when set, additionally matches the inner source, so several UEs to one
+ * destination stay on their own bearers; all-zero = any source. */
 typedef struct {
     gtpu_tunnel_t tunnel;
-    uint8_t       proto;       /* inner IPPROTO_*; required */
-    uint16_t      ue_port;     /* inner dst port; 0 = any */
-    uint16_t      remote_port; /* inner src port; 0 = any */
+    uint8_t       proto;           /* inner IPPROTO_*; required */
+    uint16_t      ue_port;         /* inner dst port; 0 = any */
+    uint16_t      remote_port;     /* inner src port; 0 = any */
+    uint8_t       inner_saddr[16]; /* inner src match; all-zero = any */
 } gtpu_tft_t;
 
 typedef void (*gtpu_event_cb_t)(void* ctx, const struct gtpu_event* ev);

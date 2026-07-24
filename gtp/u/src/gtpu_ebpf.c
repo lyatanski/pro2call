@@ -487,6 +487,7 @@ static int tft_key_build(const gtpu_tft_t* f, struct gtpu_tft_key* k)
     k->ue_port     = htons(f->ue_port);
     k->remote_port = htons(f->remote_port);
     memcpy(k->ue_addr, f->tunnel.inner_addr, 16);
+    memcpy(k->ue_saddr, f->inner_saddr, 16);
     return GTPU_OK;
 }
 

@@ -26,6 +26,8 @@
 
 static const uint8_t UE[4]        = { 10, 45, 0, 2 };
 static const uint8_t UE2[4]       = { 10, 45, 0, 3 };
+static const uint8_t UE3[4]       = { 10, 45, 0, 4 }; /* concurrent-UE source A */
+static const uint8_t UE4[4]       = { 10, 45, 0, 5 }; /* concurrent-UE source B */
 static const uint8_t HOST[4]      = { 203, 0, 113, 10 };
 static const uint8_t PCSCF[4]     = { 203, 0, 113, 20 }; /* destination-steered filter target */
 static const uint8_t O_LOCAL[4]   = { 198, 51, 100, 1 };
@@ -100,15 +102,23 @@ static size_t udp_push(uint8_t* p, uint16_t sport, uint16_t dport,
     return 8;
 }
 
-/* Inner IPv4/UDP packet as the UE would receive it (dst = UE). */
-static size_t inner_udp4(uint8_t* p, const uint8_t dst[4], uint16_t sport,
-                         uint16_t dport, const char* payload)
+/* Inner IPv4/UDP packet from src to dst. */
+static size_t inner_udp4_from(uint8_t* p, const uint8_t src[4],
+                              const uint8_t dst[4], uint16_t sport,
+                              uint16_t dport, const char* payload)
 {
     size_t plen = strlen(payload);
-    size_t off  = ipv4_push(p, HOST, dst, 17, (uint16_t)(8 + plen));
+    size_t off  = ipv4_push(p, src, dst, 17, (uint16_t)(8 + plen));
     off += udp_push(p + off, sport, dport, (uint16_t)plen);
     memcpy(p + off, payload, plen);
     return off + plen;
+}
+
+/* Inner IPv4/UDP packet as the UE would receive it (src = network host). */
+static size_t inner_udp4(uint8_t* p, const uint8_t dst[4], uint16_t sport,
+                         uint16_t dport, const char* payload)
+{
+    return inner_udp4_from(p, HOST, dst, sport, dport, payload);
 }
 
 /* Minimal ESP (IP proto 50) datagram src->dst; its body is irrelevant to
@@ -276,6 +286,40 @@ spec ("gtpu_bpf") {
             sip_esp.proto   = 50;
             sip_esp.ue_port = 0;
             check(gtpu_tft_add(g, &sip_esp) == GTPU_OK); /* 2nd filter, same TEID */
+
+            /* Two UEs (UE3, UE4) registering to the SAME destination
+             * (PCSCF): the filters share proto/dst/ports but each carries
+             * its UE's own inner source, so concurrent UEs stay on their
+             * own bearers (0x1007 / 0x1008). Each UE gets a UDP:5060 filter
+             * and an ESP (proto 50) filter — the IMS shape. They sit ahead
+             * of the source-wildcard PCSCF filters (0x1006) above. */
+            gtpu_tft_t u3_udp;
+            memset(&u3_udp, 0, sizeof u3_udp);
+            u3_udp.tunnel             = bearer_a;
+            u3_udp.tunnel.local_teid  = 0x1007;
+            u3_udp.tunnel.remote_teid = 0x2007;
+            u3_udp.tunnel.ebi         = 5;
+            memcpy(u3_udp.tunnel.inner_addr, PCSCF, 4);
+            memcpy(u3_udp.inner_saddr, UE3, 4);
+            u3_udp.proto              = 17;
+            u3_udp.ue_port            = 5060;
+            check(gtpu_tft_add(g, &u3_udp) == GTPU_OK);
+
+            gtpu_tft_t u3_esp = u3_udp; /* same bearer, ESP */
+            u3_esp.proto   = 50;
+            u3_esp.ue_port = 0;
+            check(gtpu_tft_add(g, &u3_esp) == GTPU_OK);
+
+            gtpu_tft_t u4_udp = u3_udp; /* second UE, own bearer + source */
+            u4_udp.tunnel.local_teid  = 0x1008;
+            u4_udp.tunnel.remote_teid = 0x2008;
+            memcpy(u4_udp.inner_saddr, UE4, 4);
+            check(gtpu_tft_add(g, &u4_udp) == GTPU_OK);
+
+            gtpu_tft_t u4_esp = u4_udp;
+            u4_esp.proto   = 50;
+            u4_esp.ue_port = 0;
+            check(gtpu_tft_add(g, &u4_esp) == GTPU_OK);
 
             /* IPv6 outer + QFI for a second UE. */
             gtpu_tunnel_t d = bearer_a;
@@ -477,6 +521,58 @@ spec ("gtpu_bpf") {
 
             /* Same UE's ESP (proto 50) to PCSCF -> the same bearer. */
             ilen = inner_esp4(inner, UE, PCSCF);
+            ln   = eth_push(in, 0x0800);
+            memcpy(in + ln, inner, ilen);
+            ln += ilen;
+            check(run_prog(encap_fd, in, ln, out, &olen, &ret) == 0);
+            check(ret == TC_ACT_REDIRECT);
+            check(be16g(out + 14 + 20 + 8 + 6) == 0x2006);
+        }
+
+        it ("splits concurrent UEs to one destination by inner source", !!g) {
+            uint8_t  inner[128], in[256], out[4096];
+            uint32_t ret;
+            size_t   olen, ln, ilen;
+
+            /* UE3's SIP (UDP:5060 -> PCSCF) rides UE3's own bearer 0x1007,
+             * chosen ahead of the source-wildcard PCSCF filter (0x1006). */
+            ilen = inner_udp4_from(inner, UE3, PCSCF, 5088, 5060, "reg-u3");
+            ln   = eth_push(in, 0x0800);
+            memcpy(in + ln, inner, ilen);
+            ln += ilen;
+            check(run_prog(encap_fd, in, ln, out, &olen, &ret) == 0);
+            check(ret == TC_ACT_REDIRECT);
+            check(be16g(out + 14 + 20 + 8 + 6) == 0x2007);
+
+            /* UE4's SIP: same dst/proto/port, other UE -> bearer 0x1008. */
+            ilen = inner_udp4_from(inner, UE4, PCSCF, 5088, 5060, "reg-u4");
+            ln   = eth_push(in, 0x0800);
+            memcpy(in + ln, inner, ilen);
+            ln += ilen;
+            check(run_prog(encap_fd, in, ln, out, &olen, &ret) == 0);
+            check(ret == TC_ACT_REDIRECT);
+            check(be16g(out + 14 + 20 + 8 + 6) == 0x2008);
+
+            /* Each UE's ESP (proto 50, no ports) splits by source too. */
+            ilen = inner_esp4(inner, UE3, PCSCF);
+            ln   = eth_push(in, 0x0800);
+            memcpy(in + ln, inner, ilen);
+            ln += ilen;
+            check(run_prog(encap_fd, in, ln, out, &olen, &ret) == 0);
+            check(ret == TC_ACT_REDIRECT);
+            check(be16g(out + 14 + 20 + 8 + 6) == 0x2007);
+
+            ilen = inner_esp4(inner, UE4, PCSCF);
+            ln   = eth_push(in, 0x0800);
+            memcpy(in + ln, inner, ilen);
+            ln += ilen;
+            check(run_prog(encap_fd, in, ln, out, &olen, &ret) == 0);
+            check(ret == TC_ACT_REDIRECT);
+            check(be16g(out + 14 + 20 + 8 + 6) == 0x2008);
+
+            /* A source with no per-UE filter still falls to the wildcard
+             * PCSCF bearer (0x1006): single-UE filters match any source. */
+            ilen = inner_udp4_from(inner, UE2, PCSCF, 5088, 5060, "reg-any");
             ln   = eth_push(in, 0x0800);
             memcpy(in + ln, inner, ilen);
             ln += ilen;

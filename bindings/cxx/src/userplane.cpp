@@ -84,6 +84,7 @@ static gtpu_tft_t tft_to_c(const TrafficFilter& f)
     c.proto       = f.proto;
     c.ue_port     = f.ue_port;
     c.remote_port = f.remote_port;
+    if (!f.ue_saddr.empty()) inner_addr_parse(f.ue_saddr, c.inner_saddr);
     return c;
 }
 

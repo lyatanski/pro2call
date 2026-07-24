@@ -17,7 +17,7 @@
  * order. Addresses are byte arrays, IPv4 in the first 4 bytes.
  */
 
-#define GTPU_ABI_VERSION 1
+#define GTPU_ABI_VERSION 2
 #define GTPU_PIN_DIR     "/sys/fs/bpf/gtpu"
 
 /* ---- GTP-U wire constants — TS 29.281 ---- */
@@ -104,21 +104,32 @@ struct gtpu_lpm6_key {
 /* ---- teid_tft_map key: dedicated-bearer traffic filter ----
  *
  * Exact-match subset of a 3GPP TFT packet filter (TS 24.008 §10.5.6.12):
- * protocol id, single UE-side port, single remote port, all matched on
- * the inner header of the packet being encapsulated (dst = UE side).
- * 0 means wildcard; the TC egress program probes tiers in order
+ * protocol id, single UE-side port, single remote port, the inner dst
+ * address and, optionally, the inner src address — all matched on the
+ * inner header of the packet being encapsulated (dst = UE side). 0 / an
+ * all-zero address means wildcard.
+ *
+ * The TC egress program first probes filters carrying the packet's inner
+ * source, then repeats with the source wildcarded, and within each of
+ * those two passes probes the ports in order
  *   {proto, ue_port, remote_port}, {proto, ue_port, 0},
  *   {proto, 0, remote_port},       {proto, 0, 0}
- * and falls back to the LPM default-bearer maps on miss. Port ranges
- * expand to multiple entries (control-plane concern, not datapath).
+ * falling back to the LPM default-bearer maps on a full miss. The source
+ * dimension keeps several UEs sending to one inner destination (e.g.
+ * concurrent IMS UEs to a single P-CSCF) on their own bearers: their
+ * filters share proto/dst/ports but carry each UE's own inner source, and
+ * a filter installed with ue_saddr all-zero still matches any source (the
+ * source-wildcard pass), so pre-existing single-UE filters are unchanged.
+ * Port ranges expand to multiple entries (control-plane concern).
  */
 struct gtpu_tft_key {
-    __u8   family;      /* AF_INET / AF_INET6 of the inner packet */
-    __u8   proto;       /* inner IPPROTO_* */
-    __be16 ue_port;     /* inner dst port, network order; 0 = any */
-    __be16 remote_port; /* inner src port, network order; 0 = any */
-    __u16  pad;         /* zero */
-    __u8   ue_addr[16]; /* inner dst address, full match */
+    __u8   family;       /* AF_INET / AF_INET6 of the inner packet */
+    __u8   proto;        /* inner IPPROTO_* */
+    __be16 ue_port;      /* inner dst port, network order; 0 = any */
+    __be16 remote_port;  /* inner src port, network order; 0 = any */
+    __u16  pad;          /* zero */
+    __u8   ue_addr[16];  /* inner dst address, full match */
+    __u8   ue_saddr[16]; /* inner src address, full match; all-zero = any */
 };
 
 /* ---- gtpu_stats_map: per-CPU array, slot = teid & GTPU_STATS_MASK ---- */

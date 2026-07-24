@@ -31,10 +31,11 @@ spec ("gtpu") {
         }
 
         it ("keeps the TFT key layout stable (hash key bytes)") {
-            check(sizeof(struct gtpu_tft_key) == 24);
+            check(sizeof(struct gtpu_tft_key) == 40);
             check(offsetof(struct gtpu_tft_key, ue_port) == 2);
             check(offsetof(struct gtpu_tft_key, remote_port) == 4);
             check(offsetof(struct gtpu_tft_key, ue_addr) == 8);
+            check(offsetof(struct gtpu_tft_key, ue_saddr) == 24);
         }
 
         it ("keeps LPM keys at kernel-expected sizes") {

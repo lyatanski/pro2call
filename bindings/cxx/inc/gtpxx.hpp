@@ -625,12 +625,16 @@ struct Tunnel {
 };
 
 /* Dedicated bearer: its own tunnel plus the traffic filter steering
- * inner packets onto it. 0 = wildcard port. */
+ * inner packets onto it. 0 = wildcard port. ue_saddr, when set, matches
+ * the inner source address too (tunnel.ue_addr is the inner dst), so
+ * several UEs sending to one destination stay on their own bearers;
+ * empty = any source. */
 struct TrafficFilter {
-    Tunnel   tunnel;
-    uint8_t  proto       = 0; /* inner IPPROTO_*, required */
-    uint16_t ue_port     = 0;
-    uint16_t remote_port = 0;
+    Tunnel      tunnel;
+    uint8_t     proto       = 0; /* inner IPPROTO_*, required */
+    uint16_t    ue_port     = 0;
+    uint16_t    remote_port = 0;
+    std::string ue_saddr; /* inner src match; empty = any source */
 };
 
 struct TunnelStats {
