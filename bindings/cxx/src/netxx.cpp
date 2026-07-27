@@ -17,6 +17,7 @@
 #include <map>
 #include <memory>
 #include <net/if.h>
+#include <netinet/in.h>
 
 namespace net
 {
@@ -346,6 +347,136 @@ uint16_t UdpSocket::local_port() const
 int UdpSocket::fd() const
 {
     return s_.fd;
+}
+
+/* ---- StreamConn ---- */
+
+StreamConn::~StreamConn()
+{
+    close();
+}
+
+void StreamConn::close()
+{
+    if (open_) {
+        net_sock_close(&s_);
+        open_ = false;
+    }
+}
+
+StreamData StreamConn::recv(int timeout_ms)
+{
+    StreamData d;
+    char       buf[65536];
+    ssize_t    n = net_sock_recv(&s_, buf, sizeof buf, timeout_ms);
+    if (n == NET_TIMEOUT) {
+        d.timed_out = true;
+        return d;
+    }
+    if (n < 0) throw Error("recv failed", static_cast<int>(n));
+    if (n == 0) {
+        d.closed = true;
+        return d;
+    }
+    d.data.assign(buf, static_cast<size_t>(n));
+    return d;
+}
+
+void StreamConn::send(const std::string& data, int timeout_ms)
+{
+    ssize_t n = net_sock_send(&s_, data.data(), data.size(), timeout_ms);
+    if (n < 0) throw Error("send failed", static_cast<int>(n));
+    if (static_cast<size_t>(n) < data.size())
+        throw Error("short send (" + std::to_string(n) + "/" +
+                    std::to_string(data.size()) + " bytes)");
+}
+
+std::string StreamConn::peer_host() const
+{
+    std::string h;
+    uint16_t    p;
+    addr_split(s_.peer, h, p);
+    return h;
+}
+
+uint16_t StreamConn::peer_port() const
+{
+    return net_addr_port(&s_.peer);
+}
+
+int StreamConn::fd() const
+{
+    return s_.fd;
+}
+
+/* ---- StreamListener ---- */
+
+StreamListener::StreamListener(const std::string& local_host,
+                               uint16_t local_port, int proto)
+{
+    net_addr a  = addr_of(local_host, local_port);
+    int      rc = proto == IPPROTO_SCTP ? net_sctp_bind(&s_, &a, 0)
+                                        : net_tcp_bind(&s_, &a, 0);
+    if (rc != NET_OK)
+        throw Error(
+            "cannot listen on " + local_host + ":" + std::to_string(local_port),
+            rc);
+    open_ = true;
+}
+
+StreamListener::~StreamListener()
+{
+    close();
+}
+
+void StreamListener::close()
+{
+    if (open_) {
+        net_sock_close(&s_);
+        open_ = false;
+    }
+}
+
+StreamConn* StreamListener::accept(int timeout_ms)
+{
+    net_sock out;
+    int      rc = net_sock_accept(&s_, &out, timeout_ms);
+    if (rc == NET_TIMEOUT) return nullptr;
+    if (rc != NET_OK) throw Error("accept failed", rc);
+    return new StreamConn(out);
+}
+
+std::string StreamListener::local_host() const
+{
+    std::string h;
+    uint16_t    p;
+    addr_split(s_.local, h, p);
+    return h;
+}
+
+uint16_t StreamListener::local_port() const
+{
+    return net_addr_port(&s_.local);
+}
+
+int StreamListener::fd() const
+{
+    return s_.fd;
+}
+
+StreamConn* stream_connect(const std::string& host, uint16_t port, int proto,
+                           int timeout_ms)
+{
+    net_addr peer = addr_of(host, port);
+    net_sock s;
+    int      rc = proto == IPPROTO_SCTP
+                      ? net_sctp_conn(&s, nullptr, &peer, timeout_ms)
+                      : net_tcp_conn(&s, nullptr, &peer, timeout_ms);
+    if (rc != NET_OK)
+        throw Error("connect to " + host + ":" + std::to_string(port) +
+                        " failed",
+                    rc);
+    return new StreamConn(s);
 }
 
 /* ---- Resolver ---- */

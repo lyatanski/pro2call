@@ -217,6 +217,17 @@ struct NetLuaFn;
 %constant int NET_DNS_SRV   = 33;
 %constant int NET_DNS_NAPTR = 35;
 
+/* Transport for StreamListener / stream_connect: 0 for TCP, IPPROTO_SCTP
+ * (132) for SCTP one-to-one. */
+%constant int PROTO_TCP  = 0;
+%constant int PROTO_SCTP = 132;
+
+/* A freshly accepted / dialed StreamConn is owned by the script: the Lua
+ * garbage collector runs its destructor (closing the fd). Must precede the
+ * %include so SWIG marks the return values before wrapping them. */
+%newobject net::StreamListener::accept;
+%newobject net::stream_connect;
+
 /* ---- the facade itself ---- */
 
 %include "netxx.hpp"

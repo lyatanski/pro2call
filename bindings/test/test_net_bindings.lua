@@ -136,6 +136,52 @@ do
         "addr_del raises for an unknown interface")
 end
 
+-- stream socket: listen / connect / accept / send / recv / close --------
+do
+    check(net.PROTO_TCP == 0, "PROTO_TCP")
+    check(net.PROTO_SCTP == 132, "PROTO_SCTP")
+
+    local lst = net.StreamListener("127.0.0.1", 0, net.PROTO_TCP)
+    check(lst:local_port() ~= 0, "listener ephemeral port assigned")
+    check(lst:local_host() == "127.0.0.1", "listener local host reported")
+    -- nothing pending yet -> accept polls once and returns nil
+    check(lst:accept(-1) == nil, "accept returns nil when nothing is pending")
+
+    local cli = net.stream_connect("127.0.0.1", lst:local_port(), net.PROTO_TCP)
+    local srv = lst:accept(200)
+    check(srv ~= nil, "accept returns a connection")
+    check(srv:peer_host() == "127.0.0.1", "accepted peer host reported")
+
+    -- byte-safe round trip (embedded NULs / high bytes)
+    local blob = "\0\1\2\255diameter\0"
+    cli:send(blob)
+    local d = srv:recv(1000)
+    check(not d.timed_out and not d.closed, "server received data")
+    check(d.data == blob, "stream payload round-trips byte-for-byte")
+
+    srv:send("pong")
+    check(cli:recv(1000).data == "pong", "reply round-trips")
+
+    -- nothing pending -> recv polls once and times out
+    check(srv:recv(-1).timed_out, "recv times out when nothing is queued")
+
+    -- a peer close surfaces as closed (not a timeout)
+    cli:close()
+    local closed
+    for _ = 1, 50 do
+        local r = srv:recv(20)
+        if r.closed then closed = true; break end
+        if not r.timed_out then break end
+    end
+    check(closed, "peer close is reported as closed")
+    srv:close()
+
+    check(raises(function() net.StreamListener("not-an-ip", 0) end),
+        "bad listen address raises")
+    check(raises(function() net.stream_connect("127.0.0.1", 1, net.PROTO_TCP, 200) end),
+        "connect to a dead port raises")
+end
+
 if failed == 0 then
     print(string.format("ok - %d checks passed", tests))
     os.exit(0)

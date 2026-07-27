@@ -65,6 +65,8 @@ local ims_realm = os.getenv("IMS_REALM")
 local T3_MS, N3  = 1000, 3     -- GTP-C retransmission: 1s T3-RESPONSE, up to 3 sends
 local SIP_T_MS   = tonumber(os.getenv("SIP_T_MS") or "5000")  -- SIP response deadline per registration step
 local AUTH_CAP   = 2           -- give up after this many 401 challenges
+local REG_EXPIRES = tonumber(os.getenv("IMS_EXPIRES") or "600000") -- ~7 days
+local DEREG = (os.getenv("IMS_DEREG") or "1") ~= "0"
 
 -- Ramp the attach: space each subscriber's Create Session by RAMP_MS so a large
 -- IMS_SUBS arrives as a smooth stream, not a single burst that overruns the core
@@ -184,7 +186,7 @@ end
 -- Build the UE's IMS REGISTER. Via/Contact carry the UE's PAA at its
 -- protected client port; a fresh transaction per REGISTER keys the branch
 -- and From-tag on the CSeq, the Call-ID is stable across the pair.
-local function build_register(sub, authz, sec_name, sec_hdr)
+local function build_register(sub, authz, sec_name, sec_hdr, expires)
     local b = sip.Builder()
         :request(sip.REGISTER, "sip:" .. ims_realm)
         :header(sip.H_VIA,
@@ -194,8 +196,10 @@ local function build_register(sub, authz, sec_name, sec_hdr)
         :header(sip.H_TO, ("<%s>"):format(sub.impu))
         :header(sip.H_CALL_ID, ("%s@%s"):format(sub.imsi, sub.ue_addr))
         :header(sip.H_CSEQ, ("%d REGISTER"):format(sub.cseq))
-        :header(sip.H_CONTACT, ("<sip:%s:%d>"):format(sub.ue_addr, sub.port_uc))
-        :header_u32(sip.H_EXPIRES, 600000)
+        :header(sip.H_CONTACT, expires == 0
+                and ("<sip:%s:%d>;expires=0"):format(sub.ue_addr, sub.port_uc)   -- de-REGISTER: bind removal
+                or  ("<sip:%s:%d>"):format(sub.ue_addr, sub.port_uc))
+        :header_u32(sip.H_EXPIRES, expires or REG_EXPIRES)
         :header(sip.H_AUTHORIZATION, authz)
     if sec_hdr then b:header_name(sec_name, sec_hdr) end
     return b:done()
@@ -331,13 +335,27 @@ local function run()
     local pending, grace = NSUBS, nil
     local dpending, tguard = 0, nil     -- outstanding Delete Session txns (teardown)
 
+    -- Throughput counters over the run. Each rate (reported in the summary) is
+    -- measured from the first Create Session Request (stats.start) to the last
+    -- event of its kind, so the 3s grace + teardown don't dilute the active
+    -- burst. Packets are the tool's SIP signalling datagrams (REGISTER /
+    -- responses / de-REGISTER) driven over the loop; sessions are accepted
+    -- Create Session Responses; registrations are 200 OKs.
+    local now = net.now_ms
+    local stats = {
+        tx = 0, rx = 0, sess = 0, regs = 0,   -- counts
+        start = now(),                        -- run start (before any Create Session)
+        pkt_last = nil, sess_last = nil, reg_last = nil,   -- last-event timestamps
+    }
+    local function mark_pkt() stats.pkt_last = now() end
+
     -- Per-subscriber SIP deadline over the shared loop.
     local function disarm(sub) if sub.timer then loop:cancel(sub.timer); sub.timer = nil end end
     local function arm(sub, ms, fn) disarm(sub); sub.timer = loop:after(ms, function() sub.timer = nil; fn() end) end
 
     -- forward declarations for the mutually-referring phase steps
     local begin_registration, on_sip_readable, handle_sip, on_401, on_registered
-    local begin_teardown, del_done
+    local begin_teardown, begin_deregister, del_done
 
     -- A subscriber reached a terminal state; when the last one does, wait a
     -- little for late Create Bearer Requests, then stop the loop.
@@ -349,8 +367,12 @@ local function run()
         if pending > 0 then return end
         if grace then return end
         -- All subscribers terminal: wait briefly for late Create Bearer Requests,
-        -- then tear the PDN connections down (Delete Session) before stopping.
-        grace = loop:after(3000, function() grace = nil; begin_teardown() end)
+        -- release the IMS registrations (de-REGISTER, so the P-CSCF reaps their
+        -- ESP SAs), then tear the PDN connections down (Delete Session).
+        grace = loop:after(3000, function()
+            grace = nil
+            if DEREG then begin_deregister() else begin_teardown() end
+        end)
     end
     local function fail(sub, msg)
         sub.err = msg
@@ -361,6 +383,7 @@ local function run()
     local function succeed(sub)
         sub.registered = true
         sub.stage = "done"
+        stats.regs = stats.regs + 1; stats.reg_last = now()
         slog(sub, "result", ("registered at P-CSCF %s"):format(sub.pcscf or "?"))
         finish(sub)
     end
@@ -376,6 +399,36 @@ local function run()
             if tguard then loop:cancel(tguard); tguard = nil end
             loop:stop()
         end
+    end
+
+    -- Release the IMS registrations before dropping the bearers. Each registered
+    -- UE sends one protected REGISTER with Expires:0 over its established ESP SA
+    -- (Security-Verify + the same Authorization as the successful REGISTER; the
+    -- S-CSCF de-registers an already-registered IMPU with Expires:0 without a
+    -- fresh challenge). This drives the P-CSCF's explicit contact-removal path,
+    -- which destroys the ESP SAs — unlike contact expiry, which it does not reap.
+    -- Fire-and-forget (we don't await the 200), then give it a moment before the
+    -- bearers go away so the de-REGISTERs actually egress and get processed.
+    begin_deregister = function()
+        local dr = {}
+        for _, s in ipairs(subs) do
+            if s.registered and s.sock and s.ch and s.authz then dr[#dr + 1] = s end
+        end
+        if #dr == 0 then return begin_teardown() end
+        banner(("De-REGISTER — releasing %d registration(s) so the P-CSCF reaps their IPsec SAs"):format(#dr))
+        for _, s in ipairs(dr) do
+            s.cseq = s.cseq + 1
+            local protected = s.ch.ss_raw and s.ch.p_spi_s and s.ch.p_port_s
+            local dport = protected and s.ch.p_port_s or PCSCF_SIP_PORT
+            local wire = build_register(s, s.authz,
+                                        protected and "Security-Verify" or nil, s.ch.ss_raw, 0)
+            local ok, err = pcall(function() s.sock:sendto(wire, s.pcscf, dport) end)
+            if ok then stats.tx = stats.tx + 1; mark_pkt() end
+            slog(s, "-> de-REGISTER", ok
+                and ("Expires:0 -> %s:%d (release SAs)"):format(s.pcscf, dport)
+                or  ("send failed: " .. why(err)))
+        end
+        loop:after(1500, begin_teardown)
     end
 
     -- Teardown: send a Delete Session Request for every established PDN connection
@@ -464,6 +517,7 @@ local function run()
         pcall(function() sub.reg:send(m); sub.auth:send(m); sub.txn:send(m) end)
         local sok, serr = pcall(function() sub.sock:sendto(wire, sub.pcscf, dport) end)
         if not sok then return fail(sub, "REGISTER send: " .. why(serr)) end
+        stats.tx = stats.tx + 1; mark_pkt()
         slog(sub, "-> REGISTER", ("%s, %dB -> %s:%d"):format(label, #wire, sub.pcscf, dport))
         arm(sub, SIP_T_MS, function() fail(sub, "timed out awaiting a SIP response") end)
     end
@@ -473,6 +527,7 @@ local function run()
         while true do
             local dg = sub.sock:recv(-1)
             if dg.timed_out then return end
+            stats.rx = stats.rx + 1; mark_pkt()
             local okp, m = pcall(sip.parse, dg.data)
             if okp then handle_sip(sub, m)
             else slog(sub, "SIP", "ignoring unparseable datagram") end
@@ -526,6 +581,7 @@ local function run()
                                           "sip:" .. ims_realm, ch.nonce, nc, cnonce, ch.qop or "")
         local authz = authz_hdr(sub, ch.realm, ch.nonce, response,
                                 ch.qop and { qop = ch.qop, nc = nc, cnonce = cnonce })
+        sub.authz = authz            -- kept for the Expires:0 de-REGISTER on teardown
 
         local dport, sec_name, sec_hdr = PCSCF_SIP_PORT, nil, nil
         if ch.ss_raw and ch.p_spi_s and ch.p_port_s then
@@ -594,6 +650,7 @@ local function run()
             if rsp.cause ~= gtp.GTP2_CAUSE_REQUEST_ACCEPTED then
                 return fail(sub, ("Create Session rejected, cause %d"):format(rsp.cause))
             end
+            stats.sess = stats.sess + 1; stats.sess_last = now()
             sub.pgw_ctrl_teid = sess:remote_teid()
             if rsp.has_paa then sub.ue_addr = rsp.paa.addr4 end
             if rsp.pco and #rsp.pco > 0 then
@@ -721,12 +778,12 @@ local function run()
         if sub.paa_added then pcall(function() net.addr_del("lo", sub.ue_addr, 32) end) end
     end
     if not rok then io.stderr:write("loop error: " .. why(rerr) .. "\n") end
-    return subs
+    return subs, stats
 end
 
 -- main
 local t0 = net.now_ms()
-local subs = run()
+local subs, stats = run()
 local elapsed = (net.now_ms() - t0) / 1000
 
 -- Tally registrations and, for the rest, the stage each subscriber reached when
@@ -774,4 +831,25 @@ if ok < #subs then
         end
     end
 end
+
+-- Throughput: per-second rates for the load. Each rate is measured from the
+-- first Create Session Request (stats.start) to the last event of its kind, so
+-- the 3s grace + teardown don't dilute the active-burst figures. per_s returns
+-- the rate and the window it was computed over (0/0 when nothing happened).
+local function per_s(n, last)
+    if n == 0 or not last then return 0, 0 end
+    local w = (last - stats.start) / 1000
+    if w <= 0 then return 0, 0 end
+    return n / w, w
+end
+local sess_r, sess_w = per_s(stats.sess, stats.sess_last)
+local reg_r,  reg_w  = per_s(stats.regs, stats.reg_last)
+local tx_r = per_s(stats.tx, stats.pkt_last)
+local rx_r = per_s(stats.rx, stats.pkt_last)
+banner("Throughput (rates from first Create Session Request)")
+line("sessions created",     ("%d in %.2fs  ->  %.1f/s"):format(stats.sess, sess_w, sess_r))
+line("registrations",        ("%d in %.2fs  ->  %.1f/s"):format(stats.regs, reg_w, reg_r))
+line("SIP packets sent",      ("%d  ->  %.1f/s"):format(stats.tx, tx_r))
+line("SIP packets received",  ("%d  ->  %.1f/s"):format(stats.rx, rx_r))
+
 os.exit(ok == #subs and 0 or 1)

@@ -207,6 +207,91 @@ class UdpSocket
     bool     open_ = false;
 };
 
+/* ---- TCP / SCTP stream socket ---- */
+
+/* The result of StreamConn::recv: bytes when data arrived, timed_out when
+ * the poll came up empty, or closed when the peer shut the connection down
+ * (an orderly EOF — net_sock_recv returned 0). The three are mutually
+ * exclusive; data is empty unless bytes actually arrived. */
+struct StreamData {
+    std::string data;             /* received bytes                       */
+    bool        timed_out = false;
+    bool        closed    = false; /* peer closed the connection (EOF)    */
+};
+
+/* One connected stream (TCP or SCTP one-to-one), wrapping a net_sock. Not
+ * constructed directly from a script — StreamListener::accept() hands one
+ * back for each incoming connection, and stream_connect() for an outgoing
+ * one. The fd is non-blocking and close-on-exec, so fd() goes straight
+ * into Loop::add_fd() and recv() drains what the loop signalled. */
+class StreamConn
+{
+  public:
+    ~StreamConn();
+    StreamConn(const StreamConn&)            = delete;
+    StreamConn& operator=(const StreamConn&) = delete;
+
+    /* timeout_ms >= 0 waits up to that long for bytes; < 0 polls once
+     * (drain a loop-signalled fd) and returns timed_out when nothing is
+     * queued. A peer close returns closed. Throws Error on a socket
+     * failure. */
+    StreamData recv(int timeout_ms = -1);
+
+    /* Push the whole buffer. timeout_ms bounds the wait when the send
+     * would block (a full send buffer); < 0 polls once. Throws Error on a
+     * socket failure or a short write (the buffer did not fully drain
+     * within the timeout). */
+    void send(const std::string& data, int timeout_ms = -1);
+
+    std::string peer_host() const;
+    uint16_t    peer_port() const;
+    int         fd() const;
+    void        close();
+
+  private:
+    explicit StreamConn(const net_sock& s) : s_(s), open_(true) {}
+    friend class StreamListener;
+    friend StreamConn* stream_connect(const std::string&, uint16_t, int, int);
+
+    net_sock s_;
+    bool     open_ = false;
+};
+
+/* A listening stream socket. Binds local_host:local_port and listens;
+ * proto is 0 for TCP or IPPROTO_SCTP (132) for SCTP. Host "" (or
+ * "0.0.0.0"/"::") is the any-address. Throws Error on failure. */
+class StreamListener
+{
+  public:
+    StreamListener(const std::string& local_host, uint16_t local_port,
+                   int proto = 0);
+    ~StreamListener();
+    StreamListener(const StreamListener&)            = delete;
+    StreamListener& operator=(const StreamListener&) = delete;
+
+    /* Accept one pending connection. timeout_ms >= 0 waits up to that
+     * long; < 0 polls once. Returns nullptr (nil in Lua) when nothing is
+     * pending within the timeout, so an fd-readable handler can drain the
+     * backlog with `while (c = accept(-1)) ...`. Throws Error on failure.
+     * The returned StreamConn is owned by the caller (Lua GC frees it). */
+    StreamConn* accept(int timeout_ms = -1);
+
+    std::string local_host() const;
+    uint16_t    local_port() const; /* the bound port (resolved when 0) */
+    int         fd() const;
+    void        close();
+
+  private:
+    net_sock s_;
+    bool     open_ = false;
+};
+
+/* Dial a stream peer (TCP or SCTP). local address is ephemeral; timeout_ms
+ * bounds the connect. Returns a connected StreamConn (caller-owned) or
+ * throws Error on failure/timeout. */
+StreamConn* stream_connect(const std::string& host, uint16_t port,
+                           int proto = 0, int timeout_ms = 5000);
+
 /* ---- DNS resolver ---- */
 
 /* One record from Resolver::resolve. Only the fields that apply to `type`

@@ -377,11 +377,12 @@ print(s:state_name(), s:closed())
 ## Lua: net
 
 The `net` module wraps the netxx facade (`cxx/inc/netxx.hpp`) over the
-transport layer ([`net/`](../net)): the epoll event loop and a
-non-blocking UDP socket — the same machinery the gtp module embeds for
-GTPv2-C, exposed on its own for scripts that just need to move bytes and
-drive a loop (put SIP or Diameter on the wire, run their own timers). It
-is the transport a codec-only module (`sip`, `diam`) pairs with.
+transport layer ([`net/`](../net)): the epoll event loop, a non-blocking
+UDP socket and a TCP/SCTP stream socket — the same machinery the gtp
+module embeds for GTPv2-C, exposed on its own for scripts that just need
+to move bytes and drive a loop (put SIP or Diameter on the wire, run their
+own timers). It is the transport a codec-only module (`sip`, `diam`) pairs
+with.
 
 `net.Loop` is the dispatcher: `step(ms)`/`run()`/`stop()`, one-shot
 timers with `after(ms, fn)` / `cancel(id)`, and arbitrary fds with
@@ -409,6 +410,17 @@ sock:sendto("ping", "127.0.0.1", sock:local_port())
 loop:after(1000, function() loop:stop() end)        -- bound the wait
 loop:run()
 ```
+
+For connection-oriented Diameter there is a stream socket. `net.Stream
+Listener(host, port, proto)` binds and listens (proto `net.PROTO_TCP` or
+`net.PROTO_SCTP`); its `fd()` goes into `add_fd`, and `accept(-1)` drains
+the backlog (nil when nothing is pending). Each accepted `StreamConn`
+(also what `net.stream_connect(host, port, proto)` returns for the client
+side) is `recv(ms)` / `send(data)`; `recv` returns a `{data, timed_out,
+closed}` record so a peer close is distinct from a timeout, and `recv(-1)`
+polls once to drain a loop-signalled fd. Caller frames messages out of the
+byte stream (for Diameter, by the header's Message Length). See
+[`examples/cx_hss.lua`](examples/cx_hss.lua).
 
 The module also exposes a few interface helpers: `net.if_index(name)` and
 `net.if_addr4(name)` (introspection), and `net.addr_add(name, addr,
@@ -444,6 +456,15 @@ All in Lua; run each with `LUA_CPATH=<build>/bindings/lua/?.so lua …`.
   down a site-to-site ESP tunnel (SAs + policy) over XFRM.
 - [`examples/cx_registration.lua`](examples/cx_registration.lua) — an
   IMS registration over Cx (UAR/MAR/SAR), both sides, offline.
+- [`examples/cx_hss.lua`](examples/cx_hss.lua) — the HSS side of Cx as a
+  live server: a `net.StreamListener` on TCP:3868 that the I-CSCF/S-CSCF
+  connect to instead of a real HSS. It runs the Diameter base peer
+  protocol (CER/CEA, DWR/DWA, DPR/DPA) and answers the Cx exchanges —
+  UAR/UAA, MAR/MAA (a real Milenage vector minted with `ipsec.aka_milenage`
+  from the shared USIM secret, for any IMSI, so the range registers without
+  provisioning), SAR/SAA (returns the IMS subscription profile) and
+  LIR/LIA. Point the CSCFs' Diameter peer at it to run the IMS core with no
+  real HSS behind it (load testing the CSCF chain, not the HSS).
 - [`examples/rx_media_auth.lua`](examples/rx_media_auth.lua) — a VoLTE
   call's media authorization over Rx (AAR/STR), both sides, offline.
 - [`examples/ro_credit_control.lua`](examples/ro_credit_control.lua) —
