@@ -61,7 +61,16 @@ typedef struct {
 
 /* One bearer: a TEID pair plus addressing for both directions.
  * Addresses and MACs are network order / wire format; TEIDs and ports
- * are host order. */
+ * are host order.
+ *
+ * inner_addr is the UE side: it keys the encap LPM entry (packets whose
+ * inner destination is the UE go into the tunnel) and, by default, is
+ * also the inner destination the decap validates. That pairing holds at
+ * an access-side node, where both directions of the bearer carry
+ * UE-bound inner traffic (an SGW decapsulating downlink from the PGW and
+ * encapsulating it toward the eNB). At the anchor — a PGW/UPF — decap
+ * takes uplink coming FROM the UE, whose inner destination is the remote
+ * host, so set core_side there. */
 typedef struct {
     uint32_t local_teid;  /* RX map key (this node allocated it) */
     uint32_t remote_teid; /* written to outgoing G-PDUs */
@@ -70,6 +79,7 @@ typedef struct {
     uint8_t inner_family; /* AF_INET / AF_INET6 — the UE address */
     uint8_t inner_addr[16];
     uint8_t inner_prefixlen; /* 0 = host route (/32 or /128) */
+    bool    core_side;       /* anchor-side: no decap inner-dst check */
 
     uint8_t  outer_family; /* AF_INET / AF_INET6 — the peer */
     uint8_t  remote_addr[16];

@@ -10,10 +10,10 @@ subdirectory; the deeper per-module READMEs carry the usage detail.
 
 | Module | Description |
 | ------ | ----------- |
-| [`task/`](task) | Foundation library shared by every codec: generic zero-copy TLV codec, FSM engine, big-endian helpers, logging and test macros. |
-| [`net/`](net) | Transport layer — non-blocking UDP/TCP/SCTP sockets, epoll event loop, async DNS resolver, TLS/DTLS over OpenSSL. |
+| [`task/`](task) | Foundation library shared by every codec: generic zero-copy TLV codec, FSM engine, IP address pool with reuse, big-endian helpers, logging and test macros. |
+| [`net/`](net) | Transport layer — non-blocking UDP/TCP/SCTP sockets, epoll event loop with batched loop-driven output (`sendmmsg`), async DNS resolver, TLS/DTLS over OpenSSL. |
 | [`gtp/`](gtp) | GTP protocol family: GTPv1-C (`v1`), GTPv2-C (`v2`) and the GTP-U eBPF datapath (`u`). See [`gtp/README.md`](gtp/README.md). |
-| [`diam/`](diam) | Diameter base codec plus a generated dictionary for the 3GPP Cx / Rx / Ro / Rf interfaces, and the RFC 6733 session state machines. |
+| [`diam/`](diam) | Diameter base codec plus a generated dictionary for the 3GPP Cx / Gx / Rx / Ro / Rf interfaces, and the RFC 6733 session state machines. |
 | [`sip/`](sip) | SIP message codec — zero-copy parse, buffer-writing encode, enum-resolved methods and headers — plus the RFC 3261 transaction state machines. |
 | [`sdp/`](sdp) | SDP session-description codec — zero-copy single-pass parse, enum-resolved attributes. |
 | [`rtp/`](rtp) | RTP/RTCP codec with the RFC 3550 receiver-side source tracker (sequence validation, loss, jitter). |
@@ -23,7 +23,7 @@ subdirectory; the deeper per-module READMEs carry the usage detail.
 ## Specifications
 
 ### task
-- common reusable code.
+- common reusable code (TLV codec, FSM engine, IP address pool, logging).
 
 ### net
 - RFC 1035 — DNS message format (with EDNS0, RFC 6891); A/AAAA/SRV (RFC 2782)/NAPTR (RFC 3403).
@@ -38,6 +38,7 @@ subdirectory; the deeper per-module READMEs carry the usage detail.
 - RFC 6733 — Diameter base protocol.
 - RFC 4006 — Diameter Credit-Control application (Ro).
 - 3GPP TS 29.229 — Cx interface (IMS HSS).
+- 3GPP TS 29.212 — Gx interface (PCEF/PCRF policy and charging control).
 - 3GPP TS 29.214 — Rx interface (policy/media authorization).
 - 3GPP TS 32.299 — Diameter charging applications (Ro/Rf).
 

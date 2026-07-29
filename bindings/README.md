@@ -141,7 +141,11 @@ def on_user_plane(self, sess, tun):
 ```
 
 `UserPlane.supported()` reports whether the process has the
-capabilities; construction raises otherwise. Dedicated bearers add a
+capabilities; construction raises otherwise. A tunnel at the anchor end
+of the bearer (a PGW/UPF, which decapsulates uplink coming *from* the UE
+rather than downlink heading to it) sets `t.core_side = True`; `ue_addr`
+still steers the downlink encap, but decap stops requiring the inner
+destination to be the UE. Dedicated bearers add a
 `TrafficFilter` (`add_filter`) steering inner packets by protocol and
 ports onto their own TEID pair. `stats(teid)` reads the per-TEID
 counters, and the datapath's ring-buffer events (unknown TEID, end
@@ -335,7 +339,8 @@ the Diameter codec and generated dictionary ([`diam/`](../diam)).
 Value types only — grouped AVPs parse into `children` eagerly, all
 dictionary constants are exposed with the `DIAM_` prefix stripped
 (`diam.AVP_SESSION_ID`, `diam.CMD_CREDIT_CONTROL`, `diam.APP_CX`,
-`diam.CC_REQUEST_TYPE_INITIAL_REQUEST`, ...), and the Builder fills in
+`diam.APP_GX`, `diam.CC_REQUEST_TYPE_INITIAL_REQUEST`,
+`diam.AVP_CHARGING_RULE_INSTALL`, ...), and the Builder fills in
 each AVP's vendor id and mandatory/vendor flags from the dictionary.
 Codes shared between the IETF and 3GPP registries (the Rx media AVPs)
 take the vendor explicitly:
@@ -411,6 +416,35 @@ loop:after(1000, function() loop:stop() end)        -- bound the wait
 loop:run()
 ```
 
+### Sends on the loop
+
+By default a `sendto` is a `sendto(2)`: the caller enters the kernel once
+per datagram. `sock:tx_loop(loop [, base_events])` moves the send side onto
+the loop instead ([`net/inc/net_txq.h`](../net/inc/net_txq.h)) — a `sendto`
+then copies the datagram into the socket's queue and returns, and the loop
+pushes the queue out at the top of its next iteration with `sendmmsg(2)`,
+up to `net.NET_TXQ_BATCH` (64) datagrams per syscall. Two things follow:
+
+* a handler that emits a burst (N sessions opened, N responses answered)
+  does not stop in the kernel between messages, and N datagrams on one
+  socket leave in `ceil(N/64)` syscalls instead of N;
+* a full socket buffer or qdisc (`EAGAIN`/`ENOBUFS`) suspends the queue and
+  resumes it on writability, instead of failing the send — under burst that
+  failure was indistinguishable from a real error.
+
+Ordering is preserved, `base_events` is the fd's steady-state interest so
+this composes with `add_fd` on the same fd, and the counters make the effect
+visible: `tx_sent()`, `tx_calls()` (`sent/calls` = the batching ratio),
+`tx_pending()`, `tx_blocked()`, `tx_dropped()`, plus `tx_flush()` to force
+the queue out without running the loop. Leave it off for a linear script
+that sends and then blocks in `recv()` — nothing would ever flush it.
+
+`gtp.Endpoint` does this for its own socket by default (it is loop-driven by
+construction); `ep:set_tx_loop(false)` reverts it to a direct send, and the
+same `tx_*` counters apply. [`examples/udp_tx_bench.lua`](examples/udp_tx_bench.lua)
+measures one loop's send path both ways, and `TX_MODE=loop|sync` switches
+[`examples/ims_test_s5.lua`](examples/ims_test_s5.lua) between them.
+
 For connection-oriented Diameter there is a stream socket. `net.Stream
 Listener(host, port, proto)` binds and listens (proto `net.PROTO_TCP` or
 `net.PROTO_SCTP`); its `fd()` goes into `add_fd`, and `accept(-1)` drains
@@ -429,6 +463,36 @@ RTNETLINK ([`netlink/rtnl/`](../netlink/rtnl)), so a script can make an
 address locally deliverable without shelling out to `ip` (they need
 CAP_NET_ADMIN and raise on failure).
 
+### net.IpPool
+
+`net.IpPool` is the address allocator from
+[`task/inc/ippool.h`](../task/inc/ippool.h) with a literal-string
+surface — what a PGW/SMF assigns PDN addresses from, or a DHCP server its
+leases. A scope is a CIDR prefix or a first..last pair; an IPv4 prefix
+shorter than /31 excludes its network and broadcast address, as a DHCP
+scope does. Allocation and release are O(1) over one occupancy bit per
+address, and a released address is not handed out again until the
+allocator has swept the rest of the pool — so a detaching UE's address
+does not go straight to the next attach:
+
+```lua
+local pool = net.IpPool("10.45.0.0/16")     -- 65534 addresses
+pool:reserve("10.45.0.1")                    -- keep the gateway out
+if pool:available() > 0 then
+    local ue = pool:alloc()                  -- "10.45.0.2"
+    print(pool:used(), pool:allocated(ue), pool:index_of(ue))
+    pool:release(ue)
+end
+local dhcp = net.IpPool("10.45.9.100", "10.45.9.200")   -- explicit range
+local v6   = net.IpPool("2001:db8:0:1::/64")            -- IPv6 too
+```
+
+`alloc()` raises when the pool is exhausted (check `available()` first if
+a caller would rather branch than catch), as do `reserve()` on an
+already-taken address and `release()` on one that is not allocated —
+double-release bugs surface instead of corrupting the accounting.
+`reset()` releases everything.
+
 ## Examples
 
 All in Lua; run each with `LUA_CPATH=<build>/bindings/lua/?.so lua …`.
@@ -437,6 +501,11 @@ All in Lua; run each with `LUA_CPATH=<build>/bindings/lua/?.so lua …`.
   receive driven by the `net` event loop: an echo server and a client
   over loopback, both fds registered with one `net.Loop`. Runs
   standalone.
+- [`examples/udp_tx_bench.lua`](examples/udp_tx_bench.lua) — what one
+  `net.Loop` can put on the wire, with and without the loop-driven send
+  path (`TX_MODE=loop|sync`): datagrams/s offered, the send syscalls it
+  took (batched `sendmmsg` vs one `sendto` each) and the back-pressure
+  absorbed. Loopback only, so it measures the send path and not a core.
 - [`examples/echo_probe.lua`](examples/echo_probe.lua) — liveness-probe
   a peer with Echo.
 - [`examples/session_setup.lua`](examples/session_setup.lua) — attach a
@@ -465,6 +534,21 @@ All in Lua; run each with `LUA_CPATH=<build>/bindings/lua/?.so lua …`.
   provisioning), SAR/SAA (returns the IMS subscription profile) and
   LIR/LIA. Point the CSCFs' Diameter peer at it to run the IMS core with no
   real HSS behind it (load testing the CSCF chain, not the HSS).
+- [`examples/pgw_stub.lua`](examples/pgw_stub.lua) — a PGW stub: the
+  S5/S8 anchor a test SGW attaches to, standing in for a real PGW-C+U.
+  Three parts on one `net.Loop`: **GTP-C** in `gtp.Endpoint`'s server role
+  (Create Session / Modify Bearer / Delete Session answered, a
+  PCRF-installed rule pushed back out as a Create Bearer Request),
+  **Gx** towards the PCRF (TS 29.212) over a `net.StreamConn` — CER/CEA
+  and the watchdog, a CCR-I per PDN connection whose CCA-I supplies the
+  QoS the Create Session Response grants, CCR-T on teardown, RAR/RAA —
+  and the **eBPF GTP-U** datapath, one `core_side` tunnel per bearer.
+  UE addresses come from `net.IpPool`: a specific requested address is
+  honoured when free, exhaustion is answered with cause 84, and every
+  Delete Session releases the address and reports what the bearer
+  carried. With no `$GX_PCRF` the Gx interface stays down and a local
+  default policy is used, so it runs standalone against
+  [`examples/ims_test_s5.lua`](examples/ims_test_s5.lua).
 - [`examples/rx_media_auth.lua`](examples/rx_media_auth.lua) — a VoLTE
   call's media authorization over Rx (AAR/STR), both sides, offline.
 - [`examples/ro_credit_control.lua`](examples/ro_credit_control.lua) —

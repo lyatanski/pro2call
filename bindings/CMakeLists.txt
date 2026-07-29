@@ -49,9 +49,12 @@ set_property(SOURCE swig/gtp.i PROPERTY CPLUSPLUS ON)
 set_property(SOURCE swig/gtp.i PROPERTY USE_TARGET_INCLUDE_DIRECTORIES ON)
 # SWIG re-runs when the .i changes; the facade headers it %includes /
 # %imports are not tracked automatically, so declare them or header-only
-# edits are missed. gtp.i %imports netxx.hpp for the shared net::Loop.
+# edits are missed. gtp.i %imports netxx.hpp for the shared net::Loop and
+# %includes the two gtp2 headers for their enums and constants.
 set_property(SOURCE swig/gtp.i PROPERTY DEPENDS
-    cxx/inc/gtpxx.hpp cxx/inc/netxx.hpp)
+    cxx/inc/gtpxx.hpp cxx/inc/netxx.hpp
+    ${CMAKE_SOURCE_DIR}/gtp/v2/inc/gtp2.h
+    ${CMAKE_SOURCE_DIR}/gtp/v2/inc/gtp2_ie.h)
 # The CMake target is gtp_lua because `gtp` is the Python target; the
 # loadable module is still gtp.so for `require("gtp")`.
 swig_add_library(gtp_lua
@@ -74,15 +77,21 @@ endif()
 # standalone module: net.Loop + net.UdpSocket for scripts that only need
 # transport (put SIP/Diameter bytes on the wire, drive their own loop).
 # It also fronts the rtnl netlink module (netlink/rtnl) for the interface
-# address helpers (net.addr_add / net.addr_del), beside if_index/if_addr4.
+# address helpers (net.addr_add / net.addr_del), beside if_index/if_addr4,
+# and the task library's address pool as net.IpPool.
 add_library(netxx STATIC cxx/src/netxx.cpp)
 target_include_directories(netxx PUBLIC cxx/inc)
-target_link_libraries(netxx PUBLIC net rtnl)
+# task carries the address pool behind net::IpPool (task/inc/ippool.h).
+target_link_libraries(netxx PUBLIC net rtnl task)
 set_target_properties(netxx PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 set_property(SOURCE swig/net.i PROPERTY CPLUSPLUS ON)
 set_property(SOURCE swig/net.i PROPERTY USE_TARGET_INCLUDE_DIRECTORIES ON)
-set_property(SOURCE swig/net.i PROPERTY DEPENDS cxx/inc/netxx.hpp)
+# net_txq.h too: net.i mirrors NET_TXQ_BATCH as a %constant, so a change
+# there must re-run SWIG rather than leave the Lua table stale.
+set_property(SOURCE swig/net.i PROPERTY DEPENDS
+    cxx/inc/netxx.hpp
+    ${CMAKE_SOURCE_DIR}/net/inc/net_txq.h)
 # The CMake target is net_lua because `net` is the C library; the
 # loadable module is still net.so for `require("net")`.
 swig_add_library(net_lua
@@ -169,7 +178,12 @@ set_target_properties(diamxx PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 set_property(SOURCE swig/diam.i PROPERTY CPLUSPLUS ON)
 set_property(SOURCE swig/diam.i PROPERTY USE_TARGET_INCLUDE_DIRECTORIES ON)
-set_property(SOURCE swig/diam.i PROPERTY DEPENDS cxx/inc/diamxx.hpp)
+# diam.i %includes both the facade and the generated dictionary header
+# (application ids, AVP codes, enum constants); list both or a dictionary
+# change rebuilds the C library without re-running SWIG, leaving the Lua
+# module's constant table stale.
+set_property(SOURCE swig/diam.i PROPERTY DEPENDS
+    cxx/inc/diamxx.hpp ${CMAKE_BINARY_DIR}/diam/gen/inc/diam_dict.h)
 # The CMake target is diam_lua because `diam` is the C library; the
 # loadable module is still diam.so for `require("diam")`.
 swig_add_library(diam_lua
@@ -228,4 +242,12 @@ if(BUILD_TESTING AND Lua_FOUND AND LUA_INTERPRETER)
                      ${CMAKE_CURRENT_SOURCE_DIR}/test/test_net_bindings.lua)
     set_tests_properties(bindings_lua_net PROPERTIES
         ENVIRONMENT "LUA_CPATH=${CMAKE_CURRENT_BINARY_DIR}/lua/?.so")
+
+    # examples/sdp_min.lua is pure Lua (no bindings module), so it needs
+    # LUA_PATH at the examples directory rather than LUA_CPATH.
+    add_test(NAME bindings_lua_sdp_min
+             COMMAND ${LUA_INTERPRETER}
+                     ${CMAKE_CURRENT_SOURCE_DIR}/test/test_sdp_min.lua)
+    set_tests_properties(bindings_lua_sdp_min PROPERTIES
+        ENVIRONMENT "LUA_PATH=${CMAKE_CURRENT_SOURCE_DIR}/examples/?.lua")
 endif()

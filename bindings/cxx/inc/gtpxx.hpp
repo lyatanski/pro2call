@@ -574,6 +574,29 @@ class Endpoint
     std::string local_host() const;
     uint16_t    local_port() const;
 
+    /* Output is loop-driven (net_txq): every message is queued and the loop
+     * pushes the queue out with sendmmsg() at the top of the next iteration
+     * — so a handler that answers, or a script that opens N sessions, never
+     * waits in the kernel per message, and a batch of N leaves in
+     * ceil(N/NET_TXQ_BATCH) syscalls. Ordering is preserved and a full
+     * socket buffer suspends the queue instead of failing the send.
+     *
+     * The counters make the effect visible: messages sent, sendmmsg() calls
+     * (sent/calls = the batching ratio), messages still queued, and how
+     * often the kernel pushed back. tx_flush() forces the queue out when a
+     * caller will not reach the loop again (the destructor does it too).
+     *
+     * set_tx_loop(false) reverts to a direct sendto(2) per message, on the
+     * caller's stack — what a caller wants when it will not run the loop
+     * after sending, and the baseline the counters are measured against. */
+    void     set_tx_loop(bool on);
+    int      tx_flush();
+    size_t   tx_pending() const;
+    uint64_t tx_sent() const;
+    uint64_t tx_calls() const;
+    uint64_t tx_blocked() const;
+    uint64_t tx_dropped() const;
+
     Session*              session_by_teid(uint32_t local_teid);
     std::vector<Session*> sessions();
 
@@ -608,13 +631,19 @@ class Endpoint
 /* One bearer's forwarding entry. Addresses are literal strings;
  * ue_addr is the inner (UE) side, remote_addr the outer GTP-U peer.
  * MACs ("aa:bb:cc:dd:ee:ff") are only needed when the kernel FIB
- * cannot resolve the next hop. */
+ * cannot resolve the next hop.
+ *
+ * core_side marks an anchor-side (PGW/UPF) bearer: ue_addr still steers
+ * the encap of traffic heading to the UE, but decap accepts the uplink
+ * coming from it instead of requiring the inner destination to be the
+ * UE (which only holds at an access-side node). */
 struct Tunnel {
     uint32_t    local_teid  = 0;
     uint32_t    remote_teid = 0;
     uint8_t     ebi         = 0;
     std::string ue_addr;
-    uint8_t     prefix_len = 0; /* 0 = host route */
+    uint8_t     prefix_len = 0;     /* 0 = host route */
+    bool        core_side  = false; /* PGW/UPF side of the bearer */
     std::string remote_addr;
     uint16_t    remote_port = 0; /* 0 = 2152 */
     uint32_t    rx_ifindex  = 0; /* decap redirect target; 0 = local stack */

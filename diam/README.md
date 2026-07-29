@@ -7,6 +7,7 @@ covering the 3GPP application interfaces this project cares about:
 |-----------|----------------------------------|--------------|
 | base      | 0                                | RFC 6733     |
 | Cx        | 16777216                         | TS 29.229    |
+| Gx        | 16777238                         | TS 29.212    |
 | Rx        | 16777236                         | TS 29.214    |
 | Ro        | 4 (credit-control, RFC 4006)     | TS 32.299    |
 | Rf        | 3 (base accounting)              | TS 32.299    |

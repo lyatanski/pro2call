@@ -23,6 +23,11 @@ struct tmr {
     void*     ud;
 };
 
+struct pre {
+    net_pre_f cb;
+    void*     ud;
+};
+
 struct net_loop {
     int           ep;
     int           stop;
@@ -31,6 +36,9 @@ struct net_loop {
     struct tmr*   tmr; /* binary min-heap on due */
     size_t        ntmr, ctmr;
     uint64_t      seq;
+    struct pre*   pre; /* pre-poll hooks, in registration order */
+    size_t        npre, cpre;
+    int           pre_gaps; /* a hook was dropped: compact after dispatch */
 };
 
 uint64_t net_now_ms(void)
@@ -70,6 +78,7 @@ void net_loop_free(net_loop* l)
     close(l->ep);
     free(l->fds);
     free(l->tmr);
+    free(l->pre);
     free(l);
 }
 
@@ -106,6 +115,56 @@ int net_loop_del(net_loop* l, int fd)
     l->fds[fd].cb = NULL;
     l->fds[fd].ud = NULL;
     return epoll_ctl(l->ep, EPOLL_CTL_DEL, fd, NULL) < 0 ? NET_ERR : NET_OK;
+}
+
+/* --- pre-poll hooks --------------------------------------------------- */
+
+int net_loop_pre_add(net_loop* l, net_pre_f cb, void* ud)
+{
+    if (!cb) return NET_ERR;
+    for (size_t i = 0; i < l->npre; i++)
+        if (l->pre[i].cb == cb && l->pre[i].ud == ud) return NET_OK;
+    for (size_t i = 0; i < l->npre; i++) /* reuse a dropped slot */
+        if (!l->pre[i].cb) {
+            l->pre[i].cb = cb;
+            l->pre[i].ud = ud;
+            return NET_OK;
+        }
+    if (l->npre == l->cpre) {
+        size_t      c = l->cpre ? l->cpre * 2 : 4;
+        struct pre* p = realloc(l->pre, c * sizeof *p);
+        if (!p) return NET_ERR;
+        l->pre  = p;
+        l->cpre = c;
+    }
+    l->pre[l->npre].cb = cb;
+    l->pre[l->npre].ud = ud;
+    l->npre++;
+    return NET_OK;
+}
+
+/* Removal only clears the slot; dispatch compacts afterwards. A hook that
+ * drops itself while it is running therefore cannot shift the entries the
+ * dispatch loop has not reached yet. */
+int net_loop_pre_del(net_loop* l, net_pre_f cb, void* ud)
+{
+    for (size_t i = 0; i < l->npre; i++) {
+        if (l->pre[i].cb != cb || l->pre[i].ud != ud) continue;
+        l->pre[i].cb = NULL;
+        l->pre[i].ud = NULL;
+        l->pre_gaps  = 1;
+        return NET_OK;
+    }
+    return NET_ERR;
+}
+
+static void pre_compact(net_loop* l)
+{
+    size_t w = 0;
+    for (size_t i = 0; i < l->npre; i++)
+        if (l->pre[i].cb) l->pre[w++] = l->pre[i]; /* order is contractual */
+    l->npre     = w;
+    l->pre_gaps = 0;
 }
 
 /* --- timer heap ------------------------------------------------------ */
@@ -169,6 +228,12 @@ int net_loop_cancel(net_loop* l, uint64_t id)
 
 int net_loop_step(net_loop* l, int timeout_ms)
 {
+    /* First: hand the iteration to the pre-poll hooks (queued output goes
+     * out here), then compute the timeout — a hook may have armed a timer. */
+    for (size_t i = 0; i < l->npre; i++)
+        if (l->pre[i].cb) l->pre[i].cb(l->pre[i].ud); /* may drop itself */
+    if (l->pre_gaps) pre_compact(l);
+
     int t = timeout_ms < 0 ? -1 : timeout_ms;
     if (l->ntmr) {
         uint64_t now   = net_now_ms();

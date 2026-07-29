@@ -158,7 +158,9 @@ struct Endpoint::Impl {
     net::Loop*                 loop = nullptr;
     std::shared_ptr<net_loop*> life; /* *life == nullptr once loop freed */
     net_sock                   sock;
-    bool                       sock_open = false;
+    net_txq*                   txq        = nullptr; /* loop-driven output */
+    bool                       tx_on_loop = true;
+    bool                       sock_open  = false;
     std::string                local_host;
     uint16_t                   local_port = 0;
     uint32_t                   seq        = 0; /* sequence allocator */
@@ -223,15 +225,28 @@ Endpoint::Endpoint(net::Loop& loop, const std::string& local_host,
         delete impl_;
         throw Error("net_loop_add failed");
     }
+
+    /* Move the send side onto the loop: send_to() queues, the loop batches.
+     * The endpoint is loop-driven by construction, so this is unconditional
+     * — every send is followed by a step()/run() that flushes it. */
+    impl_->txq = net_txq_new(impl_->lp(), &impl_->sock, NET_RD, 0);
+    if (!impl_->txq) {
+        net_loop_del(impl_->lp(), impl_->sock.fd);
+        net_sock_close(&impl_->sock);
+        delete impl_;
+        throw Error("net_txq_new failed");
+    }
 }
 
 Endpoint::~Endpoint()
 {
     if (net_loop* lp = *impl_->life) { /* skip when loop freed first */
+        if (impl_->txq) net_txq_flush(impl_->txq); /* don't lose queued output */
         for (auto& kv : impl_->txns)
             net_loop_cancel(lp, kv.second->timer_id);
         if (impl_->sock_open) net_loop_del(lp, impl_->sock.fd);
-    }
+    } else if (impl_->txq) net_txq_detach(impl_->txq);
+    net_txq_free(impl_->txq);
     if (impl_->sock_open) net_sock_close(&impl_->sock);
     delete impl_;
 }
@@ -261,10 +276,52 @@ void Endpoint::send_to(const Bytes& wire, const std::string& host,
     net_addr to;
     if (net_addr_from(&to, host.c_str(), port) != NET_OK)
         throw Error("bad peer address: " + host);
+    if (impl_->tx_on_loop) {
+        if (net_txq_send(impl_->txq, wire.data(), wire.size(), &to) != NET_OK)
+            throw Error("gtp send queue full for " + host + ":" +
+                        std::to_string(port));
+        return;
+    }
     ssize_t n = net_udp_send(&impl_->sock, wire.data(), wire.size(), &to);
     if (n == NET_ERR)
         throw Error("gtp send to " + host + ":" + std::to_string(port) +
                     " failed");
+}
+
+void Endpoint::set_tx_loop(bool on)
+{
+    if (!on) net_txq_flush(impl_->txq); /* keep ordering across the switch */
+    impl_->tx_on_loop = on;
+}
+
+int Endpoint::tx_flush()
+{
+    return net_txq_flush(impl_->txq);
+}
+
+size_t Endpoint::tx_pending() const
+{
+    return net_txq_pending(impl_->txq);
+}
+
+uint64_t Endpoint::tx_sent() const
+{
+    return net_txq_sent(impl_->txq);
+}
+
+uint64_t Endpoint::tx_calls() const
+{
+    return net_txq_calls(impl_->txq);
+}
+
+uint64_t Endpoint::tx_blocked() const
+{
+    return net_txq_blocked(impl_->txq);
+}
+
+uint64_t Endpoint::tx_dropped() const
+{
+    return net_txq_dropped(impl_->txq);
 }
 
 void Endpoint::start_txn(uint32_t seq, uint8_t mt, const Bytes& wire,

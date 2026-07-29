@@ -39,6 +39,12 @@ API_EXPORT void      net_addr_set_port(net_addr*, uint16_t);
 API_EXPORT int       net_addr_eq(const net_addr*, const net_addr*);
 API_EXPORT const char* net_addr_str(const net_addr*, char buf[NET_ADDR_STRLEN]);
 
+/* Write into `out` the address a dual-stack IPv6 socket must use to reach
+ * `a`: an AF_INET peer becomes its IPv4-mapped IPv6 form, any other family
+ * is copied unchanged. Used by the UDP send paths (net_udp_send,
+ * net_txq_send). */
+API_EXPORT void net_addr_map6(net_addr* out, const net_addr* a);
+
 #ifdef __cplusplus
 }
 #endif

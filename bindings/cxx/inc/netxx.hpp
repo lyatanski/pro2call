@@ -11,6 +11,7 @@
 #include "net_dns.h"
 #include "net_loop.h"
 #include "net_sock.h"
+#include "net_txq.h"
 
 /* netxx — C++ facade over the C net transport layer (net/), written to
  * be wrapped by SWIG (bindings/swig/net.i) and driven from scripting
@@ -31,6 +32,8 @@
  * stopped, and it re-raises from step()/run() rather than unwinding
  * through the C dispatcher's frames.
  */
+
+struct ippool; /* opaque; task/inc/ippool.h is not needed by users */
 
 namespace net
 {
@@ -192,6 +195,42 @@ class UdpSocket
                 uint16_t port);
     void send(const std::string& data); /* to the connected peer */
 
+    /* ---- loop-driven output (net_txq) ----
+     *
+     * Move this socket's send side onto `loop`: sendto()/send() then only
+     * queue the datagram and return, and the loop pushes the queue out at
+     * the top of each iteration with sendmmsg() — one syscall per batch of
+     * NET_TXQ_BATCH instead of one per datagram, and no syscall at all on
+     * the caller's path. A handler that answers a burst therefore does not
+     * stop to enter the kernel between messages, and a full socket buffer
+     * suspends the queue (resumed on writability) instead of failing the
+     * send.
+     *
+     * base_events is the fd's steady-state interest, so this composes with
+     * the caller's own Loop::add_fd for the same fd; the queue adds NET_WR
+     * to it only while it has a backlog. Registering the fd with the loop
+     * (as an event-driven receiver does) is the normal case; without it the
+     * queue falls back to a 1 ms retry timer.
+     *
+     * Off by default: a linear script that sends and then blocks in recv()
+     * never runs a loop, and must keep the direct syscall. */
+    void tx_loop(Loop& loop, unsigned base_events = NET_RD,
+                 size_t max_queue_bytes = 0);
+    bool tx_queued() const; /* is output loop-driven? */
+
+    /* Push the queue now, without running the loop (before closing, or from
+     * a linear flow). No-op unless tx_loop() was called. Returns the number
+     * of datagrams sent. */
+    int  tx_flush();
+    /* Datagrams still queued, and the counters over the socket's life:
+     * datagrams sent, sendmmsg() calls (sent/calls = the batching ratio),
+     * datagrams the kernel refused for good, and how often it pushed back. */
+    size_t   tx_pending() const;
+    uint64_t tx_sent() const;
+    uint64_t tx_calls() const;
+    uint64_t tx_dropped() const;
+    uint64_t tx_blocked() const;
+
     /* timeout_ms >= 0 waits up to that long; < 0 polls once (drain a
      * loop-signalled fd). A timeout returns a Datagram with timed_out
      * set and no data. */
@@ -203,8 +242,10 @@ class UdpSocket
     void        close();
 
   private:
-    net_sock s_;
-    bool     open_ = false;
+    net_sock                   s_;
+    bool                       open_ = false;
+    net_txq*                   txq_  = nullptr;
+    std::shared_ptr<net_loop*> life_; /* nulled by ~Loop; see Loop::life() */
 };
 
 /* ---- TCP / SCTP stream socket ---- */
@@ -291,6 +332,77 @@ class StreamListener
  * throws Error on failure/timeout. */
 StreamConn* stream_connect(const std::string& host, uint16_t port,
                            int proto = 0, int timeout_ms = 5000);
+
+/* ---- IP address pool ---- */
+
+/* Address allocation with reuse over the task library's pool
+ * (task/inc/ippool.h): the allocator a PGW/SMF assigns PDN addresses
+ * from, or a DHCP server its leases. The C core is binary and
+ * index-based; this facade is the literal-string surface — a scope is
+ * "10.45.0.0/16" or a first..last pair, and every address in and out is
+ * a literal ("10.45.0.7", "2001:db8::7").
+ *
+ * An IPv4 prefix shorter than /31 excludes its network and broadcast
+ * address, as a DHCP scope does; reserve() takes the gateway (or any
+ * address a subscriber must keep) out of circulation. A released
+ * address is not handed out again until the allocator has swept the
+ * rest of the pool, so a detaching UE's address does not go straight to
+ * the next attach.
+ *
+ *   local pool = net.IpPool("10.45.0.0/16")
+ *   pool:reserve("10.45.0.1")                 -- the gateway
+ *   if pool:available() > 0 then
+ *       local ue = pool:alloc()               -- "10.45.0.2"
+ *       ...
+ *       pool:release(ue)
+ *   end
+ */
+class IpPool
+{
+  public:
+    /* "10.45.0.0/16" or "2001:db8:0:1::/64"; any address inside the
+     * prefix names the same scope. Throws Error on a malformed scope. */
+    explicit IpPool(const std::string& cidr);
+
+    /* Explicit inclusive range, both ends usable and of one family:
+     * IpPool("10.45.0.100", "10.45.0.200"). */
+    IpPool(const std::string& first, const std::string& last);
+
+    ~IpPool();
+    IpPool(const IpPool&)            = delete;
+    IpPool& operator=(const IpPool&) = delete;
+
+    /* Next free address. Throws Error (code IPPOOL_E_FULL) when the pool
+     * is exhausted — available() answers that without throwing. */
+    std::string alloc();
+
+    /* Claim one specific address; throws when it is outside the pool or
+     * already allocated. */
+    void reserve(const std::string& addr);
+
+    /* Hand an address back for reuse; throws on a double release or an
+     * address that is not one of the pool's. */
+    void release(const std::string& addr);
+
+    /* Release everything, as a restart would. */
+    void reset();
+
+    bool allocated(const std::string& addr) const;
+
+    uint32_t size() const;      /* addresses in the pool     */
+    uint32_t used() const;      /* currently allocated       */
+    uint32_t available() const; /* size() - used()           */
+
+    /* The pool's own numbering: addr_at(i) is the address of slot i
+     * (throws past the end), index_of(addr) its slot or -1 when the
+     * address is not one of the pool's. Neither says whether the slot is
+     * allocated. */
+    std::string addr_at(uint32_t index) const;
+    long        index_of(const std::string& addr) const;
+
+  private:
+    ippool* p_;
+};
 
 /* ---- DNS resolver ---- */
 

@@ -377,7 +377,13 @@ static void tun_to_rx(const gtpu_tunnel_t* t, struct gtpu_rx_tun* rx)
     memset(rx, 0, sizeof *rx);
     rx->inner_family = t->inner_family;
     rx->ebi          = t->ebi;
-    memcpy(rx->inner_addr, t->inner_addr, 16);
+    /* The decap's inner-dst check only holds where the decapsulated
+     * traffic is heading TO the UE. An anchor-side (PGW/UPF) bearer
+     * decapsulates uplink coming FROM it — inner dst is the remote host —
+     * so leave inner_addr all-zero (= no check) there, as a
+     * destination-steered TFT does below. inner_addr still keys the encap
+     * LPM entry either way. */
+    if (!t->core_side) memcpy(rx->inner_addr, t->inner_addr, 16);
     rx->ifindex = t->rx_ifindex;
 }
 

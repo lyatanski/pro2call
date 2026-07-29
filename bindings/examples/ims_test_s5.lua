@@ -2,7 +2,7 @@
 --
 -- Usage:
 --   LUA_CPATH=<build>/bindings/lua/?.so [PGW_IP=smf] [IMS_SUBS=N] \
---     lua ims_test_s5.lua
+--     [TX_MODE=loop|sync] [GTP_T3_MS=1000] lua ims_test_s5.lua
 --
 -- Attaches N IMS subscribers over S5/S8 and registers each with the IMS,
 -- concurrently, on one net.Loop. IMS_SUBS (default 1) sets the count; each
@@ -62,7 +62,15 @@ local function mnc3(n) return (#n == 2) and ("0" .. n) or n end
 local ims_realm = os.getenv("IMS_REALM")
     or ("ims.mnc%s.mcc%s.3gppnetwork.org"):format(mnc3(mnc), mcc)
 
-local T3_MS, N3  = 1000, 3     -- GTP-C retransmission: 1s T3-RESPONSE, up to 3 sends
+-- GTP-C retransmission (TS 29.274 §7.6): 1s T3-RESPONSE, up to 3 sends. The
+-- 1s default is more aggressive than the spec's 3s, which shows at scale — a
+-- 1000-wide Create Session burst queues behind a single-threaded PGW/SMF, so
+-- a request can still be in progress when T3 fires and the retransmission
+-- reaches a transaction the PGW considers open (open5gs logs
+-- `ogs_gtp_xact_update_rx() failed`). Raise GTP_T3_MS to give the PGW the
+-- full T3-RESPONSE window.
+local T3_MS = tonumber(os.getenv("GTP_T3_MS") or "1000")
+local N3    = tonumber(os.getenv("GTP_N3") or "3")
 local SIP_T_MS   = tonumber(os.getenv("SIP_T_MS") or "5000")  -- SIP response deadline per registration step
 local AUTH_CAP   = 2           -- give up after this many 401 challenges
 local REG_EXPIRES = tonumber(os.getenv("IMS_EXPIRES") or "600000") -- ~7 days
@@ -73,6 +81,18 @@ local DEREG = (os.getenv("IMS_DEREG") or "1") ~= "0"
 -- (SMF Create Session, the CSCF chain and the one net.Loop) past SIP_T_MS. 0 =
 -- fire everything up front (the original behaviour).
 local RAMP_MS    = tonumber(os.getenv("RAMP_MS") or "0")
+
+-- Where the sends happen. "loop" (default) puts each UE socket's output on the
+-- net.Loop (net.UdpSocket:tx_loop): a sendto() queues the datagram and returns,
+-- and the loop pushes everything queued during one iteration out in batched
+-- sendmmsg() calls — so no subscriber waits in the kernel while the next one is
+-- being built, and a full socket buffer becomes back-pressure the queue rides
+-- out instead of a failed REGISTER. "sync" keeps the direct per-datagram
+-- sendto, for measuring what that costs. It switches the GTP-C endpoint the
+-- same way (gtp.Endpoint:set_tx_loop), which is where a 1000-wide Create
+-- Session burst collapses from 1000 syscalls to ~16.
+local TX_MODE    = os.getenv("TX_MODE") or "loop"
+local TX_ON_LOOP = TX_MODE ~= "sync"
 
 local IPPROTO_UDP    = 17      -- unprotected REGISTER: plain UDP toward the P-CSCF
 local IPPROTO_ESP    = 50      -- protected traffic: ESP (IMS-AKA IPsec, TS 33.203)
@@ -302,6 +322,7 @@ local function run()
     end
     ep:set_t3_ms(T3_MS)
     ep:set_n3(N3)
+    ep:set_tx_loop(TX_ON_LOOP)
 
     -- ---- shared GTP-U datapath (loaded once) ----
     local up
@@ -630,6 +651,10 @@ local function run()
             slog(sub, "UE SIP socket", ("SGW source (UE PAA bind refused: %s); no reply can return"):format(why(s)))
         end
         loop:add_fd(sub.sock:fd(), net.NET_RD, function() on_sip_readable(sub) end)
+        -- Put this UE's output on the loop (queue now, batched sendmmsg from
+        -- the loop). NET_RD is the fd's steady-state interest above, which the
+        -- queue restores after adding NET_WR to ride out a full send buffer.
+        if TX_ON_LOOP then sub.sock:tx_loop(loop, net.NET_RD) end
 
         if up and sub.sig_teid then sub.rx0 = up:stats(sub.sig_teid) end
 
@@ -723,6 +748,7 @@ local function run()
     -- endpoint multiplexes the transactions and the callbacks drive each to
     -- registration on the one loop.
     banner("Create Session Requests")
+    local burst_t0 = now()
     for i = 1, NSUBS do
         local sub = make_sub(i)
         subs[i] = sub
@@ -761,9 +787,41 @@ local function run()
         if RAMP_MS > 0 then loop:after((i - 1) * RAMP_MS, fire) else fire() end
     end
 
+    -- How long the attach burst took to leave the client, split into the part
+    -- on the caller's path (build + hand off every request) and the part in
+    -- the kernel (the endpoint's queue drained with batched sendmmsg — what
+    -- the loop would do at the top of its next iteration anyway). With the
+    -- direct path the two are the same thing: one sendto per request, inline.
+    if RAMP_MS == 0 then
+        local offer = now() - burst_t0
+        ep:tx_flush()
+        stats.burst = { n = NSUBS, offer = offer, total = now() - burst_t0 }
+    end
+
     -- One dispatcher for every socket and timer until the last subscriber is
     -- terminal (registered, rejected or timed out) and the grace elapses.
     local rok, rerr = pcall(function() loop:run() end)
+
+    -- Loop-driven TX accounting, read before the sockets go away. sent/calls
+    -- is the batching ratio: datagrams that left per sendmmsg() syscall (1.0 =
+    -- one syscall each, as a direct sendto). blocked counts the times the
+    -- kernel pushed back and the queue rode it out instead of failing a send.
+    local function tx_add(t, s)
+        t.sent    = t.sent + s:tx_sent()
+        t.calls   = t.calls + s:tx_calls()
+        t.blocked = t.blocked + s:tx_blocked()
+        t.dropped = t.dropped + s:tx_dropped()
+    end
+    stats.gtp_tx = { sent = ep:tx_sent(), calls = ep:tx_calls(),
+                     blocked = ep:tx_blocked(), dropped = ep:tx_dropped() }
+    stats.sip_tx = { sent = 0, calls = 0, blocked = 0, dropped = 0,
+                     queued = TX_ON_LOOP, socks = 0 }
+    for _, sub in ipairs(subs) do
+        if sub.sock and sub.sock:tx_queued() then
+            stats.sip_tx.socks = stats.sip_tx.socks + 1
+            tx_add(stats.sip_tx, sub.sock)
+        end
+    end
 
     -- Teardown that needs no loop.
     if xfrm then
@@ -851,5 +909,27 @@ line("sessions created",     ("%d in %.2fs  ->  %.1f/s"):format(stats.sess, sess
 line("registrations",        ("%d in %.2fs  ->  %.1f/s"):format(stats.regs, reg_w, reg_r))
 line("SIP packets sent",      ("%d  ->  %.1f/s"):format(stats.tx, tx_r))
 line("SIP packets received",  ("%d  ->  %.1f/s"):format(stats.rx, rx_r))
+
+-- What the loop-driven send path did: datagrams handed to the kernel per
+-- sendmmsg() syscall, and how much back-pressure it absorbed.
+local function tx_line(what, t)
+    if t.sent == 0 then return line(what, "no output") end
+    line(what, ("%d datagram(s) in %d syscall(s)  ->  %.1f per call%s%s")
+        :format(t.sent, t.calls, t.sent / math.max(t.calls, 1),
+                t.blocked > 0 and (", %d push-back(s) absorbed"):format(t.blocked) or "",
+                t.dropped > 0 and (", %d dropped"):format(t.dropped) or ""))
+end
+banner(("Loop-driven TX (TX_MODE=%s)"):format(os.getenv("TX_MODE") or "loop"))
+if stats.burst then
+    local b = stats.burst
+    line("Create Session burst", ("%d request(s) offered in %dms, on the wire in %dms  ->  %.0f/s")
+        :format(b.n, b.offer, b.total, b.n / math.max(b.total, 1) * 1000))
+end
+tx_line("GTP-C endpoint", stats.gtp_tx)
+if stats.sip_tx.queued then
+    tx_line(("SIP, %d UE socket(s)"):format(stats.sip_tx.socks), stats.sip_tx)
+else
+    line("SIP", "direct sendto per datagram (TX_MODE=sync)")
+end
 
 os.exit(ok == #subs and 0 or 1)

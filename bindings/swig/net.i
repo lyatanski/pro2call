@@ -1,6 +1,9 @@
 /* SWIG interface for the net transport layer — wraps the netxx C++
  * facade (bindings/cxx/inc/netxx.hpp) over the C net library (net/): the
- * epoll event loop and a non-blocking UDP socket.
+ * epoll event loop, a non-blocking UDP socket, a TCP/SCTP stream socket,
+ * the DNS resolver, the interface-address helpers, and net.IpPool — the
+ * address allocator from task/inc/ippool.h with its literal-string
+ * surface (a PGW's PDN addresses, a DHCP server's leases).
  *
  * Two target languages, one facade (as in gtp.i):
  *
@@ -24,6 +27,14 @@
  *   end)
  *   sock:sendto("ping", "127.0.0.1", sock:local_port())
  *   loop:run()
+ *
+ * Sends can ride the loop too: after sock:tx_loop(loop) a sendto() only
+ * queues the datagram and returns, and the loop pushes everything queued
+ * during one iteration out in batched sendmmsg() calls (net/inc/net_txq.h).
+ * That keeps a burst of sends off the caller's path — no syscall per
+ * datagram — and turns a full socket buffer into back-pressure the queue
+ * rides out instead of a failed send. Leave it off for linear scripts that
+ * send and then block in recv() without ever running the loop.
  */
 
 %module(directors="1") net
@@ -199,10 +210,15 @@ struct NetLuaFn;
 %ignore net::Loop::defer_exception;
 %ignore net::Loop::rethrow_pending;
 
-/* Loop event bits for add_fd() / on_io(). */
+/* Loop event bits for add_fd() / on_io(), and the second argument to
+ * UdpSocket::tx_loop() (the fd's steady-state interest). */
 %constant int NET_RD = 1;
 %constant int NET_WR = 2;
 %constant int NET_ER = 4;
+
+/* Datagrams per sendmmsg() when the loop flushes a queued socket
+ * (net_txq.h; SWIG does not parse the #included header). */
+%constant int NET_TXQ_BATCH = 64;
 
 /* Return codes, also the negative values a raised error carries in
  * code() (Datagram.timed_out already flags the common recv() timeout). */

@@ -116,12 +116,7 @@ static const net_addr* map6(const net_sock* s, const net_addr* a, net_addr* tmp)
 {
     if (s->local.sa.sa_family != AF_INET6 || a->sa.sa_family != AF_INET)
         return a;
-    memset(tmp, 0, sizeof *tmp);
-    tmp->v6.sin6_family           = AF_INET6;
-    tmp->v6.sin6_port             = a->v4.sin_port;
-    tmp->v6.sin6_addr.s6_addr[10] = 0xff;
-    tmp->v6.sin6_addr.s6_addr[11] = 0xff;
-    memcpy(&tmp->v6.sin6_addr.s6_addr[12], &a->v4.sin_addr, 4);
+    net_addr_map6(tmp, a);
     return tmp;
 }
 

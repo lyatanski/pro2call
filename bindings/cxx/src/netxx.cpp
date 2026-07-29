@@ -7,6 +7,7 @@
  * from Loop::step()/run(). */
 
 #include "netxx.hpp"
+#include "ippool.h" /* net::IpPool — the task library's address pool */
 #include "rtnl.h"
 
 #include <arpa/inet.h>
@@ -285,10 +286,62 @@ UdpSocket::~UdpSocket()
 
 void UdpSocket::close()
 {
+    if (txq_) {
+        if (life_ && !*life_) net_txq_detach(txq_); /* loop already gone */
+        else net_txq_flush(txq_);                   /* don't lose output */
+        net_txq_free(txq_);
+        txq_ = nullptr;
+        life_.reset();
+    }
     if (open_) {
         net_sock_close(&s_);
         open_ = false;
     }
+}
+
+void UdpSocket::tx_loop(Loop& loop, unsigned base_events,
+                        size_t max_queue_bytes)
+{
+    if (!open_) throw Error("socket is closed");
+    if (txq_) throw Error("output is already on a loop");
+    txq_ = net_txq_new(loop.raw(), &s_, base_events, max_queue_bytes);
+    if (!txq_) throw Error("net_txq_new failed");
+    life_ = loop.life();
+}
+
+bool UdpSocket::tx_queued() const
+{
+    return txq_ != nullptr;
+}
+
+int UdpSocket::tx_flush()
+{
+    return txq_ ? net_txq_flush(txq_) : 0;
+}
+
+size_t UdpSocket::tx_pending() const
+{
+    return txq_ ? net_txq_pending(txq_) : 0;
+}
+
+uint64_t UdpSocket::tx_sent() const
+{
+    return txq_ ? net_txq_sent(txq_) : 0;
+}
+
+uint64_t UdpSocket::tx_calls() const
+{
+    return txq_ ? net_txq_calls(txq_) : 0;
+}
+
+uint64_t UdpSocket::tx_dropped() const
+{
+    return txq_ ? net_txq_dropped(txq_) : 0;
+}
+
+uint64_t UdpSocket::tx_blocked() const
+{
+    return txq_ ? net_txq_blocked(txq_) : 0;
 }
 
 void UdpSocket::connect(const std::string& host, uint16_t port)
@@ -303,7 +356,13 @@ void UdpSocket::sendto(const std::string& data, const std::string& host,
                        uint16_t port)
 {
     net_addr to = addr_of(host, port);
-    ssize_t  n  = net_udp_send(&s_, data.data(), data.size(), &to);
+    if (txq_) { /* queue it; the loop pushes the batch out */
+        if (net_txq_send(txq_, data.data(), data.size(), &to) != NET_OK)
+            throw Error("send queue full for " + host + ":" +
+                        std::to_string(port));
+        return;
+    }
+    ssize_t n = net_udp_send(&s_, data.data(), data.size(), &to);
     if (n < 0)
         throw Error("send to " + host + ":" + std::to_string(port) + " failed",
                     static_cast<int>(n));
@@ -311,6 +370,11 @@ void UdpSocket::sendto(const std::string& data, const std::string& host,
 
 void UdpSocket::send(const std::string& data)
 {
+    if (txq_) {
+        if (net_txq_send(txq_, data.data(), data.size(), nullptr) != NET_OK)
+            throw Error("send queue full");
+        return;
+    }
     ssize_t n = net_udp_send(&s_, data.data(), data.size(), nullptr);
     if (n < 0) throw Error("send failed", static_cast<int>(n));
 }
@@ -477,6 +541,149 @@ StreamConn* stream_connect(const std::string& host, uint16_t port, int proto,
                         " failed",
                     rc);
     return new StreamConn(s);
+}
+
+/* ---- IpPool ---- */
+
+namespace
+{
+
+/* Literal address -> the pool's binary form. inet_pton settles the
+ * family, so "10.45.0.1" and "2001:db8::1" both just work. */
+ippool_addr_t pool_addr(const std::string& literal)
+{
+    ippool_addr_t a;
+    memset(&a, 0, sizeof a);
+    if (inet_pton(AF_INET, literal.c_str(), a.b) == 1) {
+        a.len = IPPOOL_V4;
+    } else if (inet_pton(AF_INET6, literal.c_str(), a.b) == 1) {
+        a.len = IPPOOL_V6;
+    } else {
+        throw Error("not an IP address: " + literal);
+    }
+    return a;
+}
+
+std::string pool_str(const ippool_addr_t& a)
+{
+    char buf[INET6_ADDRSTRLEN] = "";
+    inet_ntop(a.len == IPPOOL_V4 ? AF_INET : AF_INET6, a.b, buf, sizeof buf);
+    return buf;
+}
+
+/* Split "<address>/<prefix-len>"; throws when the form is not that. */
+void pool_cidr(const std::string& cidr, ippool_addr_t& net, uint8_t& plen)
+{
+    const std::string::size_type slash = cidr.find('/');
+    if (slash == std::string::npos || slash + 1 == cidr.size())
+        throw Error("not a CIDR scope (want <address>/<prefix-len>): " + cidr);
+    net = pool_addr(cidr.substr(0, slash));
+
+    const std::string digits = cidr.substr(slash + 1);
+    if (digits.find_first_not_of("0123456789") != std::string::npos)
+        throw Error("bad prefix length in " + cidr);
+    const unsigned long v = std::stoul(digits);
+    if (v > static_cast<unsigned long>(net.len) * 8u)
+        throw Error("prefix length out of range in " + cidr);
+    plen = static_cast<uint8_t>(v);
+}
+
+/* One place to turn an ippool_err_t into the facade's exception. */
+void pool_check(int rc, const std::string& what, const std::string& addr)
+{
+    if (rc == IPPOOL_OK) return;
+    const char* why = "failed";
+    switch (rc) {
+    case IPPOOL_E_FULL: why = "pool exhausted"; break;
+    case IPPOOL_E_RANGE: why = "address is not one of the pool's"; break;
+    case IPPOOL_E_INUSE: why = "address already allocated"; break;
+    case IPPOOL_E_FREE: why = "address is not allocated"; break;
+    default: break;
+    }
+    throw Error(what + (addr.empty() ? "" : " " + addr) + ": " + why, rc);
+}
+
+} /* namespace */
+
+IpPool::IpPool(const std::string& cidr) : p_(nullptr)
+{
+    ippool_addr_t net;
+    uint8_t       plen = 0;
+    pool_cidr(cidr, net, plen);
+    p_ = ippool_create(&net, plen);
+    if (!p_) throw Error("cannot create a pool over " + cidr);
+}
+
+IpPool::IpPool(const std::string& first, const std::string& last)
+    : p_(nullptr)
+{
+    const ippool_addr_t f = pool_addr(first);
+    const ippool_addr_t l = pool_addr(last);
+    p_                    = ippool_create_range(&f, &l);
+    if (!p_) throw Error("cannot create a pool over " + first + ".." + last);
+}
+
+IpPool::~IpPool()
+{
+    ippool_destroy(p_);
+}
+
+std::string IpPool::alloc()
+{
+    ippool_addr_t a;
+    pool_check(ippool_alloc(p_, &a), "allocate", "");
+    return pool_str(a);
+}
+
+void IpPool::reserve(const std::string& addr)
+{
+    const ippool_addr_t a = pool_addr(addr);
+    pool_check(ippool_reserve(p_, &a), "reserve", addr);
+}
+
+void IpPool::release(const std::string& addr)
+{
+    const ippool_addr_t a = pool_addr(addr);
+    pool_check(ippool_free(p_, &a), "release", addr);
+}
+
+void IpPool::reset()
+{
+    ippool_reset(p_);
+}
+
+bool IpPool::allocated(const std::string& addr) const
+{
+    const ippool_addr_t a = pool_addr(addr);
+    return ippool_is_allocated(p_, &a);
+}
+
+uint32_t IpPool::size() const
+{
+    return ippool_size(p_);
+}
+
+uint32_t IpPool::used() const
+{
+    return ippool_used(p_);
+}
+
+uint32_t IpPool::available() const
+{
+    return ippool_avail(p_);
+}
+
+std::string IpPool::addr_at(uint32_t index) const
+{
+    ippool_addr_t a;
+    pool_check(ippool_addr_at(p_, index, &a), "slot", std::to_string(index));
+    return pool_str(a);
+}
+
+long IpPool::index_of(const std::string& addr) const
+{
+    const ippool_addr_t a = pool_addr(addr);
+    return static_cast<long>(ippool_index_of(p_, &a));
 }
 
 /* ---- Resolver ---- */

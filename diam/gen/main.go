@@ -25,7 +25,7 @@ var files embed.FS
 // ---- Curation over the dictionary registries ----
 
 const (
-	specDoc     = "RFC 6733; 3GPP TS 29.229 (Cx), TS 29.214 (Rx), TS 32.299 (Ro/Rf)"
+	specDoc     = "RFC 6733; 3GPP TS 29.229 (Cx), TS 29.212 (Gx), TS 29.214 (Rx), TS 32.299 (Ro/Rf)"
 	specRelease = "wireshark master 2026-07" // dict/ snapshot tag
 )
 
@@ -38,7 +38,7 @@ var dictOrder = []string{"dictionary.xml", "chargecontrol.xml", "TGPP.xml"}
 // application id. Gq is selected because the dictionaries define the
 // 500-series media AVPs that Rx reuses (TS 29.214 §5.3) under the Gq
 // application.
-var selectApps = []string{"base", "3", "4", "16777216", "16777222", "16777236"}
+var selectApps = []string{"base", "3", "4", "16777216", "16777222", "16777236", "16777238"}
 
 var appComments = map[string]string{
 	"Base":            "RFC 6733 base protocol",
@@ -47,6 +47,7 @@ var appComments = map[string]string{
 	"Cx":              "IMS CSCF-HSS interface, TS 29.229",
 	"Gq":              "TS 29.209; defines the media AVPs Rx reuses",
 	"Rx":              "AF-PCRF interface, TS 29.214",
+	"Gx":              "PCEF-PCRF policy and charging control, TS 29.212",
 }
 
 // Commands the selected applications use but the dictionaries define
@@ -72,6 +73,13 @@ var enumAVPs = []string{
 	"Specific-Action", "Abort-Cause", "AF-Signalling-Protocol",
 	"Service-Info-Status", "Node-Functionality", "Role-Of-Node",
 	"Reporting-Reason", "Experimental-Result-Code",
+	// Gx (TS 29.212): what a PCEF sends in a CCR and dispatches on in a
+	// CCA / RAR.
+	"IP-CAN-Type", "RAT-Type", "Bearer-Usage", "Bearer-Operation",
+	"Bearer-Control-Mode", "Network-Request-Support", "QoS-Class-Identifier",
+	"Event-Trigger", "PCC-Rule-Status", "Rule-Failure-Code",
+	"Pre-emption-Capability", "Pre-emption-Vulnerability", "Metering-Method",
+	"Reporting-Level", "Online", "Offline", "Session-Release-Cause",
 }
 
 // ---- Generation ----

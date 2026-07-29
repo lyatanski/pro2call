@@ -22,12 +22,15 @@
  * Bearer C (dedicated): local TEID 0x1003, remote 0x2003,
  *                       TFT = {UDP, remote port 5004}
  * Bearer D (v6 outer):  UE 10.45.0.3, local 0x1004, remote 0x2004, QFI 9
+ * Bearer E (anchor):    UE 10.45.0.6, local 0x1009, remote 0x2009,
+ *                       core_side — decaps uplink from its UE
  */
 
 static const uint8_t UE[4]        = { 10, 45, 0, 2 };
 static const uint8_t UE2[4]       = { 10, 45, 0, 3 };
 static const uint8_t UE3[4]       = { 10, 45, 0, 4 }; /* concurrent-UE source A */
 static const uint8_t UE4[4]       = { 10, 45, 0, 5 }; /* concurrent-UE source B */
+static const uint8_t UE5[4]       = { 10, 45, 0, 6 }; /* anchor-side bearer's UE */
 static const uint8_t HOST[4]      = { 203, 0, 113, 10 };
 static const uint8_t PCSCF[4]     = { 203, 0, 113, 20 }; /* destination-steered filter target */
 static const uint8_t O_LOCAL[4]   = { 198, 51, 100, 1 };
@@ -331,6 +334,17 @@ spec ("gtpu_bpf") {
             d.has_qfi = true;
             d.qfi     = 9;
             check(gtpu_teid_add(g, &d) == GTPU_OK);
+
+            /* Bearer E is the anchor (PGW/UPF) end of a bearer: its UE
+             * address still keys the encap LPM entry for downlink, but the
+             * G-PDUs it decapsulates are uplink FROM that UE, so the
+             * inner-dst check must not be installed. */
+            gtpu_tunnel_t e = bearer_a;
+            e.local_teid    = 0x1009;
+            e.remote_teid   = 0x2009;
+            memcpy(e.inner_addr, UE5, 4);
+            e.core_side = true;
+            check(gtpu_teid_add(g, &e) == GTPU_OK);
         }
     }
 
@@ -442,6 +456,27 @@ spec ("gtpu_bpf") {
             check(gtpu_stats_read(g, 0x1005, &st) == GTPU_OK);
             check(st.rx_pkts == 1);
         }
+
+        it ("decaps uplink on an anchor-side bearer", !!g) {
+            /* Bearer E is the PGW end (core_side): the G-PDU it receives is
+             * uplink, so the inner dst is the remote host and only the inner
+             * source is the UE. The access-side check above would shoot it. */
+            uint8_t inner[128], in[256], out[4096];
+            size_t  ilen = inner_udp4_from(inner, UE5, HOST, 40000, 5060,
+                                           "uplink-sig");
+            size_t  ln   = gpdu4(in, GTPU_MT_GPDU, 0x1009, 0, inner, ilen);
+
+            uint32_t ret;
+            size_t   olen;
+            check(run_prog(decap_fd, in, ln, out, &olen, &ret) == 0);
+            check(ret == TC_ACT_OK);
+            check(olen == 14 + ilen);
+            check(memcmp(out + 14, inner, ilen) == 0);
+
+            struct gtpu_stats st;
+            check(gtpu_stats_read(g, 0x1009, &st) == GTPU_OK);
+            check(st.rx_pkts == 1);
+        }
     }
 
     context ("encapsulation (TC egress)") {
@@ -487,6 +522,23 @@ spec ("gtpu_bpf") {
             check(gtpu_stats_read(g, 0x1001, &st) == GTPU_OK);
             check(st.tx_pkts == 1);
             check(st.tx_bytes == ilen);
+        }
+
+        it ("wraps downlink toward an anchor-side bearer's UE", !!g) {
+            /* core_side changes the decap check only: the UE address still
+             * keys the LPM entry, so downlink to UE5 rides bearer E. */
+            uint8_t inner[128], in[256], out[4096];
+            size_t  ilen = inner_udp4(inner, UE5, 5060, 40000, "downlink-anchor");
+            size_t  ln   = eth_push(in, 0x0800);
+            memcpy(in + ln, inner, ilen);
+            ln += ilen;
+
+            uint32_t ret;
+            size_t   olen;
+            check(run_prog(encap_fd, in, ln, out, &olen, &ret) == 0);
+            check(ret == TC_ACT_REDIRECT);
+            const uint8_t* gtpu = out + 14 + 20 + 8;
+            check(be16g(gtpu + 6) == 0x2009); /* bearer E's remote TEID */
         }
 
         it ("steers TFT matches onto the dedicated bearer", !!g) {

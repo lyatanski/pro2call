@@ -34,6 +34,19 @@ Each bearer is a TEID pair. RX side, dedicated bearers are just more
 5G QoS flows: a tunnel with `has_qfi` set emits the PDU Session
 Container extension header (type 0x85) carrying the QFI.
 
+## Which end of the bearer
+
+A tunnel's `inner_addr` is the UE address: it keys the encap LPM entry
+and, by default, is the inner destination decap validates. Both hold at
+an **access-side** node, where the bearer's traffic in either direction
+is UE-bound (an SGW decapsulating downlink from the PGW and
+encapsulating it toward the eNB). At the **anchor** — a PGW/UPF — decap
+takes uplink coming *from* the UE, whose inner destination is the remote
+host, so those tunnels set `core_side`: the encap keeps steering on the
+UE address while the decap check is left out. A destination-steered TFT
+(whose `inner_addr` is the filter's remote peer, not the UE) drops the
+same check for the same reason.
+
 ## Userspace
 
 `gtpu_ebpf.h` wraps loading (libbpf skeleton), attachment

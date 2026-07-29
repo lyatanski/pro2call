@@ -59,6 +59,7 @@ static gtpu_tunnel_t tunnel_to_c(const Tunnel& t)
     if (t.remote_addr.empty()) throw Error("tunnel needs remote_addr");
     c.inner_family    = inner_addr_parse(t.ue_addr, c.inner_addr);
     c.inner_prefixlen = t.prefix_len;
+    c.core_side       = t.core_side;
     c.outer_family    = inner_addr_parse(t.remote_addr, c.remote_addr);
     c.remote_port     = t.remote_port;
 

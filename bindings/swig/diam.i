@@ -89,5 +89,27 @@ diam.Session = diam.DiamSession
 /* Message payloads are byte strings: std_string.i maps std::string with
  * its length (embedded NULs preserved), so binary AVP data survives. */
 
+/* ---- fluent returns must not orphan the owner ----------------------
+ *
+ * Builder/Session setters return *this. SWIG's default `out` typemap
+ * wraps that reference in a FRESH, NON-owning userdata — so in the
+ * documented idiom
+ *
+ *     local b = diam.Builder():answer(cmd, app)
+ *
+ * the only owning handle (the constructor's result) is unreachable the
+ * moment answer() returns, and the next GC destroys the Builder while
+ * `b` still points at it. The chain then writes AVPs into the freed
+ * 64 KiB buffer: silent heap corruption, then SIGSEGV in done().
+ *
+ * Hand back the caller's own userdata instead. Ownership and identity
+ * are preserved, so the owner stays reachable for the whole chain. */
+#ifdef SWIGLUA
+%typemap(out) diam::Builder&, diam::Session& %{
+    lua_pushvalue(L, 1);
+    SWIG_arg++;
+%}
+#endif
+
 %include "diam_dict.h"
 %include "diamxx.hpp"

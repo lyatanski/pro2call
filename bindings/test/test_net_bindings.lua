@@ -7,7 +7,8 @@
 --   - loop: timers fire in due order, cancel() suppresses one, a Lua
 --     error in a handler surfaces from run(), fds dispatch on readable;
 --   - UDP socket: ephemeral bind, loopback send/recv (blocking and via
---     the loop), recv timeout, binary-safe payloads, connected send.
+--     the loop), recv timeout, binary-safe payloads, connected send, and
+--     loop-driven output (tx_loop: queue now, batched sendmmsg later).
 --
 -- Everything runs over 127.0.0.1 loopback, so no network or privilege.
 -- Run: LUA_CPATH=<build>/bindings/lua/?.so lua test_net_bindings.lua
@@ -115,6 +116,58 @@ do
     check(peer:recv(1000).data == "connected", "connected send delivers")
 end
 
+-- UDP: loop-driven output (tx_loop) -----------------------------------
+-- After tx_loop() a sendto() only queues the datagram; the loop pushes the
+-- queue out with sendmmsg() at the top of the next iteration, so a whole
+-- burst leaves in one syscall instead of one per datagram.
+do
+    check(net.NET_TXQ_BATCH == 64, "NET_TXQ_BATCH")
+
+    local loop = net.Loop()
+    local srv  = net.UdpSocket("127.0.0.1", 0)
+    local cli  = net.UdpSocket("127.0.0.1", 0)
+    check(not cli:tx_queued(), "output is direct by default")
+    cli:tx_loop(loop)
+    check(cli:tx_queued(), "output moved onto the loop")
+
+    local N = 10
+    for i = 1, N do cli:sendto("q" .. i, "127.0.0.1", srv:local_port()) end
+    check(cli:tx_pending() == N, "sends only queued, no syscall yet")
+    check(srv:recv(-1).timed_out, "nothing on the wire before the loop runs")
+
+    check(cli:tx_flush() == N, "flush pushes the whole queue")
+    check(cli:tx_pending() == 0, "queue drained")
+    check(cli:tx_sent() == N, "sent counted")
+    check(cli:tx_calls() == 1, "the batch went out in ONE sendmmsg call")
+    check(cli:tx_dropped() == 0, "nothing dropped")
+
+    local got = {}
+    for _ = 1, N do
+        local dg = srv:recv(500)
+        if dg.timed_out then break end
+        got[#got + 1] = dg.data
+    end
+    check(#got == N, "every queued datagram arrived")
+    check(got[1] == "q1" and got[N] == "q" .. N, "FIFO order preserved")
+
+    -- the loop flushes on its own, before it polls
+    cli:sendto("via-step", "127.0.0.1", srv:local_port())
+    check(cli:tx_pending() == 1, "queued, awaiting the loop")
+    loop:step(0)
+    check(cli:tx_pending() == 0, "the loop flushed it")
+    check(srv:recv(500).data == "via-step", "loop-flushed datagram arrived")
+
+    -- a connected socket queues without a per-call address
+    local c2 = net.UdpSocket("127.0.0.1", 0)
+    c2:connect("127.0.0.1", srv:local_port())
+    c2:tx_loop(loop)
+    c2:send("connected-queued")
+    check(c2:tx_flush() == 1, "connected send flushes")
+    check(srv:recv(500).data == "connected-queued", "connected queued send delivers")
+
+    check(raises(function() cli:tx_loop(loop) end), "tx_loop twice raises")
+end
+
 -- bad address is rejected ---------------------------------------------
 check(raises(function() net.UdpSocket("not-an-ip", 0) end),
     "bad bind address raises")
@@ -180,6 +233,56 @@ do
         "bad listen address raises")
     check(raises(function() net.stream_connect("127.0.0.1", 1, net.PROTO_TCP, 200) end),
         "connect to a dead port raises")
+end
+
+-- IP pool: scope layout, reuse, reservation ---------------------------
+do
+    local p = net.IpPool("10.45.0.0/16")
+    -- an IPv4 scope keeps its network and broadcast address out
+    check(p:size() == 65534, "scope excludes network and broadcast")
+    check(p:available() == 65534 and p:used() == 0, "empty pool")
+    check(p:alloc() == "10.45.0.1", "first address is the network + 1")
+    check(p:used() == 1, "used counted")
+    check(p:allocated("10.45.0.1"), "allocated address reported")
+    check(not p:allocated("10.45.0.2"), "free address reported")
+    check(p:index_of("10.45.0.1") == 0, "slot numbering starts at the first")
+    check(p:index_of("10.99.0.1") == -1, "foreign address has no slot")
+    check(p:addr_at(65533) == "10.45.255.254", "last slot is broadcast - 1")
+
+    -- a released address waits for the cursor to come round again
+    p:release("10.45.0.1")
+    check(p:used() == 0, "release accounted")
+    check(p:alloc() == "10.45.0.2", "released address is not reused at once")
+    check(raises(function() p:release("10.45.0.1") end), "double release raises")
+    check(raises(function() p:release("10.99.0.1") end),
+        "release of a foreign address raises")
+
+    -- reservation takes a specific address (a gateway) out of circulation
+    p:reserve("10.45.0.3")
+    check(raises(function() p:reserve("10.45.0.3") end), "double reserve raises")
+    check(p:alloc() == "10.45.0.4", "allocation skips the reserved address")
+
+    p:reset()
+    check(p:used() == 0 and p:alloc() == "10.45.0.1", "reset starts over")
+
+    -- explicit range, both ends usable, then exhaustion
+    local r = net.IpPool("10.45.9.10", "10.45.9.12")
+    check(r:size() == 3, "range size")
+    check(r:alloc() == "10.45.9.10" and r:alloc() == "10.45.9.11" and
+          r:alloc() == "10.45.9.12", "range hands out both ends")
+    check(raises(function() return r:alloc() end), "exhausted pool raises")
+    check(r:available() == 0, "no addresses left")
+
+    -- IPv6 scopes use every address of the prefix
+    local v6 = net.IpPool("2001:db8::/120")
+    check(v6:size() == 256, "IPv6 prefix keeps its network address")
+    check(v6:alloc() == "2001:db8::" and v6:alloc() == "2001:db8::1",
+        "IPv6 addresses round-trip as literals")
+    check(v6:index_of("10.45.0.1") == -1, "families stay apart")
+
+    check(raises(function() net.IpPool("10.0.0.0") end), "scope needs a prefix length")
+    check(raises(function() net.IpPool("nope/24") end), "bad scope address raises")
+    check(raises(function() net.IpPool("10.0.0.0/33") end), "bad prefix length raises")
 end
 
 if failed == 0 then

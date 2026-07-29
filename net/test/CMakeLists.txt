@@ -17,3 +17,7 @@ add_test(NAME net_tls COMMAND test_net_tls)
 add_executable(test_net_dns test_net_dns.c)
 target_link_libraries(test_net_dns PRIVATE net task)
 add_test(NAME net_dns COMMAND test_net_dns)
+
+add_executable(test_net_txq test_net_txq.c)
+target_link_libraries(test_net_txq PRIVATE net task)
+add_test(NAME net_txq COMMAND test_net_txq)

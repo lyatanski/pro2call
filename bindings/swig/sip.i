@@ -61,4 +61,19 @@
 /* Message bodies are byte strings: std_string.i maps std::string with
  * its length (embedded NULs preserved), so binary payloads survive. */
 
+/* ---- fluent returns must not orphan the owner ----------------------
+ *
+ * See the same block in swig/diam.i. The setters return *this; SWIG's
+ * default `out` typemap wraps that in a fresh NON-owning userdata, so
+ * `sip.Builder():request(...)` leaves the only owning handle
+ * unreachable and the next GC frees the object mid-chain. Return the
+ * caller's own userdata so ownership survives the chain. */
+#ifdef SWIGLUA
+%typemap(out) sip::Builder&, sip::Transaction&, sip::Registration&,
+              sip::AuthChallenge& %{
+    lua_pushvalue(L, 1);
+    SWIG_arg++;
+%}
+#endif
+
 %include "sipxx.hpp"

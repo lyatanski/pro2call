@@ -75,6 +75,22 @@ int net_addr_eq(const net_addr* a, const net_addr* b)
     return 0;
 }
 
+void net_addr_map6(net_addr* out, const net_addr* a)
+{
+    if (a->sa.sa_family != AF_INET) {
+        if (out != a) *out = *a;
+        return;
+    }
+    net_addr t;
+    memset(&t, 0, sizeof t);
+    t.v6.sin6_family           = AF_INET6;
+    t.v6.sin6_port             = a->v4.sin_port;
+    t.v6.sin6_addr.s6_addr[10] = 0xff;
+    t.v6.sin6_addr.s6_addr[11] = 0xff;
+    memcpy(&t.v6.sin6_addr.s6_addr[12], &a->v4.sin_addr, 4);
+    *out = t;
+}
+
 const char* net_addr_str(const net_addr* a, char buf[NET_ADDR_STRLEN])
 {
     char ip[INET6_ADDRSTRLEN] = "?";

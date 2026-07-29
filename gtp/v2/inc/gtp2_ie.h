@@ -33,12 +33,14 @@ typedef enum {
 
 /* Cause values — TS 29.274 §8.4, Table 8.4-1 (subset). */
 typedef enum {
-    GTP2_CAUSE_REQUEST_ACCEPTED           = 16,
-    GTP2_CAUSE_REQUEST_ACCEPTED_PARTIALLY = 17,
-    GTP2_CAUSE_NEW_PDN_TYPE_PREFERENCE    = 18,
-    GTP2_CAUSE_CONTEXT_NOT_FOUND          = 64,
-    GTP2_CAUSE_MANDATORY_IE_MISSING       = 70,
-    GTP2_CAUSE_REQUEST_REJECTED           = 94
+    GTP2_CAUSE_REQUEST_ACCEPTED                   = 16,
+    GTP2_CAUSE_REQUEST_ACCEPTED_PARTIALLY         = 17,
+    GTP2_CAUSE_NEW_PDN_TYPE_PREFERENCE            = 18,
+    GTP2_CAUSE_CONTEXT_NOT_FOUND                  = 64,
+    GTP2_CAUSE_MANDATORY_IE_MISSING               = 70,
+    GTP2_CAUSE_NO_RESOURCES_AVAILABLE             = 73,
+    GTP2_CAUSE_ALL_DYNAMIC_ADDRESSES_ARE_OCCUPIED = 84,
+    GTP2_CAUSE_REQUEST_REJECTED                   = 94
 } gtp2_cause_t;
 
 /* RAT types — TS 29.274 §8.17. */
