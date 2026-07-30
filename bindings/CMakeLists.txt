@@ -4,7 +4,9 @@
 #   gtp,   gtpxx,   swig/gtp.i,   GTP stack
 #   ipsec, ipsecxx, swig/ipsec.i, IPsec/XFRM
 #   sip,   sipxx,   swig/sip.i,   SIP stack
+#   sdp,   sdpxx,   swig/sdp.i,   SDP codec (offer/answer)
 #   diam,  diamxx,  swig/diam.i,  Diameter stack
+#   rtp,   rtpxx,   swig/rtp.i,   RTP/RTCP media session
 #   net,   netxx,   swig/net.i,   event loop + UDP socket
 #
 # Optional: without SWIG or lua's development files the whole directory is skipped
@@ -29,7 +31,7 @@ include(UseSWIG)
 
 # Everything linked into an extension module must be PIC. Applied here so
 # the C libraries pay for it only when bindings build.
-foreach(dep task net gtp2 gtpu xfrm rtnl sip diam)
+foreach(dep task net gtp2 gtpu xfrm rtnl sip sdp diam rtp)
     set_target_properties(${dep} PROPERTIES POSITION_INDEPENDENT_CODE ON)
 endforeach()
 
@@ -52,7 +54,7 @@ set_property(SOURCE swig/gtp.i PROPERTY USE_TARGET_INCLUDE_DIRECTORIES ON)
 # edits are missed. gtp.i %imports netxx.hpp for the shared net::Loop and
 # %includes the two gtp2 headers for their enums and constants.
 set_property(SOURCE swig/gtp.i PROPERTY DEPENDS
-    cxx/inc/gtpxx.hpp cxx/inc/netxx.hpp
+    swig/common.i cxx/inc/gtpxx.hpp cxx/inc/netxx.hpp
     ${CMAKE_SOURCE_DIR}/gtp/v2/inc/gtp2.h
     ${CMAKE_SOURCE_DIR}/gtp/v2/inc/gtp2_ie.h)
 # The CMake target is gtp_lua because `gtp` is the Python target; the
@@ -90,7 +92,7 @@ set_property(SOURCE swig/net.i PROPERTY USE_TARGET_INCLUDE_DIRECTORIES ON)
 # net_txq.h too: net.i mirrors NET_TXQ_BATCH as a %constant, so a change
 # there must re-run SWIG rather than leave the Lua table stale.
 set_property(SOURCE swig/net.i PROPERTY DEPENDS
-    cxx/inc/netxx.hpp
+    swig/common.i cxx/inc/netxx.hpp
     ${CMAKE_SOURCE_DIR}/net/inc/net_txq.h)
 # The CMake target is net_lua because `net` is the C library; the
 # loadable module is still net.so for `require("net")`.
@@ -120,7 +122,8 @@ set_target_properties(ipsecxx PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 set_property(SOURCE swig/ipsec.i PROPERTY CPLUSPLUS ON)
 set_property(SOURCE swig/ipsec.i PROPERTY USE_TARGET_INCLUDE_DIRECTORIES ON)
-set_property(SOURCE swig/ipsec.i PROPERTY DEPENDS cxx/inc/ipsecxx.hpp)
+set_property(SOURCE swig/ipsec.i PROPERTY DEPENDS
+    swig/common.i cxx/inc/ipsecxx.hpp)
 swig_add_library(ipsec
     TYPE MODULE
     LANGUAGE lua
@@ -150,7 +153,7 @@ set_property(SOURCE swig/sip.i PROPERTY USE_TARGET_INCLUDE_DIRECTORIES ON)
 # in (sip_fsm.h transactions, sip_dialog.h dialog/usage machines) are not
 # tracked automatically, so declare them or their edits are missed.
 set_property(SOURCE swig/sip.i PROPERTY DEPENDS
-    cxx/inc/sipxx.hpp
+    swig/common.i cxx/inc/sipxx.hpp
     ${CMAKE_SOURCE_DIR}/sip/inc/sip_fsm.h
     ${CMAKE_SOURCE_DIR}/sip/inc/sip_dialog.h)
 # The CMake target is sip_lua because `sip` is the C library; the
@@ -170,6 +173,74 @@ if(NOT MSVC)
     target_compile_options(sip_lua PRIVATE -w)   # generated wrapper code
 endif()
 
+# --- sdp (sdpxx facade)
+# The offer/answer half of a call: sip carries the body, this parses and
+# builds it. Nothing but the C codec behind it — no loop, no socket.
+add_library(sdpxx STATIC cxx/src/sdp.cpp)
+target_include_directories(sdpxx PUBLIC cxx/inc)
+target_link_libraries(sdpxx PUBLIC sdp)
+set_target_properties(sdpxx PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+set_property(SOURCE swig/sdp.i PROPERTY CPLUSPLUS ON)
+set_property(SOURCE swig/sdp.i PROPERTY USE_TARGET_INCLUDE_DIRECTORIES ON)
+# The C codec header carries the enums and pool bounds the facade
+# mirrors, so a change there must re-run SWIG rather than leave the Lua
+# constant table stale.
+set_property(SOURCE swig/sdp.i PROPERTY DEPENDS
+    swig/common.i cxx/inc/sdpxx.hpp
+    ${CMAKE_SOURCE_DIR}/sdp/inc/sdp.h)
+# The CMake target is sdp_lua because `sdp` is the C library; the
+# loadable module is still sdp.so for `require("sdp")`.
+swig_add_library(sdp_lua
+    TYPE MODULE
+    LANGUAGE lua
+    OUTPUT_DIR ${CMAKE_CURRENT_BINARY_DIR}/lua
+    SOURCES swig/sdp.i)
+set_target_properties(sdp_lua PROPERTIES
+    PREFIX ""
+    OUTPUT_NAME sdp
+    LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/lua)
+target_include_directories(sdp_lua PRIVATE ${LUA_INCLUDE_DIR})
+target_link_libraries(sdp_lua PRIVATE sdpxx ${LUA_LIBRARIES})
+if(NOT MSVC)
+    target_compile_options(sdp_lua PRIVATE -w)   # generated wrapper code
+endif()
+
+# --- rtp (rtpxx facade)
+# The media session (cxx/src/rtp.cpp) registers its socket pair and its
+# report timer with net::Loop from the netxx facade — the same loop the
+# gtp session layer uses — so rtpxx links netxx (and the C net library
+# behind it) beside the rtp codec.
+add_library(rtpxx STATIC cxx/src/rtp.cpp)
+target_include_directories(rtpxx PUBLIC cxx/inc)
+target_link_libraries(rtpxx PUBLIC rtp netxx net task)
+set_target_properties(rtpxx PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+set_property(SOURCE swig/rtp.i PROPERTY CPLUSPLUS ON)
+set_property(SOURCE swig/rtp.i PROPERTY USE_TARGET_INCLUDE_DIRECTORIES ON)
+# rtp.i %imports netxx.hpp for the shared net::Loop; the C codec header
+# carries the payload types and RTCP constants the facade mirrors, so a
+# change there must re-run SWIG rather than leave the Lua table stale.
+set_property(SOURCE swig/rtp.i PROPERTY DEPENDS
+    swig/common.i cxx/inc/rtpxx.hpp cxx/inc/netxx.hpp
+    ${CMAKE_SOURCE_DIR}/rtp/inc/rtp.h)
+# The CMake target is rtp_lua because `rtp` is the C library; the
+# loadable module is still rtp.so for `require("rtp")`.
+swig_add_library(rtp_lua
+    TYPE MODULE
+    LANGUAGE lua
+    OUTPUT_DIR ${CMAKE_CURRENT_BINARY_DIR}/lua
+    SOURCES swig/rtp.i)
+set_target_properties(rtp_lua PROPERTIES
+    PREFIX ""
+    OUTPUT_NAME rtp
+    LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/lua)
+target_include_directories(rtp_lua PRIVATE ${LUA_INCLUDE_DIR})
+target_link_libraries(rtp_lua PRIVATE rtpxx ${LUA_LIBRARIES})
+if(NOT MSVC)
+    target_compile_options(rtp_lua PRIVATE -w)   # generated wrapper code
+endif()
+
 # --- diam (diamxx facade)
 add_library(diamxx STATIC cxx/src/diam.cpp)
 target_include_directories(diamxx PUBLIC cxx/inc)
@@ -183,7 +254,7 @@ set_property(SOURCE swig/diam.i PROPERTY USE_TARGET_INCLUDE_DIRECTORIES ON)
 # change rebuilds the C library without re-running SWIG, leaving the Lua
 # module's constant table stale.
 set_property(SOURCE swig/diam.i PROPERTY DEPENDS
-    cxx/inc/diamxx.hpp ${CMAKE_BINARY_DIR}/diam/gen/inc/diam_dict.h)
+    swig/common.i cxx/inc/diamxx.hpp ${CMAKE_BINARY_DIR}/diam/gen/inc/diam_dict.h)
 # The CMake target is diam_lua because `diam` is the C library; the
 # loadable module is still diam.so for `require("diam")`.
 swig_add_library(diam_lua
@@ -198,15 +269,23 @@ set_target_properties(diam_lua PROPERTIES
 target_include_directories(diam_lua PRIVATE ${LUA_INCLUDE_DIR})
 target_link_libraries(diam_lua PRIVATE diamxx ${LUA_LIBRARIES})
 # diam.i %includes diam_dict.h, which the diam target generates into its
-# build tree; make the SWIG step wait for it.
-add_dependencies(diam_lua_swig_compilation diam)
+# build tree; make the SWIG step wait for it. UseSWIG only creates the
+# <name>_swig_compilation target for generators that need explicit
+# timestamps (Makefiles); Ninja tracks the depfile itself and the target
+# is absent, so order the module target instead — either way the SWIG
+# command inherits the ordering dependency.
+if(TARGET diam_lua_swig_compilation)
+    add_dependencies(diam_lua_swig_compilation diam)
+else()
+    add_dependencies(diam_lua diam)
+endif()
 if(NOT MSVC)
     target_compile_options(diam_lua PRIVATE -w)   # generated wrapper code
 endif()
 
 # SWIG wrapper code is generated; keep clang-tidy (ENABLE_CLANG_TIDY)
 # off those targets. The facade libraries above stay covered.
-foreach(mod gtp_lua ipsec sip_lua diam_lua net_lua)
+foreach(mod gtp_lua ipsec sip_lua sdp_lua diam_lua rtp_lua net_lua)
     set_target_properties(${mod} PROPERTIES C_CLANG_TIDY "" CXX_CLANG_TIDY "")
 endforeach()
 
@@ -243,11 +322,28 @@ if(BUILD_TESTING AND Lua_FOUND AND LUA_INTERPRETER)
     set_tests_properties(bindings_lua_net PROPERTIES
         ENVIRONMENT "LUA_CPATH=${CMAKE_CURRENT_BINARY_DIR}/lua/?.so")
 
-    # examples/sdp_min.lua is pure Lua (no bindings module), so it needs
-    # LUA_PATH at the examples directory rather than LUA_CPATH.
-    add_test(NAME bindings_lua_sdp_min
+    # Two RTP sessions on ONE net.Loop shared with a gtp.Endpoint — the
+    # loop unification is the point of the test as much as the codec is.
+    add_test(NAME bindings_lua_rtp
              COMMAND ${LUA_INTERPRETER}
-                     ${CMAKE_CURRENT_SOURCE_DIR}/test/test_sdp_min.lua)
-    set_tests_properties(bindings_lua_sdp_min PROPERTIES
-        ENVIRONMENT "LUA_PATH=${CMAKE_CURRENT_SOURCE_DIR}/examples/?.lua")
+                     ${CMAKE_CURRENT_SOURCE_DIR}/test/test_rtp_bindings.lua)
+    set_tests_properties(bindings_lua_rtp PROPERTIES
+        ENVIRONMENT "LUA_CPATH=${CMAKE_CURRENT_BINARY_DIR}/lua/?.so")
+
+    add_test(NAME bindings_lua_sdp
+             COMMAND ${LUA_INTERPRETER}
+                     ${CMAKE_CURRENT_SOURCE_DIR}/test/test_sdp_bindings.lua)
+    set_tests_properties(bindings_lua_sdp PROPERTIES
+        ENVIRONMENT "LUA_CPATH=${CMAKE_CURRENT_BINARY_DIR}/lua/?.so")
+
+    # sdp and sip both wrap a class called Msg and one called Builder;
+    # SWIG's Lua type registry is shared across modules and keyed by the
+    # unscoped name, so loading both into one interpreter is exactly the
+    # collision swig/sdp.i renames around. Test it, or the next module
+    # to add a Msg reintroduces it silently.
+    add_test(NAME bindings_lua_sdp_sip
+             COMMAND ${LUA_INTERPRETER}
+                     ${CMAKE_CURRENT_SOURCE_DIR}/test/test_sdp_sip_coexist.lua)
+    set_tests_properties(bindings_lua_sdp_sip PROPERTIES
+        ENVIRONMENT "LUA_CPATH=${CMAKE_CURRENT_BINARY_DIR}/lua/?.so")
 endif()

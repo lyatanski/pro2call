@@ -15,9 +15,11 @@
 #include "gtpxx.hpp"
 
 #include <arpa/inet.h>
+#include <algorithm>
 #include <cstring>
 #include <map>
 #include <memory>
+#include <unordered_map>
 #include <vector>
 
 namespace gtp
@@ -168,6 +170,12 @@ struct Endpoint::Impl {
 
     std::vector<std::unique_ptr<Session>>    sessions;
     std::map<uint32_t, std::unique_ptr<Txn>> txns; /* keyed by request seq */
+
+    /* Every GTP-C response resolves its session by local TEID, so a scan
+     * of `sessions` made a run O(N^2) — and a cache-hostile one, chasing
+     * unique_ptrs. local_teid_ is fixed at creation, so this index needs
+     * maintaining only where a session is added or purged. */
+    std::unordered_map<uint32_t, Session*> by_teid;
 
     net_loop* lp() const
     {
@@ -377,7 +385,14 @@ Session* Endpoint::create_session(const CreateSessionRequest& req_in,
                                   const std::string& peer_host,
                                   uint16_t           peer_port)
 {
-    CreateSessionRequest req = req_in;
+    /* The session keeps the request (Session::request(), default_ebi(),
+     * and the bearer list the response path matches against), so copy
+     * the caller's straight into its final home and fill the generated
+     * fields there — a separate local would be a second full copy of a
+     * struct holding vectors and strings, per session. */
+    auto                  s   = std::make_unique<Session>();
+    CreateSessionRequest& req = s->req_;
+    req                       = req_in;
     if (req.sequence == 0) req.sequence = next_seq();
 
     /* Fill the sender F-TEID: a fully-default one also gets if_type S11
@@ -397,18 +412,19 @@ Session* Endpoint::create_session(const CreateSessionRequest& req_in,
         else sf.addr6 = local_host();
     }
 
-    auto s        = std::make_unique<Session>();
-    s->ep_        = this;
-    s->state_     = Session::CREATING;
+    s->ep_         = this;
+    s->state_      = Session::CREATING;
     s->local_teid_ = sf.teid;
-    s->peer_host_ = peer_host;
-    s->peer_port_ = peer_port;
-    s->req_       = req;
-    Session* ret  = s.get();
+    s->peer_host_  = peer_host;
+    s->peer_port_  = peer_port;
+    Session* ret   = s.get();
     impl_->sessions.push_back(std::move(s));
+    /* emplace, not operator[]: a caller that reuses a local TEID keeps
+     * the first session resolvable, as the old linear scan did. */
+    impl_->by_teid.emplace(ret->local_teid_, ret);
 
-    start_txn(req.sequence, GTP2_MT_CREATE_SESSION_REQUEST, req.encode(),
-              ret->local_teid_, peer_host, peer_port);
+    start_txn(ret->req_.sequence, GTP2_MT_CREATE_SESSION_REQUEST,
+              ret->req_.encode(), ret->local_teid_, peer_host, peer_port);
     return ret;
 }
 
@@ -458,9 +474,8 @@ void Endpoint::send_raw(const Bytes& wire, const std::string& host,
 
 Session* Endpoint::session_by_teid(uint32_t local_teid)
 {
-    for (auto& s : impl_->sessions)
-        if (s->local_teid_ == local_teid) return s.get();
-    return nullptr;
+    auto it = impl_->by_teid.find(local_teid);
+    return it == impl_->by_teid.end() ? nullptr : it->second;
 }
 
 std::vector<Session*> Endpoint::sessions()
@@ -474,12 +489,23 @@ std::vector<Session*> Endpoint::sessions()
 
 void Endpoint::purge()
 {
-    for (auto it = impl_->sessions.begin(); it != impl_->sessions.end();) {
-        Session::State st = (*it)->state_;
-        if (st == Session::DELETED || st == Session::FAILED)
-            it = impl_->sessions.erase(it);
-        else ++it;
-    }
+    /* Partition then erase once: erasing from the middle of the vector
+     * per victim shifted the tail every time, so purging a 10k-session
+     * endpoint was O(N^2). */
+    auto& v  = impl_->sessions;
+    auto  it = std::remove_if(v.begin(), v.end(),
+                              [this](const std::unique_ptr<Session>& s) {
+             if (s->state_ != Session::DELETED && s->state_ != Session::FAILED)
+                 return false;
+             /* Drop the TEID index entry only if it points at *this*
+              * session: with a reused local TEID the entry belongs to
+              * whichever session claimed it first. */
+             auto mit = impl_->by_teid.find(s->local_teid_);
+             if (mit != impl_->by_teid.end() && mit->second == s.get())
+                 impl_->by_teid.erase(mit);
+             return true;
+                              });
+    v.erase(it, v.end());
 }
 
 /* ---- receive path ---- */
@@ -591,8 +617,10 @@ bool Endpoint::handle_response(const Bytes& wire, const gtp2_hdr_t& h,
              * and a Delete Session is answered "Context Not Found" (cause 64). */
             if (rsp.has_sender_fteid) s->remote_teid_ = rsp.sender_fteid.teid;
             else if (rsp.has_pgw_fteid) s->remote_teid_ = rsp.pgw_fteid.teid;
-            s->tunnels_ = tunnels_from(
-                CreateSessionRequest::decode(t->wire).bearers, rsp.bearers);
+            /* s->req_ is the request we sent; decoding t->wire again just
+             * to read its bearer list was a full GTP-C decode per
+             * response. */
+            s->tunnels_ = tunnels_from(s->req_.bearers, rsp.bearers);
         } else {
             s->state_ = Session::FAILED;
         }
@@ -605,8 +633,7 @@ bool Endpoint::handle_response(const Bytes& wire, const gtp2_hdr_t& h,
     case GTP2_MT_MODIFY_BEARER_RESPONSE: {
         ModifyBearerResponse rsp = ModifyBearerResponse::decode(wire);
         if (rsp.cause == GTP2_CAUSE_REQUEST_ACCEPTED)
-            s->tunnels_ = tunnels_from(
-                ModifyBearerRequest::decode(t->wire).bearers, rsp.bearers);
+            s->tunnels_ = tunnels_from(s->mod_bearers_, rsp.bearers);
         if (handler_) handler_->on_modify_bearer_response(*s, rsp);
         if (rsp.cause == GTP2_CAUSE_REQUEST_ACCEPTED && handler_)
             for (const UserPlaneTunnel& t2 : s->tunnels_)
@@ -638,6 +665,7 @@ void Session::modify_bearer(const ModifyBearerRequest& req_in)
     ModifyBearerRequest req = req_in;
     req.teid                = remote_teid_;
     req.sequence            = ep_->next_seq();
+    mod_bearers_            = req.bearers; /* the response path matches these */
     ep_->start_txn(req.sequence, GTP2_MT_MODIFY_BEARER_REQUEST, req.encode(),
                    local_teid_, peer_host_, peer_port_);
 }

@@ -2,6 +2,7 @@
 #define SIPXX_HPP
 
 #include <cstdint>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -226,13 +227,25 @@ std::string method_name(int method);
 std::string hdr_name(int hdr);
 std::string status_phrase(int status);
 
-/* Builds one message into an internal fixed buffer (64 KiB — the
- * practical ceiling for a SIP message); done() returns the wire bytes.
+/* Builds one message into an internal fixed buffer; done() returns the
+ * wire bytes. The buffer is allocated once and never zeroed, so reusing
+ * one Builder across messages costs no allocation at all — that is the
+ * intended usage on a hot path. request()/response() reset the buffer
+ * before writing the start line, so a build that throws part-way cannot
+ * leak stale bytes into the next message.
+ *
+ * The default capacity covers any practical SIP message (a REGISTER is
+ * ~600 B and SIP-over-UDP is MTU-bound); pass an explicit cap for
+ * outsized bodies. Overflow is sticky and surfaces as an error from the
+ * offending call, so a truncated message is never returned.
+ *
  * Calls chain: Builder():request(...):header(...):body(...):done(). */
 class Builder
 {
   public:
-    Builder();
+    enum { DEFAULT_CAP = 8 * 1024 };
+
+    explicit Builder(size_t cap = DEFAULT_CAP);
 
     Builder& request(int method, const std::string& uri);
     Builder& response(int status, const std::string& reason = "");
@@ -245,9 +258,16 @@ class Builder
      * message. The Builder resets and can build the next message. */
     std::string done(const std::string& body = "");
 
+    size_t capacity() const { return cap_; }
+
   private:
-    std::vector<char> buf_;
-    sip_wbuf_t        w_;
+    void reset() { sip_wbuf_init(&w_, buf_.get(), cap_); }
+
+    /* Raw array, not std::vector<char>: vector value-initializes, which
+     * costs a full memset of the capacity on every construction. */
+    std::unique_ptr<char[]> buf_;
+    size_t                  cap_;
+    sip_wbuf_t              w_;
 };
 
 /* ---- Transaction state machines (RFC 3261 §17) ---- */
@@ -315,6 +335,14 @@ class Transaction
     int         state() const;
     std::string state_name() const;
     bool        terminated() const;
+
+    /* Re-arm for the next transaction: back to SIP_TRANS_ST_INIT, same
+     * kind. A transaction is per-request, so a client that sends a
+     * second REGISTER needs a second machine — this lets one object
+     * serve them in turn rather than allocating a machine per request,
+     * which is what the per-request cost is on a load-generating path.
+     * Only the state is reset; nothing else is carried. */
+    Transaction& restart();
 
     /* Inject a raw TE_* event. Throws Error on an illegal move. */
     Transaction& event(int ev);

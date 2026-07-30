@@ -36,6 +36,9 @@
 %include <std_vector.i>
 %include <exception.i>
 
+/* shared move-on-value-return typemap */
+%include "common.i"
+
 /* ---- exceptions: sip::Error / std::exception -> Lua error ---- */
 
 %exception {
@@ -69,8 +72,8 @@
  * unreachable and the next GC frees the object mid-chain. Return the
  * caller's own userdata so ownership survives the chain. */
 #ifdef SWIGLUA
-%typemap(out) sip::Builder&, sip::Transaction&, sip::Registration&,
-              sip::AuthChallenge& %{
+%typemap(out) sip::Builder&, sip::Transaction&, sip::Dialog&,
+              sip::Registration&, sip::AuthChallenge& %{
     lua_pushvalue(L, 1);
     SWIG_arg++;
 %}

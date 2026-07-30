@@ -2,6 +2,7 @@
 #define DIAMXX_HPP
 
 #include <cstdint>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -168,11 +169,16 @@ class Builder
   private:
     void ensure_started(const char* op);
 
-    std::vector<uint8_t> buf_;
-    diam_wbuf_t          w_;
-    diam_hdr_t           hdr_;
-    bool                 started_ = false;
-    std::vector<int>     groups_;
+    /* Raw array, not std::vector<uint8_t>: vector value-initializes,
+     * which costs a full memset of the capacity per construction.
+     * request()/answer() already re-init the write buffer, so reusing
+     * one Builder across messages costs no allocation at all. */
+    std::unique_ptr<uint8_t[]> buf_;
+    size_t                     cap_;
+    diam_wbuf_t                w_;
+    diam_hdr_t                 hdr_;
+    bool                       started_ = false;
+    std::vector<int>           groups_;
 };
 
 /* ---- Session state machines (RFC 6733 §8.1) ---- */

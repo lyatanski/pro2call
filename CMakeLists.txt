@@ -5,6 +5,10 @@ set(CMAKE_C_STANDARD 99)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS OFF)
 
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+    set(CMAKE_BUILD_TYPE RelWithDebInfo CACHE STRING "" FORCE)
+endif()
+
 if(MSVC)
     add_compile_options(/W4)
     add_compile_definitions(API_EXPORT=__declspec(dllexport))
@@ -25,6 +29,7 @@ add_subdirectory(gtp)
 add_subdirectory(diam)
 add_subdirectory(net)
 add_subdirectory(sip)
+add_subdirectory(sdp)
 add_subdirectory(rtp)
 add_subdirectory(nlmsg)
 

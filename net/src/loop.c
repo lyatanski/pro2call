@@ -2,6 +2,7 @@
 #include "net_loop.h"
 
 #include <errno.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/epoll.h>
@@ -16,11 +17,39 @@ struct fdrec {
     void*    ud;
 };
 
+/* Timer handles.
+ *
+ * Cancel has to be O(1): scripts arm and disarm a protocol deadline on
+ * every event, so scanning the heap for the id cost ~7 us per cancel at
+ * 16k outstanding timers and got worse as concurrency rose.
+ *
+ * So a handle is not a bare counter but a (generation, slot) pair. The
+ * slot indexes l->slot, which records where that timer currently sits in
+ * the heap; every heap move writes the position back, so cancel decodes
+ * the slot and removes the entry directly. The generation is bumped when
+ * a slot is released, which keeps the handle of a cancelled or already
+ * fired timer distinguishable from a live timer that has since reused
+ * the slot — so a second cancel of the same id still reports NET_ERR.
+ *
+ * Generations start at 1 and skip 0 on wrap, so a handle is never 0
+ * (net_loop_after reserves 0 for failure). */
+#define TMR_NOPOS         ((size_t)-1)
+#define TMR_NOSLOT        UINT32_MAX
+#define TMR_SLOT(id)      ((uint32_t)((id) & 0xffffffffu))
+#define TMR_GEN(id)       ((uint32_t)((id) >> 32))
+#define TMR_ID(gen, slot) (((uint64_t)(gen) << 32) | (uint32_t)(slot))
+
 struct tmr {
     uint64_t  due;
-    uint64_t  id;
+    uint32_t  slot; /* back-pointer into l->slot */
     net_tmr_f cb;
     void*     ud;
+};
+
+struct tmrslot {
+    size_t   pos;  /* index in the heap, or TMR_NOPOS when not armed */
+    uint32_t gen;  /* bumped on release; 0 is never live */
+    uint32_t next; /* free-list link while not armed */
 };
 
 struct pre {
@@ -29,16 +58,18 @@ struct pre {
 };
 
 struct net_loop {
-    int           ep;
-    int           stop;
-    struct fdrec* fds; /* indexed by fd: O(1) dispatch, no lifetime races */
-    int           cap;
-    struct tmr*   tmr; /* binary min-heap on due */
-    size_t        ntmr, ctmr;
-    uint64_t      seq;
-    struct pre*   pre; /* pre-poll hooks, in registration order */
-    size_t        npre, cpre;
-    int           pre_gaps; /* a hook was dropped: compact after dispatch */
+    int             ep;
+    int             stop;
+    struct fdrec*   fds; /* indexed by fd: O(1) dispatch, no lifetime races */
+    int             cap;
+    struct tmr*     tmr; /* binary min-heap on due */
+    size_t          ntmr, ctmr;
+    struct tmrslot* slot; /* handle table: heap position + generation */
+    size_t          cslot;
+    uint32_t        freeslot; /* head of the free-slot list */
+    struct pre*     pre;      /* pre-poll hooks, in registration order */
+    size_t          npre, cpre;
+    int             pre_gaps; /* a hook was dropped: compact after dispatch */
 };
 
 uint64_t net_now_ms(void)
@@ -64,7 +95,8 @@ net_loop* net_loop_new(void)
 {
     net_loop* l = calloc(1, sizeof *l);
     if (!l) return NULL;
-    l->ep = epoll_create1(EPOLL_CLOEXEC);
+    l->freeslot = TMR_NOSLOT; /* 0 is a valid slot index, so not calloc's 0 */
+    l->ep       = epoll_create1(EPOLL_CLOEXEC);
     if (l->ep < 0) {
         free(l);
         return NULL;
@@ -78,6 +110,7 @@ void net_loop_free(net_loop* l)
     close(l->ep);
     free(l->fds);
     free(l->tmr);
+    free(l->slot);
     free(l->pre);
     free(l);
 }
@@ -169,26 +202,80 @@ static void pre_compact(net_loop* l)
 
 /* --- timer heap ------------------------------------------------------ */
 
-static void tmr_up(struct tmr* h, size_t i)
+/* Record where heap entry i now lives, so its handle stays resolvable.
+ * Every write to l->tmr[i] must be followed by one of these. */
+static void tmr_place(net_loop* l, size_t i)
 {
-    struct tmr t = h[i];
-    for (; i && t.due < h[(i - 1) / 2].due; i = (i - 1) / 2)
-        h[i] = h[(i - 1) / 2];
-    h[i] = t;
+    l->slot[l->tmr[i].slot].pos = i;
 }
 
-static void tmr_down(struct tmr* h, size_t n, size_t i)
+static void tmr_up(net_loop* l, size_t i)
 {
-    struct tmr t = h[i];
+    struct tmr* h = l->tmr;
+    struct tmr  t = h[i];
+    for (; i && t.due < h[(i - 1) / 2].due; i = (i - 1) / 2) {
+        h[i] = h[(i - 1) / 2];
+        tmr_place(l, i);
+    }
+    h[i] = t;
+    tmr_place(l, i);
+}
+
+static void tmr_down(net_loop* l, size_t n, size_t i)
+{
+    struct tmr* h = l->tmr;
+    struct tmr  t = h[i];
     for (;;) {
         size_t c = 2 * i + 1;
         if (c >= n) break;
         if (c + 1 < n && h[c + 1].due < h[c].due) c++;
         if (t.due <= h[c].due) break;
         h[i] = h[c];
-        i    = c;
+        tmr_place(l, i);
+        i = c;
     }
     h[i] = t;
+    tmr_place(l, i);
+}
+
+/* Pull heap entry i out, release its slot and restore the heap. */
+static void tmr_remove(net_loop* l, size_t i)
+{
+    uint32_t s = l->tmr[i].slot;
+
+    l->slot[s].pos = TMR_NOPOS;
+    if (++l->slot[s].gen == 0) l->slot[s].gen = 1;
+    l->slot[s].next = l->freeslot;
+    l->freeslot     = s;
+
+    l->tmr[i] = l->tmr[--l->ntmr]; /* self-assign when i was the last */
+    if (i < l->ntmr) {
+        tmr_place(l, i);
+        tmr_down(l, l->ntmr, i);
+        tmr_up(l, i);
+    }
+}
+
+/* Take a free slot, growing the table when the free list runs dry. */
+static uint32_t tmr_slot_alloc(net_loop* l)
+{
+    if (l->freeslot == TMR_NOSLOT) {
+        size_t c = l->cslot ? l->cslot * 2 : 16;
+        if (c >= TMR_NOSLOT) return TMR_NOSLOT;
+        struct tmrslot* s = realloc(l->slot, c * sizeof *s);
+        if (!s) return TMR_NOSLOT;
+        l->slot = s;
+        for (size_t i = l->cslot; i < c; i++) {
+            l->slot[i].pos  = TMR_NOPOS;
+            l->slot[i].gen  = 1;
+            l->slot[i].next = i + 1 < c ? (uint32_t)(i + 1) : TMR_NOSLOT;
+        }
+        l->freeslot = (uint32_t)l->cslot;
+        l->cslot    = c;
+    }
+    uint32_t s  = l->freeslot;
+    l->freeslot = l->slot[s].next;
+    return s;
 }
 
 uint64_t net_loop_after(net_loop* l, uint64_t ms, net_tmr_f cb, void* ud)
@@ -201,27 +288,28 @@ uint64_t net_loop_after(net_loop* l, uint64_t ms, net_tmr_f cb, void* ud)
         l->tmr  = h;
         l->ctmr = c;
     }
-    struct tmr* t = &l->tmr[l->ntmr];
-    t->due        = net_now_ms() + ms;
-    t->id         = ++l->seq;
-    t->cb         = cb;
-    t->ud         = ud;
-    tmr_up(l->tmr, l->ntmr++);
-    return l->seq;
+    uint32_t s = tmr_slot_alloc(l);
+    if (s == TMR_NOSLOT) return 0;
+
+    struct tmr* t  = &l->tmr[l->ntmr];
+    t->due         = net_now_ms() + ms;
+    t->slot        = s;
+    t->cb          = cb;
+    t->ud          = ud;
+    l->slot[s].pos = l->ntmr;
+    tmr_up(l, l->ntmr++);
+    return TMR_ID(l->slot[s].gen, s);
 }
 
 int net_loop_cancel(net_loop* l, uint64_t id)
 {
-    for (size_t i = 0; i < l->ntmr; i++) {
-        if (l->tmr[i].id != id) continue;
-        l->tmr[i] = l->tmr[--l->ntmr];
-        if (i < l->ntmr) {
-            tmr_down(l->tmr, l->ntmr, i);
-            tmr_up(l->tmr, i);
-        }
-        return NET_OK;
-    }
-    return NET_ERR;
+    uint32_t s = TMR_SLOT(id);
+    if (s >= l->cslot) return NET_ERR;
+    if (l->slot[s].gen != TMR_GEN(id)) return NET_ERR; /* stale handle */
+    size_t i = l->slot[s].pos;
+    if (i == TMR_NOPOS) return NET_ERR; /* not armed */
+    tmr_remove(l, i);
+    return NET_OK;
 }
 
 /* --- dispatch --------------------------------------------------------- */
@@ -253,8 +341,7 @@ int net_loop_step(net_loop* l, int timeout_ms)
         uint64_t now = net_now_ms();
         while (l->ntmr && l->tmr[0].due <= now) {
             struct tmr due = l->tmr[0];
-            l->tmr[0]      = l->tmr[--l->ntmr];
-            if (l->ntmr) tmr_down(l->tmr, l->ntmr, 0);
+            tmr_remove(l, 0);
             due.cb(due.ud); /* popped first: cb may re-arm or cancel */
         }
     }

@@ -37,13 +37,29 @@ static size_t put_hdr(gtp2_wbuf_t& w, uint8_t mt, uint32_t teid, uint32_t seq)
     return off;
 }
 
-static Bytes finish(gtp2_wbuf_t& w, Bytes& out, size_t hdr_off,
-                    const char* doing)
+/* Every encode() writes into one per-thread scratch buffer and copies
+ * the finished bytes out, rather than allocating — and, being a sized
+ * std::vector, value-initializing — 64 KiB per message. No encode()
+ * nests inside another, so one scratch per thread is enough.
+ *
+ * The finishers must *copy* out of the scratch, never resize it: a
+ * resize would permanently shrink the shared buffer and the next encode
+ * would overflow. An encode that throws part-way leaves stale bytes
+ * behind, which is harmless — gtp2_wbuf_init rewinds off to 0 and
+ * nothing is ever read past it. */
+static gtp2_wbuf_t scratch_wbuf()
+{
+    static thread_local Bytes scratch(WIRE_MAX);
+    gtp2_wbuf_t               w;
+    gtp2_wbuf_init(&w, scratch.data(), scratch.size());
+    return w;
+}
+
+static Bytes finish(gtp2_wbuf_t& w, size_t hdr_off, const char* doing)
 {
     const int rc = gtp2_hdr_finalize(&w, hdr_off);
     if (rc != GTP2_OK) throw_gtp2(rc, doing);
-    out.resize(w.off);
-    return out;
+    return Bytes(w.buf, w.buf + w.off);
 }
 
 static void put_bytes(gtp2_wbuf_t& w, uint8_t type, uint8_t inst,
@@ -191,9 +207,7 @@ Bytes CreateSessionRequest::encode() const
         throw Error("Create Session Request: a bearer context is mandatory",
                     GTP2_E_MISSING);
 
-    Bytes       out(WIRE_MAX);
-    gtp2_wbuf_t w;
-    gtp2_wbuf_init(&w, out.data(), out.size());
+    gtp2_wbuf_t w = scratch_wbuf();
     const size_t off =
         put_hdr(w, GTP2_MT_CREATE_SESSION_REQUEST, teid, sequence);
 
@@ -243,7 +257,7 @@ Bytes CreateSessionRequest::encode() const
         gtp2_ie_put_u16(&w, GTP2_IE_CHARGING_CHARACTERISTICS, 0,
                         static_cast<uint16_t>(charging_char));
 
-    return finish(w, out, off, "encode Create Session Request");
+    return finish(w, off, "encode Create Session Request");
 }
 
 CreateSessionRequest CreateSessionRequest::decode(const Bytes& wire)
@@ -330,9 +344,7 @@ CreateSessionRequest CreateSessionRequest::decode(const Bytes& wire)
 
 Bytes CreateSessionResponse::encode() const
 {
-    Bytes       out(WIRE_MAX);
-    gtp2_wbuf_t w;
-    gtp2_wbuf_init(&w, out.data(), out.size());
+    gtp2_wbuf_t w = scratch_wbuf();
     const size_t off =
         put_hdr(w, GTP2_MT_CREATE_SESSION_RESPONSE, teid, sequence);
 
@@ -362,7 +374,7 @@ Bytes CreateSessionResponse::encode() const
     if (recovery >= 0)
         gtp2_ie_put_u8(&w, GTP2_IE_RECOVERY, 0, static_cast<uint8_t>(recovery));
 
-    return finish(w, out, off, "encode Create Session Response");
+    return finish(w, off, "encode Create Session Response");
 }
 
 CreateSessionResponse CreateSessionResponse::decode(const Bytes& wire)
@@ -438,9 +450,7 @@ CreateSessionResponse CreateSessionResponse::decode(const Bytes& wire)
 
 Bytes ModifyBearerRequest::encode() const
 {
-    Bytes       out(WIRE_MAX);
-    gtp2_wbuf_t w;
-    gtp2_wbuf_init(&w, out.data(), out.size());
+    gtp2_wbuf_t w = scratch_wbuf();
     const size_t off =
         put_hdr(w, GTP2_MT_MODIFY_BEARER_REQUEST, teid, sequence);
 
@@ -466,7 +476,7 @@ Bytes ModifyBearerRequest::encode() const
     if (recovery >= 0)
         gtp2_ie_put_u8(&w, GTP2_IE_RECOVERY, 0, static_cast<uint8_t>(recovery));
 
-    return finish(w, out, off, "encode Modify Bearer Request");
+    return finish(w, off, "encode Modify Bearer Request");
 }
 
 ModifyBearerRequest ModifyBearerRequest::decode(const Bytes& wire)
@@ -525,9 +535,7 @@ ModifyBearerRequest ModifyBearerRequest::decode(const Bytes& wire)
 
 Bytes ModifyBearerResponse::encode() const
 {
-    Bytes       out(WIRE_MAX);
-    gtp2_wbuf_t w;
-    gtp2_wbuf_init(&w, out.data(), out.size());
+    gtp2_wbuf_t w = scratch_wbuf();
     const size_t off =
         put_hdr(w, GTP2_MT_MODIFY_BEARER_RESPONSE, teid, sequence);
 
@@ -550,7 +558,7 @@ Bytes ModifyBearerResponse::encode() const
     if (recovery >= 0)
         gtp2_ie_put_u8(&w, GTP2_IE_RECOVERY, 0, static_cast<uint8_t>(recovery));
 
-    return finish(w, out, off, "encode Modify Bearer Response");
+    return finish(w, off, "encode Modify Bearer Response");
 }
 
 ModifyBearerResponse ModifyBearerResponse::decode(const Bytes& wire)
@@ -610,9 +618,7 @@ ModifyBearerResponse ModifyBearerResponse::decode(const Bytes& wire)
 
 Bytes DeleteSessionRequest::encode() const
 {
-    Bytes       out(WIRE_MAX);
-    gtp2_wbuf_t w;
-    gtp2_wbuf_init(&w, out.data(), out.size());
+    gtp2_wbuf_t w = scratch_wbuf();
     const size_t off =
         put_hdr(w, GTP2_MT_DELETE_SESSION_REQUEST, teid, sequence);
 
@@ -628,7 +634,7 @@ Bytes DeleteSessionRequest::encode() const
         gtp2_fteid_put(&w, 0, &f);
     }
 
-    return finish(w, out, off, "encode Delete Session Request");
+    return finish(w, off, "encode Delete Session Request");
 }
 
 DeleteSessionRequest DeleteSessionRequest::decode(const Bytes& wire)
@@ -672,9 +678,7 @@ DeleteSessionRequest DeleteSessionRequest::decode(const Bytes& wire)
 
 Bytes DeleteSessionResponse::encode() const
 {
-    Bytes       out(WIRE_MAX);
-    gtp2_wbuf_t w;
-    gtp2_wbuf_init(&w, out.data(), out.size());
+    gtp2_wbuf_t w = scratch_wbuf();
     const size_t off =
         put_hdr(w, GTP2_MT_DELETE_SESSION_RESPONSE, teid, sequence);
 
@@ -683,7 +687,7 @@ Bytes DeleteSessionResponse::encode() const
         gtp2_ie_put_u8(&w, GTP2_IE_RECOVERY, 0, static_cast<uint8_t>(recovery));
     put_bytes(w, GTP2_IE_PCO, 0, pco);
 
-    return finish(w, out, off, "encode Delete Session Response");
+    return finish(w, off, "encode Delete Session Response");
 }
 
 DeleteSessionResponse DeleteSessionResponse::decode(const Bytes& wire)
@@ -724,9 +728,7 @@ DeleteSessionResponse DeleteSessionResponse::decode(const Bytes& wire)
 
 Bytes CreateBearerRequest::encode() const
 {
-    Bytes       out(WIRE_MAX);
-    gtp2_wbuf_t w;
-    gtp2_wbuf_init(&w, out.data(), out.size());
+    gtp2_wbuf_t w = scratch_wbuf();
     const size_t off =
         put_hdr(w, GTP2_MT_CREATE_BEARER_REQUEST, teid, sequence);
 
@@ -743,7 +745,7 @@ Bytes CreateBearerRequest::encode() const
     for (const BearerContext& b : bearers)
         put_bearer(w, b);
 
-    return finish(w, out, off, "encode Create Bearer Request");
+    return finish(w, off, "encode Create Bearer Request");
 }
 
 CreateBearerRequest CreateBearerRequest::decode(const Bytes& wire)
@@ -789,9 +791,7 @@ CreateBearerRequest CreateBearerRequest::decode(const Bytes& wire)
 
 Bytes CreateBearerResponse::encode() const
 {
-    Bytes       out(WIRE_MAX);
-    gtp2_wbuf_t w;
-    gtp2_wbuf_init(&w, out.data(), out.size());
+    gtp2_wbuf_t w = scratch_wbuf();
     const size_t off =
         put_hdr(w, GTP2_MT_CREATE_BEARER_RESPONSE, teid, sequence);
 
@@ -804,7 +804,7 @@ Bytes CreateBearerResponse::encode() const
     if (recovery >= 0)
         gtp2_ie_put_u8(&w, GTP2_IE_RECOVERY, 0, static_cast<uint8_t>(recovery));
 
-    return finish(w, out, off, "encode Create Bearer Response");
+    return finish(w, off, "encode Create Bearer Response");
 }
 
 CreateBearerResponse CreateBearerResponse::decode(const Bytes& wire)
@@ -915,9 +915,7 @@ static void put_ie(gtp2_wbuf_t& w, const Ie& ie)
 
 Bytes RawMessage::encode() const
 {
-    Bytes       out(WIRE_MAX);
-    gtp2_wbuf_t w;
-    gtp2_wbuf_init(&w, out.data(), out.size());
+    gtp2_wbuf_t w = scratch_wbuf();
 
     gtp2_hdr_t h;
     std::memset(&h, 0, sizeof h);
@@ -934,10 +932,7 @@ Bytes RawMessage::encode() const
     for (const Ie& ie : ies)
         put_ie(w, ie);
 
-    int rc = gtp2_hdr_finalize(&w, hdr_off);
-    if (rc != GTP2_OK) throw_gtp2(rc, "encode message");
-    out.resize(w.off);
-    return out;
+    return finish(w, hdr_off, "encode message");
 }
 
 RawMessage RawMessage::decode(const Bytes& wire)

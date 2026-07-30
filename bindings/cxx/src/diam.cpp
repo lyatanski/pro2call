@@ -211,10 +211,14 @@ std::string Msg::str(uint32_t code, uint32_t vendor) const
 
 /* ---- Builder ---- */
 
-/* 64 KiB — a generous ceiling for signalling messages. */
-Builder::Builder() : buf_(64 * 1024)
+/* 64 KiB — a generous ceiling for signalling messages. Diameter runs
+ * over TCP/SCTP with no MTU bound and accounting messages can carry
+ * large grouped AVPs, so the ceiling stays; only the value-initialization
+ * goes (a memset of the whole capacity, per Builder). Overflow is sticky
+ * and done() throws on it, so a truncated message is never returned. */
+Builder::Builder() : buf_(new uint8_t[64 * 1024]), cap_(64 * 1024)
 {
-    diam_wbuf_init(&w_, buf_.data(), buf_.size());
+    diam_wbuf_init(&w_, buf_.get(), cap_);
     hdr_ = diam_hdr_t{};
 }
 
@@ -230,7 +234,7 @@ Builder& Builder::request(uint32_t cmd, uint32_t app)
     hdr_.request  = true;
     hdr_.cmd_code = cmd;
     hdr_.app_id   = app;
-    diam_wbuf_init(&w_, buf_.data(), buf_.size());
+    diam_wbuf_init(&w_, buf_.get(), cap_);
     w_.off = DIAM_HDR_LEN; /* header encoded by done() */
     groups_.clear();
     started_ = true;
@@ -395,12 +399,12 @@ std::string Builder::done()
     ensure_started("done");
     if (!groups_.empty()) throw Error("done: unclosed group");
 
-    int rc = diam_hdr_encode(buf_.data(), buf_.size(), &hdr_);
+    int rc = diam_hdr_encode(buf_.get(), cap_, &hdr_);
     if (rc < 0) fail("done", rc);
     rc = diam_hdr_finalize(&w_, 0);
     if (rc != DIAM_OK) fail("done", rc);
 
-    std::string out((const char*)buf_.data(), w_.off);
+    std::string out((const char*)buf_.get(), w_.off);
     started_ = false;
     return out;
 }

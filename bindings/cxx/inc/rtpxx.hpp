@@ -7,7 +7,7 @@
 #include <string>
 #include <vector>
 
-#include "net_loop.h"
+#include "netxx.hpp" /* net::Loop — the transport the media session runs on */
 #include "rtp.h"
 
 /* rtpxx — C++ facade over the C RTP/RTCP codec (rtp/inc/rtp.h),
@@ -21,13 +21,19 @@
  *     Lua tables/functions by the SWIG layer;
  *   - errors are exceptions (rtp::Error), never return codes.
  *
- * The media layer (Session) drives one RTP stream over a pair of
+ * The media layer (Stream — see bindings/swig/rtp.i for why it is not
+ * called Session) drives one RTP stream over a pair of
  * net_loop-registered UDP sockets (RTP on the given port, RTCP on
  * port + 1, per RFC 3550 §11): sequencing and timestamps on send,
  * source validation / loss / jitter tracking on receive (the
  * appendix-A algorithms in the C library), and periodic compound
  * RTCP — SR when we sent since the last report, else RR, plus SDES
- * CNAME — with incoming SR/RR/BYE surfaced through SessionHandler. */
+ * CNAME — with incoming SR/RR/BYE surfaced through StreamHandler.
+ *
+ * The event loop is net::Loop from the netxx facade (as the gtp
+ * session layer's is), not a private one: a script that already runs
+ * GTP-C and SIP on one net.Loop gives its media sessions the same
+ * loop, and one loop:run() drives signalling and media together. */
 
 namespace rtp
 {
@@ -67,7 +73,7 @@ enum Pt {
 /* ---- value types ---- */
 
 /* One RTP packet. payload (and ext) are byte strings. On send through
- * Session::send_packet() every field is used as given. */
+ * Stream::send_packet() every field is used as given. */
 struct Packet {
     int                   pt     = 0;
     bool                  marker = false;
@@ -101,90 +107,32 @@ struct ReportBlock {
     uint32_t lsr = 0, dlsr = 0;
 };
 
-/* Session counters; the rx_* side tracks the first remote SSRC seen. */
+/* Stream counters; the rx_* side tracks the first remote SSRC seen.
+ *
+ * rx_* is what WE see of the inbound stream; the outbound direction can
+ * only be measured by the peer, which reports it back in an RTCP report
+ * block (StreamHandler::on_receiver_report). rtt_ms is the one figure
+ * derived from such a block here, since it needs a clock reading at
+ * arrival: negative until a block about our SSRC carrying a non-zero
+ * lsr arrives. */
 struct Stats {
     uint32_t local_ssrc  = 0;
     uint32_t remote_ssrc = 0; /* 0 until a source is seen */
     uint64_t tx_packets = 0, tx_octets = 0;
     uint64_t rx_packets = 0, rx_octets = 0;
-    int      rx_lost   = 0; /* cumulative, may be negative */
-    uint32_t rx_jitter = 0; /* timestamp units */
+    int      rx_lost   = 0;  /* cumulative, may be negative */
+    uint32_t rx_jitter = 0;  /* timestamp units */
+    double   rtt_ms    = -1; /* last RTT, < 0 = not measured yet */
 };
 
-/* ---- event loop ---- */
+/* ---- media stream ---- */
 
-class TimerHandler
-{
-  public:
-    virtual ~TimerHandler() = default;
-    virtual void on_timer() = 0;
-};
-
-class IoHandler
-{
-  public:
-    virtual ~IoHandler()                        = default;
-    virtual void on_io(int fd, unsigned events) = 0; /* NET_RD/NET_WR/NET_ER */
-};
-
-/* Wraps net_loop (net/inc/net_loop.h), exactly like net::Loop: the
- * single-threaded epoll dispatcher every session registers with.
- * Handlers are borrowed — the caller keeps them alive (the Lua layer
- * pins them in registries). Exceptions thrown by handlers never
- * unwind through the C dispatcher: they are captured, the loop is
- * stopped, and step()/run() rethrows. */
-class Loop
-{
-  public:
-    Loop();
-    ~Loop();
-    Loop(const Loop&)            = delete;
-    Loop& operator=(const Loop&) = delete;
-
-    /* One poll iteration; timeout_ms < 0 waits for the next event or
-     * timer. Returns the number of fd events dispatched. */
-    int  step(int timeout_ms = -1);
-    void run(); /* step until stop() */
-    void stop();
-
-    /* One-shot timer; returns a cancellation id. */
-    uint64_t after(uint64_t ms, TimerHandler* h);
-    void     cancel(uint64_t timer_id);
-
-    /* Register an arbitrary fd (integration point for other stacks). */
-    void add_fd(int fd, unsigned events, IoHandler* h);
-    void mod_fd(int fd, unsigned events);
-    void del_fd(int fd);
-
-    net_loop* raw() const
-    {
-        return l_;
-    }
-
-    /* Internal (used by callback trampolines): capture the in-flight
-     * exception, stop the loop, and rethrow it from step()/run(). */
-    void defer_exception();
-    void rethrow_pending();
-
-  private:
-    friend class Session;
-    struct Impl;
-    Impl*     impl_;
-    net_loop* l_;
-    /* Liveness token: nulled by ~Loop so dependents destroyed after
-     * the loop (garbage collectors order teardown freely) skip their
-     * unregistration instead of touching a freed net_loop. */
-    std::shared_ptr<net_loop*> life_;
-};
-
-/* ---- media session ---- */
-
-/* Subclass this and pass it to Session::set_handler(). All methods
+/* Subclass this and pass it to Stream::set_handler(). All methods
  * default to no-ops. */
-class SessionHandler
+class StreamHandler
 {
   public:
-    virtual ~SessionHandler() = default;
+    virtual ~StreamHandler() = default;
 
     /* One RTP packet arrived (already validated by the codec). */
     virtual void on_rtp(const Packet& p, const std::string& host,
@@ -199,18 +147,25 @@ class SessionHandler
 };
 
 /* One RTP stream endpoint: binds rtp_port and rtp_port + 1 (RTCP) on
- * local_host and registers both with the Loop. Sending needs a peer
+ * local_host and registers both with the loop. Sending needs a peer
  * (set_peer); the peer's RTCP port is its RTP port + 1. Periodic
- * compound reports start with set_peer() and stop at bye(). */
-class Session
+ * compound reports start with set_peer() and stop at bye().
+ *
+ * nonlocal_src sets IP_FREEBIND + IP_TRANSPARENT (net_sock.h's
+ * NET_NONLOCAL_SRC, as net::UdpSocket's own flag does) so the pair can
+ * bind and send from an address this host does not own — a simulated
+ * UE's PDN address, whose media must leave with the PAA as its source.
+ * Needs CAP_NET_ADMIN. */
+class Stream
 {
   public:
-    Session(Loop& loop, const std::string& local_host, uint16_t rtp_port);
-    ~Session();
-    Session(const Session&)            = delete;
-    Session& operator=(const Session&) = delete;
+    Stream(net::Loop& loop, const std::string& local_host, uint16_t rtp_port,
+           bool nonlocal_src = false);
+    ~Stream();
+    Stream(const Stream&)            = delete;
+    Stream& operator=(const Stream&) = delete;
 
-    void set_handler(SessionHandler* h)
+    void set_handler(StreamHandler* h)
     {
         handler_ = h;
     }
@@ -237,21 +192,23 @@ class Session
     void send_packet(const Packet& p);
 
     /* Send the closing compound (report + SDES + BYE) and stop the
-     * periodic reports. The session can still receive. */
+     * periodic reports. The stream can still receive. */
     void bye(const std::string& reason = "");
 
     Stats stats() const;
 
   private:
     struct Impl;
-    Impl*           impl_;
-    SessionHandler* handler_ = nullptr;
+    Impl*          impl_;
+    StreamHandler* handler_ = nullptr;
 
     void on_rtp_readable();
     void on_rtcp_readable();
     void on_report_timer();
     void send_report(bool with_bye, const std::string& reason);
     void arm_timer();
+    /* RTT from a report block about us: now_ntp - lsr - dlsr (§6.4.1). */
+    void                            note_rtt(const rtcp_rep_t& rep);
     static std::vector<ReportBlock> report_blocks(const rtcp_rep_t& rep);
 };
 

@@ -36,6 +36,9 @@
 %include <std_string.i>
 %include <exception.i>
 
+/* shared move-on-value-return typemap */
+%include "common.i"
+
 /* ---- exceptions: ipsec::Error / std::exception -> Lua error ---- */
 
 %exception {

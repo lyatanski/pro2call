@@ -281,15 +281,20 @@ std::string status_phrase(int status)
 
 /* ---- Builder ---- */
 
-enum { BUILDER_CAP = 64 * 1024 };
-
-Builder::Builder() : buf_(BUILDER_CAP)
+Builder::Builder(size_t cap)
+    : buf_(new char[cap ? cap : (size_t)DEFAULT_CAP]),
+      cap_(cap ? cap : (size_t)DEFAULT_CAP)
 {
-    sip_wbuf_init(&w_, buf_.data(), buf_.size());
+    reset();
 }
 
+/* request()/response() write the start line, so they are always the
+ * first call of a message — reset here rather than trusting done() to
+ * have run, or a build that threw mid-way poisons the next message with
+ * its leftover bytes (sip_put_* append; they never rewind). */
 Builder& Builder::request(int method, const std::string& uri)
 {
+    reset();
     int rc = sip_put_request(&w_, (sip_method_t)method, uri.data(), uri.size());
     if (rc != SIP_OK) fail("request", rc);
     return *this;
@@ -297,6 +302,7 @@ Builder& Builder::request(int method, const std::string& uri)
 
 Builder& Builder::response(int status, const std::string& reason)
 {
+    reset();
     int rc =
         sip_put_status(&w_, (unsigned)status,
                        reason.empty() ? NULL : reason.data(), reason.size());
@@ -330,11 +336,11 @@ std::string Builder::done(const std::string& body)
 {
     int n = sip_put_body(&w_, body.data(), body.size());
     if (n < 0) {
-        sip_wbuf_init(&w_, buf_.data(), buf_.size());
+        reset();
         fail("done", n);
     }
-    std::string out(buf_.data(), (size_t)n);
-    sip_wbuf_init(&w_, buf_.data(), buf_.size()); /* ready for the next */
+    std::string out(buf_.get(), (size_t)n);
+    reset(); /* ready for the next */
     return out;
 }
 
@@ -370,6 +376,12 @@ std::string Transaction::state_name() const
 bool Transaction::terminated() const
 {
     return fsm_terminated(fsm_);
+}
+
+Transaction& Transaction::restart()
+{
+    fsm_set_current_state(fsm_, SIP_TRANS_ST_INIT);
+    return *this;
 }
 
 Transaction& Transaction::event(int ev)

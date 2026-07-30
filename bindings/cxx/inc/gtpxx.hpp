@@ -142,6 +142,12 @@ struct BearerContext {
     Bytes                   tft; /* raw TS 24.008 TFT, empty = absent */
     std::vector<FteidEntry> fteids;
     void                    add_fteid(uint8_t instance, const Fteid& f);
+    /* Drop the list so one context can be re-filled per subscriber
+     * instead of a fresh one per message. */
+    void clear_fteids()
+    {
+        fteids.clear();
+    }
 };
 
 /* ---- Typed messages (session workflow, TS 29.274 §7.2) ----
@@ -179,6 +185,12 @@ struct CreateSessionRequest { /* §7.2.1 */
     {
         bearers.push_back(b);
     }
+    /* Drop the list so one message can be re-filled and re-encoded per
+     * subscriber, instead of a fresh message object per send. */
+    void clear_bearers()
+    {
+        bearers.clear();
+    }
 
     Bytes                       encode() const;
     static CreateSessionRequest decode(const Bytes& wire);
@@ -206,6 +218,12 @@ struct CreateSessionResponse { /* §7.2.2 */
     {
         bearers.push_back(b);
     }
+    /* Drop the list so one message can be re-filled and re-encoded per
+     * subscriber, instead of a fresh message object per send. */
+    void clear_bearers()
+    {
+        bearers.clear();
+    }
 
     Bytes                        encode() const;
     static CreateSessionResponse decode(const Bytes& wire);
@@ -231,6 +249,12 @@ struct ModifyBearerRequest { /* §7.2.7 */
     {
         bearers.push_back(b);
     }
+    /* Drop the list so one message can be re-filled and re-encoded per
+     * subscriber, instead of a fresh message object per send. */
+    void clear_bearers()
+    {
+        bearers.clear();
+    }
 
     Bytes                      encode() const;
     static ModifyBearerRequest decode(const Bytes& wire);
@@ -253,6 +277,12 @@ struct ModifyBearerResponse { /* §7.2.8 */
     void                       add_bearer(const BearerContext& b)
     {
         bearers.push_back(b);
+    }
+    /* Drop the list so one message can be re-filled and re-encoded per
+     * subscriber, instead of a fresh message object per send. */
+    void clear_bearers()
+    {
+        bearers.clear();
     }
 
     Bytes                       encode() const;
@@ -300,6 +330,12 @@ struct CreateBearerRequest { /* §7.2.3 (network-initiated dedicated bearer) */
     {
         bearers.push_back(b);
     }
+    /* Drop the list so one message can be re-filled and re-encoded per
+     * subscriber, instead of a fresh message object per send. */
+    void clear_bearers()
+    {
+        bearers.clear();
+    }
 
     Bytes                      encode() const;
     static CreateBearerRequest decode(const Bytes& wire);
@@ -318,6 +354,12 @@ struct CreateBearerResponse { /* §7.2.4 */
     void                       add_bearer(const BearerContext& b)
     {
         bearers.push_back(b);
+    }
+    /* Drop the list so one message can be re-filled and re-encoded per
+     * subscriber, instead of a fresh message object per send. */
+    void clear_bearers()
+    {
+        bearers.clear();
     }
 
     Bytes                       encode() const;
@@ -510,6 +552,10 @@ class Session
     std::string                  peer_host_;
     uint16_t                     peer_port_ = 0;
     CreateSessionRequest         req_;
+    /* Bearer list of the last Modify Bearer Request sent, which the
+     * response path matches the peer's F-TEIDs against — kept here so
+     * the response need not re-decode the request off the wire. */
+    std::vector<BearerContext>   mod_bearers_;
     std::vector<UserPlaneTunnel> tunnels_;
 };
 

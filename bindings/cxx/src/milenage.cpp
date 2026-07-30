@@ -18,18 +18,65 @@ namespace
 
 using Block = std::array<uint8_t, 16>;
 
+/* AES-128-ECB against one context per thread, with the key schedule
+ * cached across blocks.
+ *
+ * Milenage runs five AES blocks per vector and aka_verify runs two
+ * vectors, all under the same K — so allocating, keying and freeing an
+ * EVP_CIPHER_CTX per block (five 448-byte CRYPTO_zalloc sites under
+ * EVP_CipherInit_ex) is most of the cost of an authentication. ECB
+ * chains no state between blocks, so holding the context and re-keying
+ * only when K actually changes is exact.
+ *
+ * Not thread-safe by design and does not need to be: the context is
+ * thread_local, so concurrent authentications never share one. */
+class AesEcb
+{
+  public:
+    static AesEcb& instance()
+    {
+        static thread_local AesEcb inst;
+        return inst;
+    }
+
+    void block(const uint8_t key[16], const uint8_t in[16], uint8_t out[16])
+    {
+        if (!keyed_ || std::memcmp(key, key_, 16) != 0) {
+            keyed_ = false; /* a failed re-key must not leave a stale one */
+            if (EVP_EncryptInit_ex(ctx_, EVP_aes_128_ecb(), nullptr, key,
+                                   nullptr) != 1 ||
+                EVP_CIPHER_CTX_set_padding(ctx_, 0) != 1)
+                throw Error("milenage: AES-128 key setup failed");
+            std::memcpy(key_, key, 16);
+            keyed_ = true;
+        }
+        int len = 0;
+        if (EVP_EncryptUpdate(ctx_, out, &len, in, 16) != 1 || len != 16)
+            throw Error("milenage: AES-128 block encryption failed");
+    }
+
+    AesEcb(const AesEcb&)            = delete;
+    AesEcb& operator=(const AesEcb&) = delete;
+
+  private:
+    AesEcb() : ctx_(EVP_CIPHER_CTX_new()), key_{}
+    {
+        if (!ctx_) throw Error("milenage: EVP_CIPHER_CTX_new failed");
+    }
+    ~AesEcb()
+    {
+        EVP_CIPHER_CTX_free(ctx_);
+    }
+
+    EVP_CIPHER_CTX* ctx_;
+    uint8_t         key_[16];
+    bool            keyed_ = false;
+};
+
 /* One AES-128 ECB block: out = E_K(in). */
 void aes128_block(const uint8_t key[16], const uint8_t in[16], uint8_t out[16])
 {
-    EVP_CIPHER_CTX* c = EVP_CIPHER_CTX_new();
-    if (!c) throw Error("milenage: EVP_CIPHER_CTX_new failed");
-    int  len = 0;
-    bool ok =
-        EVP_EncryptInit_ex(c, EVP_aes_128_ecb(), nullptr, key, nullptr) == 1 &&
-        EVP_CIPHER_CTX_set_padding(c, 0) == 1 &&
-        EVP_EncryptUpdate(c, out, &len, in, 16) == 1 && len == 16;
-    EVP_CIPHER_CTX_free(c);
-    if (!ok) throw Error("milenage: AES-128 block encryption failed");
+    AesEcb::instance().block(key, in, out);
 }
 
 Block xorb(const Block& a, const Block& b)
@@ -151,17 +198,32 @@ AkaVector aka_verify(const std::string& k, const std::string& opc,
     return v;
 }
 
+/* Same reasoning as AesEcb: aka_digest runs three MD5s per response, so
+ * the context is held per thread and only re-initialized. EVP_DigestInit_ex
+ * fully resets the digest state, so consecutive calls do not interfere. */
 std::string md5(const std::string& data)
 {
+    struct Ctx {
+        EVP_MD_CTX* p;
+        Ctx() : p(EVP_MD_CTX_new())
+        {
+            if (!p) throw Error("md5: EVP_MD_CTX_new failed");
+        }
+        ~Ctx()
+        {
+            EVP_MD_CTX_free(p);
+        }
+        Ctx(const Ctx&)            = delete;
+        Ctx& operator=(const Ctx&) = delete;
+    };
+    static thread_local Ctx c;
+
     unsigned char out[EVP_MAX_MD_SIZE];
     unsigned int  n = 0;
-    EVP_MD_CTX*   c = EVP_MD_CTX_new();
-    if (!c) throw Error("md5: EVP_MD_CTX_new failed");
-    bool ok = EVP_DigestInit_ex(c, EVP_md5(), nullptr) == 1 &&
-              EVP_DigestUpdate(c, data.data(), data.size()) == 1 &&
-              EVP_DigestFinal_ex(c, out, &n) == 1;
-    EVP_MD_CTX_free(c);
-    if (!ok) throw Error("md5: digest failed");
+    if (EVP_DigestInit_ex(c.p, EVP_md5(), nullptr) != 1 ||
+        EVP_DigestUpdate(c.p, data.data(), data.size()) != 1 ||
+        EVP_DigestFinal_ex(c.p, out, &n) != 1)
+        throw Error("md5: digest failed");
     return std::string(reinterpret_cast<char*>(out), n);
 }
 

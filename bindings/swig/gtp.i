@@ -51,6 +51,9 @@
 %include <std_except.i>
 %include <exception.i>
 
+/* shared move-on-value-return typemap */
+%include "common.i"
+
 /* ---- Lua callback bridge ----------------------------------------------
  *
  * SWIG cannot generate directors for Lua, so a Lua "handler" cannot

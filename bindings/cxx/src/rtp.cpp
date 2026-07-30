@@ -1,10 +1,13 @@
-/* Event loop wrapper and the RTP media session: sequencing on send,
- * source/loss/jitter tracking on receive, periodic compound RTCP and
- * handler dispatch, on top of net_loop + net_sock and the C codec.
+/* The RTP media session: sequencing on send, source/loss/jitter
+ * tracking on receive, periodic compound RTCP and handler dispatch, on
+ * top of net_loop + net_sock and the C codec.
  *
- * Handler callbacks may be Lua trampolines; any exception they raise
- * is deferred through Loop so it never unwinds through net_loop's C
- * frames, and rethrown from Loop::step()/run(). */
+ * The loop is the netxx one (net::Loop::raw()/life(), exactly as the
+ * gtp session layer uses it), so media shares the script's single
+ * dispatcher with GTP-C and SIP. Handler callbacks may be Lua
+ * trampolines; any exception they raise is deferred through the loop so
+ * it never unwinds through net_loop's C frames, and rethrown from
+ * Loop::step()/run(). */
 
 #include "rtpxx.hpp"
 
@@ -13,8 +16,6 @@
 #include <arpa/inet.h>
 #include <cstring>
 #include <ctime>
-#include <exception>
-#include <map>
 #include <memory>
 
 namespace rtp
@@ -60,153 +61,20 @@ static uint32_t rnd32()
     return (uint32_t)(state >> 32);
 }
 
-/* ---- Loop (same shape as net::Loop, see netxx.hpp) ---- */
-
-struct Loop::Impl {
-    struct TimerCtx {
-        Loop*         loop;
-        TimerHandler* h;
-        uint64_t      id;
-    };
-    struct IoCtx {
-        Loop*      loop;
-        IoHandler* h;
-    };
-
-    std::exception_ptr                            pending;
-    std::map<uint64_t, std::unique_ptr<TimerCtx>> timers;
-    std::map<int, std::unique_ptr<IoCtx>>         ios;
-
-    static void timer_tramp(void* ud)
-    {
-        auto*         ctx  = static_cast<TimerCtx*>(ud);
-        Loop*         loop = ctx->loop;
-        TimerHandler* h    = ctx->h;
-        loop->impl_->timers.erase(ctx->id); /* one-shot; ctx dies here */
-        try {
-            h->on_timer();
-        } catch (...) {
-            loop->defer_exception();
-        }
-    }
-
-    static void io_tramp(void* ud, int fd, unsigned ev)
-    {
-        auto* ctx = static_cast<IoCtx*>(ud);
-        try {
-            ctx->h->on_io(fd, ev);
-        } catch (...) {
-            ctx->loop->defer_exception();
-        }
-    }
-};
-
-Loop::Loop() : impl_(new Impl), l_(net_loop_new())
-{
-    if (!l_) {
-        delete impl_;
-        throw Error("net_loop_new failed");
-    }
-    life_ = std::make_shared<net_loop*>(l_);
-}
-
-Loop::~Loop()
-{
-    *life_ = nullptr;
-    net_loop_free(l_);
-    delete impl_;
-}
-
-void Loop::defer_exception()
-{
-    if (!impl_->pending) impl_->pending = std::current_exception();
-    net_loop_stop(l_);
-}
-
-void Loop::rethrow_pending()
-{
-    if (impl_->pending) {
-        std::exception_ptr p = impl_->pending;
-        impl_->pending       = nullptr;
-        std::rethrow_exception(p);
-    }
-}
-
-int Loop::step(int timeout_ms)
-{
-    int rc = net_loop_step(l_, timeout_ms);
-    rethrow_pending();
-    if (rc < 0) throw Error("event loop step failed", rc);
-    return rc;
-}
-
-void Loop::run()
-{
-    net_loop_run(l_);
-    rethrow_pending();
-}
-
-void Loop::stop()
-{
-    net_loop_stop(l_);
-}
-
-uint64_t Loop::after(uint64_t ms, TimerHandler* h)
-{
-    if (!h) throw Error("timer handler is null");
-    auto ctx    = std::make_unique<Impl::TimerCtx>();
-    ctx->loop   = this;
-    ctx->h      = h;
-    uint64_t id = net_loop_after(l_, ms, Impl::timer_tramp, ctx.get());
-    if (id == 0) throw Error("net_loop_after failed");
-    ctx->id           = id;
-    impl_->timers[id] = std::move(ctx);
-    return id;
-}
-
-void Loop::cancel(uint64_t timer_id)
-{
-    net_loop_cancel(l_, timer_id);
-    impl_->timers.erase(timer_id);
-}
-
-void Loop::add_fd(int fd, unsigned events, IoHandler* h)
-{
-    if (!h) throw Error("io handler is null");
-    auto ctx  = std::make_unique<Impl::IoCtx>();
-    ctx->loop = this;
-    ctx->h    = h;
-    if (net_loop_add(l_, fd, events, Impl::io_tramp, ctx.get()) != NET_OK)
-        throw Error("net_loop_add failed");
-    impl_->ios[fd] = std::move(ctx);
-}
-
-void Loop::mod_fd(int fd, unsigned events)
-{
-    if (net_loop_mod(l_, fd, events) != NET_OK)
-        throw Error("net_loop_mod failed");
-}
-
-void Loop::del_fd(int fd)
-{
-    net_loop_del(l_, fd);
-    impl_->ios.erase(fd);
-}
-
 /* ---- default (no-op) handler bodies ---- */
 
-void SessionHandler::on_rtp(const Packet&, const std::string&, uint16_t)
+void StreamHandler::on_rtp(const Packet&, const std::string&, uint16_t)
 {
 }
-void SessionHandler::on_sender_report(uint32_t, const SenderInfo&,
+void StreamHandler::on_sender_report(uint32_t, const SenderInfo&,
                                       const std::vector<ReportBlock>&)
 {
 }
-void SessionHandler::on_receiver_report(uint32_t,
+void StreamHandler::on_receiver_report(uint32_t,
                                         const std::vector<ReportBlock>&)
 {
 }
-void SessionHandler::on_bye(uint32_t, const std::string&)
+void StreamHandler::on_bye(uint32_t, const std::string&)
 {
 }
 
@@ -268,10 +136,10 @@ Packet Packet::parse(const std::string& wire)
     return packet_from(p);
 }
 
-/* ---- Session ---- */
+/* ---- Stream ---- */
 
-struct Session::Impl {
-    Loop*                      loop = nullptr;
+struct Stream::Impl {
+    net::Loop*                 loop = nullptr;
     std::shared_ptr<net_loop*> loop_life;
     net_sock                   rtp_sock, rtcp_sock;
 
@@ -297,10 +165,19 @@ struct Session::Impl {
     uint64_t     rx_packets = 0, rx_octets = 0;
     uint32_t     last_sr_lsr     = 0; /* middle NTP bits of last SR */
     uint64_t     last_sr_arrival = 0; /* net_now_ms at its arrival  */
+    double       rtt_ms          = -1;
+
+    /* The loop through its liveness token, so a session outliving the
+     * loop under a garbage collector unregisters nothing (see
+     * net::Loop::life()). */
+    net_loop* lp() const
+    {
+        return *loop_life;
+    }
 
     static void rtp_tramp(void* ud, int, unsigned)
     {
-        auto* s = static_cast<Session*>(ud);
+        auto* s = static_cast<Stream*>(ud);
         try {
             s->on_rtp_readable();
         } catch (...) {
@@ -310,7 +187,7 @@ struct Session::Impl {
 
     static void rtcp_tramp(void* ud, int, unsigned)
     {
-        auto* s = static_cast<Session*>(ud);
+        auto* s = static_cast<Stream*>(ud);
         try {
             s->on_rtcp_readable();
         } catch (...) {
@@ -320,7 +197,7 @@ struct Session::Impl {
 
     static void timer_tramp(void* ud)
     {
-        auto* s            = static_cast<Session*>(ud);
+        auto* s            = static_cast<Stream*>(ud);
         s->impl_->timer_id = 0;
         try {
             s->on_report_timer();
@@ -330,18 +207,22 @@ struct Session::Impl {
     }
 };
 
-Session::Session(Loop& loop, const std::string& local_host, uint16_t rtp_port)
+Stream::Stream(net::Loop& loop, const std::string& local_host,
+                 uint16_t rtp_port, bool nonlocal_src)
     : impl_(new Impl)
 {
     std::unique_ptr<Impl> guard(impl_);
     impl_->loop      = &loop;
-    impl_->loop_life = loop.life_;
+    impl_->loop_life = loop.life();
     impl_->ssrc      = rnd32();
     impl_->seq       = (uint16_t)rnd32();
     impl_->ts        = rnd32();
 
+    unsigned flags = NET_BOUND;
+    if (nonlocal_src) flags |= NET_NONLOCAL_SRC;
+
     net_addr a  = addr_of(local_host, rtp_port);
-    int      rc = net_udp_open(&impl_->rtp_sock, &a, NET_BOUND);
+    int      rc = net_udp_open(&impl_->rtp_sock, &a, flags);
     if (rc != NET_OK)
         throw Error(
             "cannot bind " + local_host + ":" + std::to_string(rtp_port), rc);
@@ -350,17 +231,17 @@ Session::Session(Loop& loop, const std::string& local_host, uint16_t rtp_port)
      * port, next to whatever was assigned. */
     uint16_t rp = net_addr_port(&impl_->rtp_sock.local);
     net_addr b  = addr_of(local_host, (uint16_t)(rp + 1));
-    rc          = net_udp_open(&impl_->rtcp_sock, &b, NET_BOUND);
+    rc          = net_udp_open(&impl_->rtcp_sock, &b, flags);
     if (rc != NET_OK) {
         net_sock_close(&impl_->rtp_sock);
         throw Error("cannot bind RTCP port " + std::to_string(rp + 1), rc);
     }
 
-    if (net_loop_add(loop.raw(), impl_->rtp_sock.fd, NET_RD, Impl::rtp_tramp,
+    if (net_loop_add(impl_->lp(), impl_->rtp_sock.fd, NET_RD, Impl::rtp_tramp,
                      this) != NET_OK ||
-        net_loop_add(loop.raw(), impl_->rtcp_sock.fd, NET_RD, Impl::rtcp_tramp,
+        net_loop_add(impl_->lp(), impl_->rtcp_sock.fd, NET_RD, Impl::rtcp_tramp,
                      this) != NET_OK) {
-        net_loop_del(loop.raw(), impl_->rtp_sock.fd);
+        net_loop_del(impl_->lp(), impl_->rtp_sock.fd);
         net_sock_close(&impl_->rtp_sock);
         net_sock_close(&impl_->rtcp_sock);
         throw Error("cannot register session with the loop");
@@ -370,7 +251,7 @@ Session::Session(Loop& loop, const std::string& local_host, uint16_t rtp_port)
     guard.release();
 }
 
-Session::~Session()
+Stream::~Stream()
 {
     /* The loop may already be gone when a garbage collector tears the
      * two down in the wrong order; unregister only while it lives. */
@@ -385,7 +266,7 @@ Session::~Session()
     delete impl_;
 }
 
-void Session::set_peer(const std::string& host, uint16_t rtp_port)
+void Stream::set_peer(const std::string& host, uint16_t rtp_port)
 {
     impl_->peer_rtp   = addr_of(host, rtp_port);
     impl_->peer_rtcp  = addr_of(host, (uint16_t)(rtp_port + 1));
@@ -394,44 +275,44 @@ void Session::set_peer(const std::string& host, uint16_t rtp_port)
     arm_timer();
 }
 
-void Session::set_payload_type(int pt)
+void Stream::set_payload_type(int pt)
 {
     if (pt < 0 || pt > 127)
         throw Error("payload type out of range", RTP_E_INVAL);
     impl_->pt = pt;
 }
 
-void Session::set_clock_rate(unsigned hz)
+void Stream::set_clock_rate(unsigned hz)
 {
     if (hz == 0) throw Error("clock rate is zero", RTP_E_INVAL);
     impl_->clock_rate = hz;
 }
 
-void Session::set_cname(const std::string& cname)
+void Stream::set_cname(const std::string& cname)
 {
     if (cname.size() > 255) throw Error("CNAME too long", RTP_E_INVAL);
     impl_->cname = cname;
 }
 
-void Session::set_ssrc(uint32_t ssrc)
+void Stream::set_ssrc(uint32_t ssrc)
 {
     impl_->ssrc = ssrc;
 }
-void Session::set_rtcp_interval(unsigned ms)
+void Stream::set_rtcp_interval(unsigned ms)
 {
     impl_->rtcp_ms = ms;
 }
 
-uint32_t Session::ssrc() const
+uint32_t Stream::ssrc() const
 {
     return impl_->ssrc;
 }
-uint16_t Session::rtp_port() const
+uint16_t Stream::rtp_port() const
 {
     return net_addr_port(&impl_->rtp_sock.local);
 }
 
-std::string Session::local_host() const
+std::string Stream::local_host() const
 {
     std::string host;
     uint16_t    port;
@@ -439,7 +320,7 @@ std::string Session::local_host() const
     return host;
 }
 
-void Session::send(const std::string& payload, uint32_t ts_step, bool marker)
+void Stream::send(const std::string& payload, uint32_t ts_step, bool marker)
 {
     Packet p;
     p.pt      = impl_->pt;
@@ -453,7 +334,7 @@ void Session::send(const std::string& payload, uint32_t ts_step, bool marker)
     impl_->ts += ts_step;
 }
 
-void Session::send_packet(const Packet& p)
+void Stream::send_packet(const Packet& p)
 {
     if (!impl_->has_peer) throw Error("no peer set");
     std::string wire = p.encode();
@@ -465,7 +346,7 @@ void Session::send_packet(const Packet& p)
     impl_->sent_since_report = true;
 }
 
-void Session::bye(const std::string& reason)
+void Stream::bye(const std::string& reason)
 {
     if (reason.size() > 255) throw Error("BYE reason too long", RTP_E_INVAL);
     send_report(true, reason);
@@ -477,7 +358,7 @@ void Session::bye(const std::string& reason)
     }
 }
 
-Stats Session::stats() const
+Stats Stream::stats() const
 {
     Stats s;
     s.local_ssrc = impl_->ssrc;
@@ -485,6 +366,7 @@ Stats Session::stats() const
     s.tx_octets  = impl_->tx_octets;
     s.rx_packets = impl_->rx_packets;
     s.rx_octets  = impl_->rx_octets;
+    s.rtt_ms     = impl_->rtt_ms;
     if (impl_->have_source) {
         const rtp_source_t* src = &impl_->source;
         s.remote_ssrc           = src->ssrc;
@@ -497,7 +379,7 @@ Stats Session::stats() const
 
 /* ---- receive paths ---- */
 
-void Session::on_rtp_readable()
+void Stream::on_rtp_readable()
 {
     uint8_t  buf[4096];
     net_addr from;
@@ -531,7 +413,7 @@ void Session::on_rtp_readable()
     }
 }
 
-void Session::on_rtcp_readable()
+void Stream::on_rtcp_readable()
 {
     uint8_t  buf[4096];
     net_addr from;
@@ -550,6 +432,7 @@ void Session::on_rtcp_readable()
                 /* remember for the lsr/dlsr of our next report */
                 impl_->last_sr_lsr = (rep.ntp_sec << 16) | (rep.ntp_frac >> 16);
                 impl_->last_sr_arrival = net_now_ms();
+                note_rtt(rep);
                 if (handler_) {
                     SenderInfo si;
                     si.ntp_sec      = rep.ntp_sec;
@@ -563,6 +446,7 @@ void Session::on_rtcp_readable()
                 break;
             case RTCP_RR:
                 if (rtcp_rr_parse(&v, &rep) != RTP_OK) break;
+                note_rtt(rep);
                 if (handler_)
                     handler_->on_receiver_report(rep.ssrc, report_blocks(rep));
                 break;
@@ -582,7 +466,30 @@ void Session::on_rtcp_readable()
     }
 }
 
-std::vector<ReportBlock> Session::report_blocks(const rtcp_rep_t& rep)
+/* Round-trip time from a report block the peer wrote about us (RFC 3550
+ * §6.4.1): it echoes the middle 32 NTP bits of the last SR it had from
+ * us (lsr) and how long it then held the report (dlsr), so
+ *
+ *     RTT = now_ntp - lsr - dlsr
+ *
+ * all in 1/65536 s. A zero lsr means the peer had never heard an SR from
+ * us when it wrote the block — no measurement, leave the last one alone.
+ * Blocks about any other source are somebody else's round trip. */
+void Stream::note_rtt(const rtcp_rep_t& rep)
+{
+    uint32_t sec, frac;
+    rtp_ntp_now(&sec, &frac);
+    uint32_t now = (sec << 16) | (frac >> 16);
+
+    for (unsigned i = 0; i < rep.count; i++) {
+        const rtcp_report_t* r = &rep.reports[i];
+        if (r->ssrc != impl_->ssrc || r->lsr == 0) continue;
+        uint32_t delay = now - r->lsr - r->dlsr; /* wraps modulo 2^32 */
+        impl_->rtt_ms  = (double)delay * 1000.0 / 65536.0;
+    }
+}
+
+std::vector<ReportBlock> Stream::report_blocks(const rtcp_rep_t& rep)
 {
     std::vector<ReportBlock> out(rep.count);
     for (unsigned i = 0; i < rep.count; i++) {
@@ -600,21 +507,23 @@ std::vector<ReportBlock> Session::report_blocks(const rtcp_rep_t& rep)
 
 /* ---- periodic reports ---- */
 
-void Session::arm_timer()
+void Stream::arm_timer()
 {
     if (impl_->timer_id || !impl_->reports_on || impl_->rtcp_ms == 0) return;
-    impl_->timer_id = net_loop_after(impl_->loop->raw(), impl_->rtcp_ms,
-                                     Impl::timer_tramp, this);
+    net_loop* l = impl_->lp();
+    if (!l) return; /* the loop is gone; nothing left to report to */
+    impl_->timer_id =
+        net_loop_after(l, impl_->rtcp_ms, Impl::timer_tramp, this);
     if (impl_->timer_id == 0) throw Error("net_loop_after failed");
 }
 
-void Session::on_report_timer()
+void Stream::on_report_timer()
 {
     send_report(false, "");
     arm_timer();
 }
 
-void Session::send_report(bool with_bye, const std::string& reason)
+void Stream::send_report(bool with_bye, const std::string& reason)
 {
     if (!impl_->has_peer) return;
 

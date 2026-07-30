@@ -42,6 +42,9 @@
 %include <std_vector.i>
 %include <exception.i>
 
+/* shared move-on-value-return typemap */
+%include "common.i"
+
 /* ---- exceptions: diam::Error / std::exception -> Lua error ---- */
 
 %exception {
