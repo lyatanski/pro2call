@@ -1,8 +1,7 @@
 #!/usr/bin/env lua
 --
 -- Usage:
---   LUA_CPATH=<build>/bindings/lua/?.so [PGW_IP=smf] [IMS_SUBS=N] \
---     [TX_MODE=loop|sync] [GTP_T3_MS=1000] lua ims_test_s5.lua
+--   LUA_CPATH=<build>/bindings/lua/?.so [PGW_IP=smf] [IMS_SUBS=N] lua ims_test_s5.lua
 --
 -- Attaches N IMS subscribers over S5/S8 and registers each with the IMS,
 -- concurrently, on one net.Loop. IMS_SUBS (default 1) sets the count; each
@@ -62,11 +61,6 @@
 --     the peer's view of our uplink from RTCP report blocks, RTT from their
 --     lsr/dlsr, and a G.107 MOS *estimate* computed from those packet
 --     statistics (no audio is decoded, so it is not PESQ/POLQA).
---
--- Because the tool measures itself, a fixed 100 ms timer records
--- actual-vs-scheduled firing delta throughout the run and the summary reports
--- loop-lag p95: any run whose lag is a material fraction of its setup times is
--- measuring the tool, not the network.
 --
 -- GTP-U user plane (eBPF): with CAP_BPF + CAP_NET_ADMIN and an eBPF build
 -- the datapath is loaded once and shared. Set $GTPU_IFACE (the S5/S8-U
@@ -183,24 +177,6 @@ local MEDIA = {
     port_base = 40000,
 }
 
--- Ramp the attach: space each subscriber's Create Session by RAMP_MS so a large
--- IMS_SUBS arrives as a smooth stream, not a single burst that overruns the core
--- (SMF Create Session, the CSCF chain and the one net.Loop) past SIP_T_MS. 0 =
--- fire everything up front (the original behaviour).
-local RAMP_MS    = tonumber(os.getenv("RAMP_MS") or "0")
-
--- Where the sends happen. "loop" (default) puts each UE socket's output on the
--- net.Loop (net.UdpSocket:tx_loop): a sendto() queues the datagram and returns,
--- and the loop pushes everything queued during one iteration out in batched
--- sendmmsg() calls — so no subscriber waits in the kernel while the next one is
--- being built, and a full socket buffer becomes back-pressure the queue rides
--- out instead of a failed REGISTER. "sync" keeps the direct per-datagram
--- sendto, for measuring what that costs. It switches the GTP-C endpoint the
--- same way (gtp.Endpoint:set_tx_loop), which is where a 1000-wide Create
--- Session burst collapses from 1000 syscalls to ~16.
-local TX_MODE    = os.getenv("TX_MODE") or "loop"
-local TX_ON_LOOP = TX_MODE ~= "sync"
-
 -- Per-event logging. The trace is ~18 lines per subscriber at ~1.6 us of
 -- unbuffered write each, so past a few hundred subscribers the tool spends
 -- a serious fraction of a core describing the run rather than driving it —
@@ -272,6 +248,34 @@ local function attempt(sub, what, fn)
     local ok, err = pcall(fn)
     slog(sub, what, ok and "ok" or ("skipped (" .. why(err) .. ")"))
     return ok
+end
+
+-- Feed one of the sip module's machines, but only while it can still move.
+--
+-- A machine in its terminal state is not something to hide: fsm_act()
+-- (task/src/fsm.c) warns "fsm: already in the terminal state" and the facade
+-- turns the FSM_E_FINAL into an exception, so a bare pcall around the feed
+-- swallows the error and leaves one unexplained WARN line per call on stderr.
+-- Every event that reaches a terminal machine here is one it is CORRECT to
+-- drop, so the guard belongs at the feed, not around it:
+--
+--   * the ACK for a 2xx is its OWN transaction (RFC 3261 §17.2.1) — sending the
+--     200 OK ended the INVITE server transaction and handed retransmission to
+--     the TU, so the ACK that follows has no transaction left to move. This is
+--     the one that fires on every answered call;
+--   * a retransmitted 200 OK, or a BYE that crosses our own, arrives at a
+--     dialog or client transaction we have already torn down.
+--
+-- Transaction and Dialog both answer terminated(). The registration machines
+-- call that state failed() and are only ever fed while the subscriber is live
+-- (handle_sip returns early once it is done), so they keep their own path.
+-- The method is taken as a value rather than wrapped in a closure: these run
+-- once per message, and pcall(m.recv, m, msg) allocates nothing.
+local function feed_ev(m, ev)
+    if m and not m:terminated() then pcall(m.event, m, ev) end
+end
+local function feed_msg(m, msg)
+    if m and not m:terminated() then pcall(m.recv, m, msg) end
 end
 
 -- Resolve a host name to an IPv4 literal via the net module's own resolver
@@ -759,7 +763,7 @@ local function run()
     end
     ep:set_t3_ms(T3_MS)
     ep:set_n3(N3)
-    ep:set_tx_loop(TX_ON_LOOP)
+    ep:set_tx_loop(true)
 
     -- ---- shared GTP-U datapath (loaded once) ----
     local up
@@ -807,26 +811,6 @@ local function run()
     }
     local function mark_pkt() stats.pkt_last = now() end
 
-    -- ---- the tool measures itself: instrument that ----
-    --
-    -- Both UEs of every pair, all RTP, all timers and all SIP share one thread.
-    -- When the loop saturates, every timing mark below is inflated by the
-    -- tool's own queueing — and the numbers still look plausible, which is what
-    -- makes it dangerous. A fixed 100 ms timer whose actual-vs-scheduled delta
-    -- is recorded costs nothing and turns that into a reported figure: any run
-    -- whose loop-lag p95 is a material fraction of its setup times is measuring
-    -- the tool, not the network.
-    local LAG_MS = 100
-    local lag = { samples = {}, stop = false }
-    local function arm_lag()
-        if lag.stop then return end
-        local due = now() + LAG_MS
-        loop:after(LAG_MS, function()
-            lag.samples[#lag.samples + 1] = now() - due
-            arm_lag()
-        end)
-    end
-
     -- ---- call phase state ----
     local calls, by_callid = {}, {}
     local cpending, cguard = 0, nil
@@ -837,7 +821,8 @@ local function run()
         stage = {},                           -- where a failed call died
         kpi = { pdd = {}, sst = {}, sst_net = {}, mo_transit = {}, mt_transit = {},
                 answer = {}, cut = {}, release = {} },
-        media = { streams = 0, zero = 0, early = 0, late = 0, no_reports = 0,
+        media = { streams = 0, calls = 0, zero = 0, early = 0, late = 0, no_reports = 0,
+                  unconnected = 0,   -- streams opened for a call that never answered
                   tx = 0, rx = 0, tx_err = 0, tx_why = nil,
                   dl_loss = {}, dl_jitter = {}, ul_loss = {}, ul_jitter = {},
                   exp_loss = {}, rtt = {}, mos = {} },
@@ -983,18 +968,15 @@ local function run()
         banner(("Delete Session Requests — tearing down %d PDN connection(s)"):format(#del))
         dpending = #del
         -- overall deadline so a lost response cannot hang teardown forever
-        tguard = loop:after(#del * math.max(RAMP_MS, 1) + T3_MS * N3 + 2000,
+        tguard = loop:after(#del + T3_MS * N3 + 2000,
                             function() tguard = nil; loop:stop() end)
         for i, s in ipairs(del) do
-            local function fire_del()
-                local dok, derr = pcall(function() s.sess:delete_session() end)
-                if dok then
-                    slog(s, "-> Delete Session Req", ("linked EBI -> PGW ctrl TEID %#x"):format(s.pgw_ctrl_teid))
-                else
-                    del_done(s, false, "send failed: " .. why(derr))
-                end
+            local dok, derr = pcall(function() s.sess:delete_session() end)
+            if dok then
+                slog(s, "-> Delete Session Req", ("linked EBI -> PGW ctrl TEID %#x"):format(s.pgw_ctrl_teid))
+            else
+                del_done(s, false, "send failed: " .. why(derr))
             end
-            if RAMP_MS > 0 then loop:after((i - 1) * RAMP_MS, fire_del) else fire_del() end
         end
     end
 
@@ -1398,7 +1380,7 @@ local function run()
             stop_media(c)
             local bye = build_in_dialog(c, sip.BYE, "BYE", c.cseq + 1,
                                         c.branch .. "-bye", c.route_mo)
-            pcall(function() c.dlg_mo:event(sip.DE_TERMINATE) end)
+            feed_ev(c.dlg_mo, sip.DE_TERMINATE)
             send_call(c.mo, c.mo.sock, "mo", bye, "BYE")
             carm(c, CALL.t_ms, function()
                 -- No 200 to our BYE: released as far as we are concerned, but
@@ -1419,8 +1401,11 @@ local function run()
                                 rate = c.mt_rate or MEDIA.rate,
                                 ptime = MEDIA.ptime_ms }
         local wire = build_response(c, mt, c.mt_req, 200, "OK", body)
-        pcall(function() c.txn_mt:event(sip.TE_SEND_2XX) end)
-        pcall(function() c.dlg_mt:event(sip.DE_CONFIRM) end)
+        -- The 2xx ends the INVITE server transaction (§17.2.1); the ACK that
+        -- follows is a transaction of its own, which is why call_request feeds
+        -- it through feed_msg rather than into this machine.
+        feed_ev(c.txn_mt, sip.TE_SEND_2XX)
+        feed_ev(c.dlg_mt, sip.DE_CONFIRM)
         c.t.t5 = now()
         send_call(mt, mt.sock, "mt", wire, "200 OK (answer)")
         -- A UE starts sending as it answers; the MO starts at its ACK, so
@@ -1433,8 +1418,8 @@ local function run()
     local function on_invite(sub, c, m)
         c.t.t2 = now()
         c.stage = "ringing"
-        pcall(function() c.txn_mt:recv(m) end)
-        pcall(function() c.dlg_mt:recv(m) end)
+        feed_msg(c.txn_mt, m)
+        feed_msg(c.dlg_mt, m)
         c.mt_req   = m                    -- what the responses must echo back
         c.route_mt = route_set(m, false)
 
@@ -1460,8 +1445,8 @@ local function run()
         -- 180 now (that is what the MO's post-dial delay measures), 200 OK
         -- after the deliberate ring hold.
         local ring = build_response(c, sub, m, 180, "Ringing")
-        pcall(function() c.txn_mt:event(sip.TE_SEND_1XX) end)
-        pcall(function() c.dlg_mt:event(sip.DE_EARLY) end)
+        feed_ev(c.txn_mt, sip.TE_SEND_1XX)
+        feed_ev(c.dlg_mt, sip.DE_EARLY)
         c.t.t3 = now()
         send_call(sub, sub.sock, "mt", ring, "180 Ringing")
         loop:after(CALL.answer_ms, function() send_answer(c) end)
@@ -1478,7 +1463,10 @@ local function run()
             if c.t.t2 then return end            -- retransmission; already ringing
             return on_invite(sub, c, m)
         elseif m.method == sip.ACK then
-            if c then pcall(function() c.txn_mt:recv(m) end) end
+            -- Absorbed by the transaction only when a non-2xx final left one
+            -- alive (Completed -ACK-> Confirmed). After a 2xx there is nothing
+            -- to absorb it — see feed_msg.
+            if c then feed_msg(c.txn_mt, m) end
             return
         elseif m.method == sip.BYE then
             -- Answer it whoever we are; then this call is over for us.
@@ -1490,7 +1478,7 @@ local function run()
             local wire = build_response(c or { to_tag = "x", mt = sub }, sub, m, 200, "OK")
             send_call(sub, sock, role, wire, "200 OK (BYE)")
             if c and not c.done then
-                pcall(function() (sub == c.mt and c.dlg_mt or c.dlg_mo):recv(m) end)
+                feed_msg(sub == c.mt and c.dlg_mt or c.dlg_mo, m)
                 if not c.released_at then c.released_at = now() end
                 cstats.released = cstats.released + 1
                 stop_media(c)
@@ -1532,8 +1520,8 @@ local function run()
         end
         if meth ~= sip.INVITE or c.done then return end
 
-        pcall(function() c.txn_mo:recv(m) end)
-        pcall(function() c.dlg_mo:recv(m) end)
+        feed_msg(c.txn_mo, m)
+        feed_msg(c.dlg_mo, m)
 
         if m.status == 100 then
             c.t.t1 = c.t.t1 or now()
@@ -1652,7 +1640,7 @@ local function run()
                                      pt = MEDIA.pt, codec = MEDIA.codec,
                                      rate = MEDIA.rate, ptime = MEDIA.ptime_ms }
                 local wire = build_invite(c)
-                pcall(function() c.txn_mo:event(sip.TE_SEND_REQUEST) end)
+                feed_ev(c.txn_mo, sip.TE_SEND_REQUEST)
                 c.t.t0 = now()
                 cstats.first_invite = cstats.first_invite or c.t.t0
                 cstats.attempted = cstats.attempted + 1
@@ -1810,7 +1798,7 @@ local function run()
         -- Put this UE's output on the loop (queue now, batched sendmmsg from
         -- the loop). NET_RD is the fd's steady-state interest above, which the
         -- queue restores after adding NET_WR to ride out a full send buffer.
-        if TX_ON_LOOP then sub.sock:tx_loop(loop, net.NET_RD) end
+        sub.sock:tx_loop(loop, net.NET_RD)
 
         -- No second socket: with one protected port in both roles (see
         -- security_client) the P-CSCF delivers terminating requests to this
@@ -2069,10 +2057,10 @@ local function run()
     CSR_U.if_type, CSR_U.addr4 = gtp.GTP2_IF_S5S8U_SGW, sgw_ip
 
     -- Point the shared template at one subscriber. Called from inside fire(),
-    -- not ahead of it: with RAMP_MS the send is deferred, and filling early
-    -- would let the next subscriber's values overwrite the template before
-    -- this one's request left. create_session() copies what it is given, so
-    -- one fill-then-send per subscriber is all that is needed.
+    -- not ahead of it: filling early would let the next subscriber's values
+    -- overwrite the template before this one's request left. create_session()
+    -- copies what it is given, so one fill-then-send per subscriber is all
+    -- that is needed.
     local function fill_csr(sub)
         CSR.imsi   = sub.imsi
         CSR_U.teid = sub.up_teid
@@ -2081,24 +2069,18 @@ local function run()
         return CSR
     end
 
-    arm_lag()   -- from here to the end of the run, watch our own scheduling
-
     local burst_t0 = now()
     for i = 1, NSUBS do
         local sub = make_sub(i)
         subs[i] = sub
         by_imsi[sub.imsi] = sub
 
-        -- Send now, or stagger by RAMP_MS * index so the attach is a stream.
-        local function fire()
-            local sess = ep:create_session(fill_csr(sub), pgw_ip)
-            sub.sess = sess
-            by_teid[sess:local_teid()] = sub
-            if VERBOSE then
-                slog(sub, "-> Create Session Req", ("SGW ctrl TEID %#x, IMSI %s"):format(sess:local_teid(), sub.imsi))
-            end
+        local sess = ep:create_session(fill_csr(sub), pgw_ip)
+        sub.sess = sess
+        by_teid[sess:local_teid()] = sub
+        if VERBOSE then
+            slog(sub, "-> Create Session Req", ("SGW ctrl TEID %#x, IMSI %s"):format(sess:local_teid(), sub.imsi))
         end
-        if RAMP_MS > 0 then loop:after((i - 1) * RAMP_MS, fire) else fire() end
     end
 
     -- How long the attach burst took to leave the client, split into the part
@@ -2106,11 +2088,9 @@ local function run()
     -- the kernel (the endpoint's queue drained with batched sendmmsg — what
     -- the loop would do at the top of its next iteration anyway). With the
     -- direct path the two are the same thing: one sendto per request, inline.
-    if RAMP_MS == 0 then
-        local offer = now() - burst_t0
-        ep:tx_flush()
-        stats.burst = { n = NSUBS, offer = offer, total = now() - burst_t0 }
-    end
+    local offer = now() - burst_t0
+    ep:tx_flush()
+    stats.burst = { n = NSUBS, offer = offer, total = now() - burst_t0 }
 
     -- One dispatcher for every socket and timer until the last subscriber is
     -- terminal (registered, rejected or timed out) and the grace elapses.
@@ -2128,8 +2108,7 @@ local function run()
     end
     stats.gtp_tx = { sent = ep:tx_sent(), calls = ep:tx_calls(),
                      blocked = ep:tx_blocked(), dropped = ep:tx_dropped() }
-    stats.sip_tx = { sent = 0, calls = 0, blocked = 0, dropped = 0,
-                     queued = TX_ON_LOOP, socks = 0 }
+    stats.sip_tx = { sent = 0, calls = 0, blocked = 0, dropped = 0, socks = 0 }
     for _, sub in ipairs(subs) do
         if sub.sock and sub.sock:tx_queued() then
             stats.sip_tx.socks = stats.sip_tx.socks + 1
@@ -2150,10 +2129,20 @@ local function run()
     --      rtpengine routing bug takes) instead of reporting it as no data.
     local M = cstats.media
     for _, c in ipairs(calls) do
+        -- A call that never reached its 200 OK still opened both sockets at
+        -- INVITE time, and they carried nothing because nothing was ever
+        -- negotiated. Those streams are counted APART from the media figures:
+        -- folded in, they report a signalling failure as one-way audio, and
+        -- when the only call carrying RTP is the one that failed they leave
+        -- every quality row reading "no samples" with nothing to say why.
+        local connected, counted = c.answered_at ~= nil, 0
         for _, side in ipairs({ { c.sess_mo, c.mstat_mo }, { c.sess_mt, c.mstat_mt } }) do
             local s, st = side[1], side[2]
-            if s and st then
+            if s and st and not connected then
+                M.unconnected = M.unconnected + 1
+            elseif s and st then
                 M.streams = M.streams + 1
+                counted = counted + 1
                 local ok, sm = pcall(function() return s:stats() end)
                 if ok then
                     M.early = M.early + st.early
@@ -2199,9 +2188,9 @@ local function run()
                 end
             end
         end
+        if counted > 0 then M.calls = M.calls + 1 end
     end
     stats.calls = cstats
-    stats.lag_samples = lag.samples
 
     -- Datapath counters, read while the datapath is still loaded. Aggregated
     -- over every bearer the run programmed, because the error tallies are the
@@ -2229,7 +2218,6 @@ local function run()
     end
 
     -- Teardown that needs no loop.
-    lag.stop = true
     if xfrm then
         pcall(function() xfrm:flush_policy() end)
         pcall(function() xfrm:flush_sa(ipsec.PROTO_ESP) end)
@@ -2339,25 +2327,6 @@ local function dist(s, unit, fmt)
 end
 
 if cs and cs.pairs_total > 0 then
-    -- The most important number in the file, and the cheapest: when the loop
-    -- saturates, every mark below is inflated by the tool's own queueing while
-    -- still looking plausible. Print it BEFORE the measurements it qualifies.
-    banner("Tool self-check — loop lag (actual minus scheduled, fixed 100 ms timer, whole run)")
-    local sst = summarize(cs.kpi.sst)
-    stats.lag = summarize(stats.lag_samples)
-    if stats.lag then
-        local l = stats.lag
-        line("loop lag", ("p50 %.0f  p95 %.0f  max %.0f ms  (n=%d)"):format(l.p50, l.p95, l.max, l.n))
-        if sst and sst.p50 > 0 then
-            local share = l.p95 / sst.p50 * 100
-            line("validity", share >= 20
-                and ("loop lag p95 is %.0f%% of setup-time p50 -- these numbers are the TOOL's, not the network's"):format(share)
-                or  ("loop lag p95 is %.0f%% of setup-time p50 (tool-side saturation ruled out)"):format(share))
-        end
-    else
-        line("loop lag", "not sampled")
-    end
-
     banner(("Call setup — %d answered / %d attempted (%d of %d structural pair(s) eligible)")
         :format(cs.answered, cs.attempted, cs.eligible, cs.pairs_total))
     if cs.attempted > 0 then
@@ -2422,8 +2391,8 @@ if cs and cs.pairs_total > 0 then
     -- ---- media quality ----
     local M = cs.media
     if M.streams > 0 then
-        banner(("Media quality — %d stream(s) over %d call(s) carrying RTP  [%s, %d ms, RTCP %d ms]")
-            :format(M.streams, cs.media_calls,
+        banner(("Media quality — %d stream(s) over %d of %d call(s) carrying RTP  [%s, %d ms, RTCP %d ms]")
+            :format(M.streams, M.calls, cs.media_calls,
                     MEDIA.pt == 0 and "G.711 PCMU" or ("payload type " .. MEDIA.pt),
                     MEDIA.ptime_ms, MEDIA.rtcp_ms))
         line("packets sent / received", ("%d / %d"):format(M.tx, M.rx))
@@ -2446,12 +2415,25 @@ if cs and cs.pairs_total > 0 then
             line("ONE-WAY AUDIO", ("%d of %d stream(s) received nothing at all")
                 :format(M.zero, M.streams))
         end
+        if M.unconnected > 0 then
+            line("streams not counted", ("%d belonged to call(s) that never answered")
+                :format(M.unconnected))
+        end
         if M.no_reports > 0 then
             line("no RTCP received", ("%d stream(s) -- uplink figures come from fewer streams")
                 :format(M.no_reports))
         end
         if M.early > 0 then line("early media", ("%d packet(s) before the 200 OK"):format(M.early)) end
         if M.late > 0 then line("late media", ("%d packet(s) after the BYE (relay teardown lag)"):format(M.late)) end
+    elseif M.unconnected > 0 then
+        -- The distinction that matters: nothing was measured because no call
+        -- carrying RTP ever connected. Said plainly here, because the
+        -- alternative — a page of "no samples" — reads as a media fault.
+        banner(("Media quality — nothing to measure: every RTP call failed before the answer (%d stream(s))")
+            :format(M.unconnected))
+        line("", "the sockets opened at INVITE time and no SDP was ever negotiated,")
+        line("", "so no RTP was expected. The cause is in the call-failure")
+        line("", "attribution above, not in the media path.")
     elseif cs.media_calls > 0 then
         banner("Media quality — no stream opened (media sockets need CAP_NET_ADMIN for the PAA source)")
     end
@@ -2474,8 +2456,8 @@ local rx_r = per_s(stats.rx, stats.pkt_last)
 banner("Throughput (rates from first Create Session Request)")
 line("sessions created",     ("%d in %.2fs  ->  %.1f/s"):format(stats.sess, sess_w, sess_r))
 line("registrations",        ("%d in %.2fs  ->  %.1f/s"):format(stats.regs, reg_w, reg_r))
-line("SIP packets sent",      ("%d  ->  %.1f/s"):format(stats.tx, tx_r))
-line("SIP packets received",  ("%d  ->  %.1f/s"):format(stats.rx, rx_r))
+line("SIP packets sent",     ("%d  ->  %.1f/s"):format(stats.tx, tx_r))
+line("SIP packets received", ("%d  ->  %.1f/s"):format(stats.rx, rx_r))
 -- Calls are rated over their own window (first INVITE to last answer) so the
 -- registration phase that precedes them does not dilute the figure, exactly as
 -- the rates above exclude the grace and teardown.
@@ -2488,26 +2470,10 @@ if cs and cs.attempted > 0 then
         or  ("%d (single burst, under one clock tick)"):format(cs.answered))
 end
 
--- What the loop-driven send path did: datagrams handed to the kernel per
--- sendmmsg() syscall, and how much back-pressure it absorbed.
-local function tx_line(what, t)
-    if t.sent == 0 then return line(what, "no output") end
-    line(what, ("%d datagram(s) in %d syscall(s)  ->  %.1f per call%s%s")
-        :format(t.sent, t.calls, t.sent / math.max(t.calls, 1),
-                t.blocked > 0 and (", %d push-back(s) absorbed"):format(t.blocked) or "",
-                t.dropped > 0 and (", %d dropped"):format(t.dropped) or ""))
-end
-banner(("Loop-driven TX (TX_MODE=%s)"):format(os.getenv("TX_MODE") or "loop"))
 if stats.burst then
     local b = stats.burst
     line("Create Session burst", ("%d request(s) offered in %dms, on the wire in %dms  ->  %.0f/s")
         :format(b.n, b.offer, b.total, b.n / math.max(b.total, 1) * 1000))
-end
-tx_line("GTP-C endpoint", stats.gtp_tx)
-if stats.sip_tx.queued then
-    tx_line(("SIP, %d UE socket(s)"):format(stats.sip_tx.socks), stats.sip_tx)
-else
-    line("SIP", "direct sendto per datagram (TX_MODE=sync)")
 end
 
 -- A run passes when every subscriber registered and every call it actually
