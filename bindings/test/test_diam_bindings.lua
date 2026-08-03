@@ -35,6 +35,26 @@ check(diam.AVP_SESSION_ID == 263, "Session-Id code")
 check(diam.VENDOR_3GPP == 10415, "3GPP vendor id")
 check(diam.CC_REQUEST_TYPE_INITIAL_REQUEST == 1, "enum constant")
 
+-- SMS-over-IMS interfaces (TS 29.338 SGd/S6c, TS 29.328/29.329 Sh).
+-- SGd is a bare <application> in the dictionary with no registry of its
+-- own: its AVPs are the S6c ones, so the two must both be selected or
+-- an OFR has nothing to carry.
+check(diam.APP_SGD == 16777313, "SGd app id")
+check(diam.APP_S6C == 16777312, "S6c app id")
+check(diam.APP_SH == 16777217, "Sh app id")
+check(diam.CMD_MO_FORWARD_SHORT_MESSAGE == 8388645, "OFR command code")
+check(diam.CMD_MT_FORWARD_SHORT_MESSAGE == 8388646, "TFR command code")
+check(diam.CMD_ALERT_SERVICE_CENTRE == 8388648, "ALR command code")
+check(diam.CMD_SEND_ROUTING_INFO_FOR_SM == 8388647, "SRR command code")
+check(diam.AVP_SM_RP_UI == 3301, "SM-RP-UI code")
+check(diam.AVP_SC_ADDRESS == 3300, "SC-Address code")
+check(diam.AVP_TFR_FLAGS == 3302, "TFR-Flags code")
+check(diam.AVP_OFR_FLAGS == 3328, "OFR-Flags code")
+check(diam.AVP_USER_IDENTITY == 700, "User-Identity code")
+check(diam.AVP_DATA_REFERENCE == 703, "Data-Reference code")
+check(diam.DATA_REFERENCE_SMSREGISTRATIONINFO == 24, "SMSRegistrationInfo")
+check(diam.SM_RP_MTI_SM_DELIVER == 0, "SM-RP-MTI SM_DELIVER")
+
 -- name tables -------------------------------------------------------------
 check(diam.app_name(diam.APP_CX) == "Cx", "app_name")
 check(diam.cmd_name(272) == "Credit-Control", "cmd_name")
@@ -100,6 +120,25 @@ check(rsu:grouped(), "nested group")
 check(rsu:child(diam.AVP_CC_TOTAL_OCTETS):u64() == 5 * 1024 * 1024, "nested child u64")
 check(mscc:has_child(diam.AVP_RATING_GROUP), "has_child")
 check(not mscc:has_child(diam.AVP_SESSION_ID), "has_child negative")
+
+-- binary OctetString survives the SWIG typemap ---------------------------
+-- SM-RP-UI (TS 29.338) carries a raw RPDU, which routinely contains 0x00
+-- (a GSM 7-bit '@', an empty TP-UD, a zero timestamp octet). If a future
+-- typemap change ever went NUL-terminated, SMS would break silently and
+-- nothing else in this suite would notice.
+local rpdu = "\x00\x01\x00\x0Bhi\xFF\x00there\x00"
+local sgd = diam.Builder()
+    :request(diam.CMD_MO_FORWARD_SHORT_MESSAGE, diam.APP_SGD)
+    :put_str(diam.AVP_SESSION_ID, "ipsmgw.example.net;1;1")
+    :put_str(diam.AVP_SC_ADDRESS, "+123456789")
+    :put_str(diam.AVP_SM_RP_UI, rpdu)
+    :put_u32(diam.AVP_OFR_FLAGS, 0)
+    :done()
+local sgd_msg = diam.parse(sgd)
+check(sgd_msg.cmd == diam.CMD_MO_FORWARD_SHORT_MESSAGE, "OFR command round-trip")
+check(sgd_msg.app == diam.APP_SGD, "SGd application id round-trip")
+check(sgd_msg:str(diam.AVP_SM_RP_UI, diam.VENDOR_3GPP) == rpdu,
+      "binary SM-RP-UI survives the round-trip byte for byte")
 
 -- enum value names ------------------------------------------------------
 local rt = msg:find(diam.AVP_CC_REQUEST_TYPE)

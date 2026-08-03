@@ -25,7 +25,8 @@ var files embed.FS
 // ---- Curation over the dictionary registries ----
 
 const (
-	specDoc     = "RFC 6733; 3GPP TS 29.229 (Cx), TS 29.212 (Gx), TS 29.214 (Rx), TS 32.299 (Ro/Rf)"
+	specDoc = "RFC 6733; 3GPP TS 29.229 (Cx), TS 29.212 (Gx), TS 29.214 (Rx), " +
+		"TS 32.299 (Ro/Rf), TS 29.328/29.329 (Sh), TS 29.338 (S6c/SGd)"
 	specRelease = "wireshark master 2026-07" // dict/ snapshot tag
 )
 
@@ -37,17 +38,24 @@ var dictOrder = []string{"dictionary.xml", "chargecontrol.xml", "TGPP.xml"}
 // carries the TS 32.299 charging AVPs in the dictionary) or a decimal
 // application id. Gq is selected because the dictionaries define the
 // 500-series media AVPs that Rx reuses (TS 29.214 §5.3) under the Gq
-// application.
-var selectApps = []string{"base", "3", "4", "16777216", "16777222", "16777236", "16777238"}
+// application; S6c the same way for SGd, which is a bare <application>
+// element with no registry of its own — the short-message AVPs
+// (SM-RP-UI, SC-Address, TFR-Flags, ...) are defined once under S6c and
+// reused verbatim by SGd (TS 29.338 §6.3).
+var selectApps = []string{"base", "3", "4", "16777216", "16777217", "16777222",
+	"16777236", "16777238", "16777312", "16777313"}
 
 var appComments = map[string]string{
 	"Base":            "RFC 6733 base protocol",
 	"Base-Accounting": "RFC 6733 accounting; Rf offline charging (TS 32.299) runs here",
 	"Credit-Control":  "RFC 4006 DCCA; Ro online charging (TS 32.299) runs here",
 	"Cx":              "IMS CSCF-HSS interface, TS 29.229",
+	"Sh":              "IP-SM-GW/AS-HSS interface, TS 29.328/29.329",
 	"Gq":              "TS 29.209; defines the media AVPs Rx reuses",
 	"Rx":              "AF-PCRF interface, TS 29.214",
 	"Gx":              "PCEF-PCRF policy and charging control, TS 29.212",
+	"S6c":             "SMSC-HSS routing info; also the SGd AVP registry, TS 29.338",
+	"SGd":             "SMS over Diameter, TS 29.338",
 }
 
 // Commands the selected applications use but the dictionaries define
@@ -55,6 +63,30 @@ var appComments = map[string]string{
 // dictionaries keep it in their NASREQ file.
 var extraCommands = []*Command{
 	{Name: "AA", Code: 265, App: "Rx"},
+}
+
+// AVPs a selected application uses that the dictionary snapshot is
+// missing outright. TS 29.338 §6.3.20 defines OFR-Flags at 3328, in the
+// 3324..3328 run the Wireshark dictionary skips; an MO-Forward-Short-
+// Message-Request that cannot carry it has no way to say the message
+// was submitted over S6as6d. Same escape hatch as extraCommands.
+var extraAVPs = []*AVP{
+	{Name: "OFR-Flags", Code: 3328, Vendor: "3GPP", VendorID: 10415,
+		Type: "Unsigned32", Mandatory: false, App: "S6c"},
+}
+
+// Provenance fixups for commands the dictionaries do extract, but into
+// the wrong registry. The TS 29.338 commands sit in dictionary.xml's
+// <base> command list, so they come out labelled "Base"; this only
+// rewrites the comment the generated header carries beside each code,
+// never the code itself. Appending them to extraCommands instead would
+// emit the same DIAM_CMD_* constant twice.
+var commandApp = map[uint32]string{
+	8388645: "SGd", // MO-Forward-Short-Message
+	8388646: "SGd", // MT-Forward-Short-Message
+	8388647: "S6c", // Send-Routing-Info-for-SM
+	8388648: "SGd", // Alert-Service-Centre
+	8388649: "SGd", // Report-SM-Delivery-Status
 }
 
 // AVPs whose Enumerated values become C constants + name-table entries
@@ -80,6 +112,13 @@ var enumAVPs = []string{
 	"Event-Trigger", "PCC-Rule-Status", "Rule-Failure-Code",
 	"Pre-emption-Capability", "Pre-emption-Vulnerability", "Metering-Method",
 	"Reporting-Level", "Online", "Offline", "Session-Release-Cause",
+	// SGd/S6c (TS 29.338) and Sh (TS 29.328): what an IP-SM-GW sets in
+	// an OFR/TFR and dispatches on in the answer.
+	"SM-Delivery-Outcome", "SM-Delivery-Cause",
+	"SM-Enumerated-Delivery-Failure-Cause", "SM-RP-MTI",
+	"SM-Delivery-Not-Intended", "Serving-Node-Type",
+	"User-Data-Already-Available", "Alert-Reason",
+	"Data-Reference", "Subs-Req-Type",
 }
 
 // ---- Generation ----
@@ -118,6 +157,29 @@ func run(outDir string) error {
 		a.Comment = appComments[a.Name]
 	}
 	spec.Commands = append(spec.Commands, extraCommands...)
+	for _, c := range spec.Commands {
+		if app, ok := commandApp[c.Code]; ok {
+			c.App = app
+		}
+	}
+	// Hand-added AVPs yield to the dictionary: a later snapshot that
+	// fills the gap must not produce the constant twice. build() sorts
+	// the registry, so appending out of code order is fine.
+	for _, a := range extraAVPs {
+		dup := false
+		for _, have := range spec.AVPs {
+			if have.Code == a.Code && have.VendorID == a.VendorID {
+				dup = true
+				warn("avp %s (code %d): now in the dictionary, drop it from extraAVPs",
+					a.Name, a.Code)
+				break
+			}
+		}
+		if !dup {
+			a.CName = deriveCName(a.Name)
+			spec.AVPs = append(spec.AVPs, a)
+		}
+	}
 
 	model, err := build(spec)
 	if err != nil {

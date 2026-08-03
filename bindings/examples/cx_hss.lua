@@ -302,11 +302,55 @@ local DEREG = {
     [diam.SERVER_ASSIGNMENT_TYPE_AUTHENTICATION_FAILURE] = true,
 }
 
--- A minimal but complete IMS subscription (TS 29.228 Annex): one unbarred
--- public identity, no InitialFilterCriteria (no application server needed to
--- complete a bare REGISTER).
-local function profile(impi, impu)
+-- An initial filter criterion sending MESSAGE requests to an application
+-- server — the IP-SM-GW, for SMS over IMS (TS 24.341 §5.3.2). The S-CSCF
+-- triggers application servers from the iFC in the profile returned here
+-- and nowhere else (serving.cfg loads ims_isc and calls
+-- isc_match_filter), so this is what puts bindings/examples/ipsmgw.lua in
+-- the path without touching the ims stack's own configuration.
+--
+-- SessionCase values are TS 29.228 §6.3.5: 0 originating, 1 terminating
+-- for a registered user. DefaultHandling 0 is SESSION_CONTINUED, so a
+-- gateway that is down does not break every other MESSAGE.
+--
+-- The Content-Type service point is deliberately not added. It would be
+-- more precise, but this stack's isc_match_filter only evaluates the
+-- header-based service points it was compiled with, and a criterion whose
+-- extra term never matches sends nothing to the gateway at all — which
+-- looks exactly like a broken iFC.
+local function ifc(as_uri, session_case, priority)
     return table.concat({
+        '<InitialFilterCriteria>',
+        '<Priority>', tostring(priority), '</Priority>',
+        '<TriggerPoint>',
+        '<ConditionTypeCNF>1</ConditionTypeCNF>',
+        '<SPT><ConditionNegated>0</ConditionNegated><Group>0</Group>',
+        '<Method>MESSAGE</Method></SPT>',
+        '<SPT><ConditionNegated>0</ConditionNegated><Group>0</Group>',
+        '<SessionCase>', tostring(session_case), '</SessionCase></SPT>',
+        '</TriggerPoint>',
+        '<ApplicationServer>',
+        '<ServerName>', as_uri, '</ServerName>',
+        '<DefaultHandling>0</DefaultHandling>',
+        '</ApplicationServer>',
+        '</InitialFilterCriteria>',
+    })
+end
+
+-- HSS_IPSMGW is the application server URI, e.g.
+-- "sip:ipsmgw.ims.mnc001.mcc001.3gppnetwork.org:5065". Unset means no iFC
+-- at all, which is what a bare REGISTER needs and what this emulator did
+-- before SMS existed. HSS_IPSMGW_TERM=0 drops the terminating criterion,
+-- for a deployment where the gateway originates its own MT MESSAGE (the
+-- design ipsmgw.lua actually uses) rather than being forked into the
+-- terminating path.
+local IPSMGW      = os.getenv("HSS_IPSMGW")
+local IPSMGW_TERM = (os.getenv("HSS_IPSMGW_TERM") or "1") ~= "0"
+
+-- A minimal but complete IMS subscription (TS 29.228 Annex): one unbarred
+-- public identity, plus the SMS iFC when an IP-SM-GW is configured.
+local function profile(impi, impu)
+    local parts = {
         '<?xml version="1.0" encoding="UTF-8"?>',
         '<IMSSubscription>',
         '<PrivateID>', impi, '</PrivateID>',
@@ -315,9 +359,16 @@ local function profile(impi, impu)
         '<BarringIndication>0</BarringIndication>',
         '<Identity>', impu, '</Identity>',
         '</PublicIdentity>',
-        '</ServiceProfile>',
-        '</IMSSubscription>',
-    })
+    }
+    if IPSMGW then
+        parts[#parts + 1] = ifc(IPSMGW, 0, 0)               -- originating
+        if IPSMGW_TERM then
+            parts[#parts + 1] = ifc(IPSMGW, 1, 1)           -- terminating
+        end
+    end
+    parts[#parts + 1] = '</ServiceProfile>'
+    parts[#parts + 1] = '</IMSSubscription>'
+    return table.concat(parts)
 end
 
 local function on_sar(m)
@@ -483,6 +534,9 @@ log("   listen         %s:%d/%s", BIND, PORT, PROTO)
 log("   Origin-Host    %s", ORIGIN_HOST)
 log("   Origin-Realm   %s", ORIGIN_REALM)
 log("   S-CSCF         %s", SCSCF)
+log("   SMS iFC        %s", IPSMGW
+    and ("%s (orig%s)"):format(IPSMGW, IPSMGW_TERM and " + term" or " only")
+    or "none (set HSS_IPSMGW to put an IP-SM-GW in the MESSAGE path)")
 log("   Host-IP        %s", HOST_IP)
 log("   USIM           K=%s OPc=%s AMF=%s (accept-any-IMSI)", hex(K), hex(OPc), hex(AMF))
 

@@ -2,8 +2,8 @@
 
 SWIG bindings for the C libraries. The GTP stack (`gtp`) is exposed as
 both a Python and a Lua module; the IPsec/XFRM (`ipsec`), SIP codec
-(`sip`), Diameter codec (`diam`) and transport layer (`net`) modules are
-Lua. Each is the same two-layer pattern; the GTP module described below
+(`sip`), SDP codec (`sdp`), SMS codec (`sms`), Diameter codec (`diam`),
+RTP session (`rtp`) and transport layer (`net`) modules are Lua. Each is the same two-layer pattern; the GTP module described below
 is the most involved:
 
 - **`cxx/` — gtpxx**, a C++17 facade over the C libraries, written to
@@ -47,8 +47,14 @@ lua -e 'print(require("gtp").GTPC_PORT)'
 
 `ctest` runs the binding suites — `test/test_bindings.py` and the Lua
 `test_gtp_bindings.lua` / `test_sip_bindings.lua` /
-`test_diam_bindings.lua` / `test_bindings.lua` (ipsec) — along with the
-C tests.
+`test_diam_bindings.lua` / `test_sdp_bindings.lua` /
+`test_sms_bindings.lua` / `test_rtp_bindings.lua` /
+`test_net_bindings.lua` / `test_bindings.lua` (ipsec) — along with the C
+tests. Two of them are coexistence tests rather than codec tests:
+`test_sdp_sip_coexist.lua` and `test_sms_coexist.lua` load several
+modules into ONE interpreter, because SWIG's Lua runtime keys wrapped
+classes in a registry shared by every module and a name collision would
+otherwise go unnoticed at both build and load time.
 
 ## Creating a session
 
@@ -332,6 +338,66 @@ IMS-AKA primitives its ESP keys come from — `ipsec.aka_opc`,
 `ipsec.aka_milenage` and `ipsec.aka_verify` (Milenage, TS 35.206) and
 `ipsec.md5` (for the HTTP Digest AKAv1-MD5 response).
 
+## Lua: sms
+
+The `sms` module wraps the smsxx facade (`cxx/inc/smsxx.hpp`) over the SMS
+codec ([`sms/`](../sms)): the payload half of SMS over IMS. A SIP MESSAGE
+with `Content-Type: application/vnd.3gpp.sms` carries an RPDU
+(TS 24.011), the RPDU carries a TPDU (TS 23.040), and the TPDU carries
+the text — this builds and parses all three layers.
+
+```lua
+local sms = require("sms")
+
+-- MO: the body of a MESSAGE to the service centre
+local body = sms.submit{ to = "+447700900123", text = "hi", srr = true }
+
+-- MT: what arrives at the other UE
+local rp = sms.parse_rpdu(req.body, sms.DIR_SC_TO_MS)
+if rp.type == sms.RP_T_DATA then
+    local t = rp:tpdu()                    -- direction handled for you
+    print(t.addr:display(), t:text())      -- "+44...", "hi"
+    ue:send(sms.ack(sms.DIR_MS_TO_SC, rp.mr))
+end
+```
+
+Three things the facade decides so a script does not have to:
+
+- The six TPDU types are **one** `Tpdu` with a `type` tag, so there is no
+  union arm to reach into — `t.addr` is TP-OA on a DELIVER, TP-DA on a
+  SUBMIT and TP-RA on a STATUS-REPORT.
+- `Rpdu:tpdu()` parses the contained TPDU with the direction the RPDU
+  implies, **and** adds the RP-ERROR modifier: a report TPDU inside an
+  RP-ERROR has a TP-FCS octet the RP-ACK form does not, nothing in the
+  TPDU says which, and guessing shifts every following field by one.
+- `Tpdu:text()` applies TP-DCS, TP-UDHI and TP-UDL together, which is the
+  only way to get the septet alignment and the length units right at once.
+
+Alphabets, causes, message types and type-of-number are enum constants
+(`sms.ALPHA_UCS2`, `sms.RP_CAUSE_CONGESTION`, `sms.T_SUBMIT`,
+`sms.TON_INTERNATIONAL`), and `sms.CONTENT_TYPE` / `sms.FEATURE_TAG`
+carry the two strings every SMS-over-IMS script needs spelled identically.
+`sms.ALPHA_AUTO` picks GSM 7-bit when the text fits it and UCS2 when it
+does not, as a handset does.
+
+Bodies are byte strings throughout, so an RPDU with an embedded `0x00` —
+which is every message containing a GSM 7-bit `@` — survives intact.
+
+Longer text is split for you; each part is a complete RPDU:
+
+```lua
+for _, rpdu in ipairs(sms.parts(sms.submit_parts({ to = n, text = long }, ref))) do
+    send_message(rpdu)
+end
+```
+
+`sms.deliver_from_submit(tpdu, oa)` is what a service centre does to a
+submitted message: SUBMIT to DELIVER with the originator's address and a
+timestamp, keeping TP-PID/TP-DCS/TP-UDHI/TP-UD **byte for byte**. Both
+emulators use it, and it is what makes an end-to-end "what arrived equals
+what was sent" assertion mean something rather than testing the codec
+against itself.
+
 ## Lua: diam
 
 The `diam` module wraps the diamxx facade (`cxx/inc/diamxx.hpp`) over
@@ -549,6 +615,31 @@ All in Lua; run each with `LUA_CPATH=<build>/bindings/lua/?.so lua …`.
   carried. With no `$GX_PCRF` the Gx interface stays down and a local
   default policy is used, so it runs standalone against
   [`examples/ims_test_s5.lua`](examples/ims_test_s5.lua).
+- [`examples/ipsmgw.lua`](examples/ipsmgw.lua) — an IP-SM-GW: the
+  application server that bridges IMS SIP MESSAGE traffic (TS 24.341) to
+  a service centre over Diameter SGd (TS 29.338). Two roles on one
+  `net.Loop`: the **ISC/AS side** on a `net.UdpSocket`, receiving MESSAGE
+  requests the S-CSCF forked here on an initial filter criterion (or that
+  a UE addressed straight to this port), answering a submit **202
+  Accepted** and handing the sender its RP-ACK in a new out-of-dialog
+  MESSAGE; and the **SGd side** on a `net.StreamConn` — CER/CEA, the
+  watchdog, an OFR per submit, and inbound TFR for each delivery the
+  centre pushes. `IPSMGW_MODE=loopback` turns a submit straight into a
+  delivery with no centre and no Diameter at all, which is what makes it
+  the right tool for bisecting an IMS-side failure from an SGd-side one.
+  The relay layer terminates here: the SIP body is an RPDU, `SM-RP-UI` on
+  SGd is the bare TPDU (§7.3.4), and getting that boundary wrong is the
+  most likely reason an SGd interop attempt fails.
+- [`examples/smsc_stub.lua`](examples/smsc_stub.lua) — the service centre
+  side of SGd as a live server: a `net.StreamListener` the IP-SM-GW
+  connects to. CER/CEA advertising SGd, OFR answered with OFA, and every
+  accepted submit stored and forwarded — turned into a delivery for its
+  own TP-DA and pushed back out as a TFR on the connection it arrived on,
+  followed by an SMS-STATUS-REPORT when the submit set TP-SRR. Knobs for
+  the failure paths: `SMSC_OFA_RESULT` refuses every submit (the gateway
+  should turn that into an RP-ERROR the UE understands),
+  `SMSC_DELAY_MS` gives the store-and-forward hop a cost, and
+  `SMSC_FORWARD=0` measures the MO direction alone.
 - [`examples/rx_media_auth.lua`](examples/rx_media_auth.lua) — a VoLTE
   call's media authorization over Rx (AAR/STR), both sides, offline.
 - [`examples/ro_credit_control.lua`](examples/ro_credit_control.lua) —

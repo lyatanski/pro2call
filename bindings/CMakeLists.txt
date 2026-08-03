@@ -5,6 +5,7 @@
 #   ipsec, ipsecxx, swig/ipsec.i, IPsec/XFRM
 #   sip,   sipxx,   swig/sip.i,   SIP stack
 #   sdp,   sdpxx,   swig/sdp.i,   SDP codec (offer/answer)
+#   sms,   smsxx,   swig/sms.i,   SMS codec (TPDU + RP layer)
 #   diam,  diamxx,  swig/diam.i,  Diameter stack
 #   rtp,   rtpxx,   swig/rtp.i,   RTP/RTCP media session
 #   net,   netxx,   swig/net.i,   event loop + UDP socket
@@ -31,7 +32,7 @@ include(UseSWIG)
 
 # Everything linked into an extension module must be PIC. Applied here so
 # the C libraries pay for it only when bindings build.
-foreach(dep task net gtp2 gtpu xfrm rtnl sip sdp diam rtp)
+foreach(dep task net gtp2 gtpu xfrm rtnl sip sdp sms diam rtp)
     set_target_properties(${dep} PROPERTIES POSITION_INDEPENDENT_CODE ON)
 endforeach()
 
@@ -206,6 +207,41 @@ if(NOT MSVC)
     target_compile_options(sdp_lua PRIVATE -w)   # generated wrapper code
 endif()
 
+# --- sms (smsxx facade)
+# The payload half of SMS over IMS: sip carries the RPDU in a MESSAGE
+# body, this parses and builds it. Nothing but the C codec behind it —
+# no loop, no socket.
+add_library(smsxx STATIC cxx/src/sms.cpp)
+target_include_directories(smsxx PUBLIC cxx/inc)
+target_link_libraries(smsxx PUBLIC sms)
+set_target_properties(smsxx PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+set_property(SOURCE swig/sms.i PROPERTY CPLUSPLUS ON)
+set_property(SOURCE swig/sms.i PROPERTY USE_TARGET_INCLUDE_DIRECTORIES ON)
+# Both C codec headers carry the enums, causes and limits the facade
+# mirrors, so a change there must re-run SWIG rather than leave the Lua
+# constant table stale.
+set_property(SOURCE swig/sms.i PROPERTY DEPENDS
+    swig/common.i cxx/inc/smsxx.hpp
+    ${CMAKE_SOURCE_DIR}/sms/inc/sms.h
+    ${CMAKE_SOURCE_DIR}/sms/inc/sms_rp.h)
+# The CMake target is sms_lua because `sms` is the C library; the
+# loadable module is still sms.so for `require("sms")`.
+swig_add_library(sms_lua
+    TYPE MODULE
+    LANGUAGE lua
+    OUTPUT_DIR ${CMAKE_CURRENT_BINARY_DIR}/lua
+    SOURCES swig/sms.i)
+set_target_properties(sms_lua PROPERTIES
+    PREFIX ""
+    OUTPUT_NAME sms
+    LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/lua)
+target_include_directories(sms_lua PRIVATE ${LUA_INCLUDE_DIR})
+target_link_libraries(sms_lua PRIVATE smsxx ${LUA_LIBRARIES})
+if(NOT MSVC)
+    target_compile_options(sms_lua PRIVATE -w)   # generated wrapper code
+endif()
+
 # --- rtp (rtpxx facade)
 # The media session (cxx/src/rtp.cpp) registers its socket pair and its
 # report timer with net::Loop from the netxx facade — the same loop the
@@ -285,7 +321,7 @@ endif()
 
 # SWIG wrapper code is generated; keep clang-tidy (ENABLE_CLANG_TIDY)
 # off those targets. The facade libraries above stay covered.
-foreach(mod gtp_lua ipsec sip_lua sdp_lua diam_lua rtp_lua net_lua)
+foreach(mod gtp_lua ipsec sip_lua sdp_lua sms_lua diam_lua rtp_lua net_lua)
     set_target_properties(${mod} PROPERTIES C_CLANG_TIDY "" CXX_CLANG_TIDY "")
 endforeach()
 
@@ -336,6 +372,12 @@ if(BUILD_TESTING AND Lua_FOUND AND LUA_INTERPRETER)
     set_tests_properties(bindings_lua_sdp PROPERTIES
         ENVIRONMENT "LUA_CPATH=${CMAKE_CURRENT_BINARY_DIR}/lua/?.so")
 
+    add_test(NAME bindings_lua_sms
+             COMMAND ${LUA_INTERPRETER}
+                     ${CMAKE_CURRENT_SOURCE_DIR}/test/test_sms_bindings.lua)
+    set_tests_properties(bindings_lua_sms PROPERTIES
+        ENVIRONMENT "LUA_CPATH=${CMAKE_CURRENT_BINARY_DIR}/lua/?.so")
+
     # sdp and sip both wrap a class called Msg and one called Builder;
     # SWIG's Lua type registry is shared across modules and keyed by the
     # unscoped name, so loading both into one interpreter is exactly the
@@ -345,5 +387,18 @@ if(BUILD_TESTING AND Lua_FOUND AND LUA_INTERPRETER)
              COMMAND ${LUA_INTERPRETER}
                      ${CMAKE_CURRENT_SOURCE_DIR}/test/test_sdp_sip_coexist.lua)
     set_tests_properties(bindings_lua_sdp_sip PROPERTIES
+        ENVIRONMENT "LUA_CPATH=${CMAKE_CURRENT_BINARY_DIR}/lua/?.so")
+
+    # sms beside sip, sdp, diam and net — the four modules ipsmgw.lua
+    # loads together. sms was named to avoid the clash (Address, not the
+    # Addr netxx wraps; Tpdu/Rpdu, not Msg), so this is the assertion
+    # that the next type added to smsxx.hpp has not silently collided.
+    # It also checks a binary RPDU through both the SIP body and an
+    # SM-RP-UI AVP, which is what would break if a typemap ever went
+    # NUL-terminated.
+    add_test(NAME bindings_lua_sms_coexist
+             COMMAND ${LUA_INTERPRETER}
+                     ${CMAKE_CURRENT_SOURCE_DIR}/test/test_sms_coexist.lua)
+    set_tests_properties(bindings_lua_sms_coexist PROPERTIES
         ENVIRONMENT "LUA_CPATH=${CMAKE_CURRENT_BINARY_DIR}/lua/?.so")
 endif()

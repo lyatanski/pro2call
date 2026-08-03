@@ -89,6 +89,7 @@ local sip   = require("sip")   -- codec + Registration / AuthChallenge / Transac
 local ipsec = require("ipsec") -- Milenage (aka_verify) + AKAv1-MD5 digest + Xfrm
 local rtp   = require("rtp")   -- RTP/RTCP media session on the same net.Loop
 local sdp   = require("sdp")   -- SDP codec: the audio offer and the answer's media
+local sms   = require("sms")   -- SMS codec: the TPDU and RP layers in a MESSAGE body
 
 -- ---- configuration ----------------------------------------------------
 
@@ -175,6 +176,72 @@ local MEDIA = {
     -- Each subscriber's RTP port plus its RTCP port (RFC 3550 §11 wants
     -- port + 1), so the stride is 4: room to spare, clear of the SIP ports.
     port_base = 40000,
+}
+
+-- ---- SMS phase --------------------------------------------------------
+--
+-- SMS over IMS (TS 24.341): the UE puts an RPDU (TS 24.011) carrying a TPDU
+-- (TS 23.040) in the body of a SIP MESSAGE with Content-Type
+-- application/vnd.3gpp.sms. The path is UE -> P-CSCF -> S-CSCF -> (iFC)
+-- IP-SM-GW -> ... -> IP-SM-GW -> S-CSCF -> P-CSCF -> UE, so a delivered
+-- message exercises the same terminating routing an MT INVITE does — plus
+-- the ISC leg and, in SGd mode, a Diameter round trip to the SC.
+--
+-- The gateway is bindings/examples/ipsmgw.lua and the service centre
+-- bindings/examples/smsc_stub.lua. Nothing here assumes either: with
+-- SMS_DIRECT=1 the UE addresses the gateway itself, which proves the codec
+-- and the emulator without needing the S-CSCF's iFC to fire (the plan's
+-- fallback, and the right first step when MT never arrives).
+--
+-- The phase is orthogonal to the call phase: IMS_CALL=0 IMS_SMS=1 measures
+-- SMS alone, both together measures them in sequence.
+local SMS = {
+    on = (os.getenv("IMS_SMS") or "0") ~= "0",
+    -- Messages per submitting subscriber. The default walks the whole
+    -- content matrix once, which is the interesting run; a number larger
+    -- than the matrix repeats it.
+    per_sub = tonumber(os.getenv("SMS_PER_SUB") or ""),
+    pairs   = tonumber(os.getenv("SMS_PAIRS") or ""),   -- nil = every eligible pair
+    -- Offered submit rate, like CALL_CPS: 0 is a single burst, consistent
+    -- with the deliberately unramped registration side.
+    mps  = tonumber(os.getenv("SMS_MPS") or "0"),
+    t_ms = tonumber(os.getenv("SMS_T_MS") or "20000"),  -- per-message deadline
+    -- Ask for a status report. It costs an extra MT MESSAGE per message and
+    -- only the SC can produce one, so it is off unless asked for.
+    srr  = (os.getenv("SMS_SRR") or "0") ~= "0",
+    -- Where a submit is addressed. The service centre PSI by default, which
+    -- is what a UE does; SMS_DIRECT=1 sends to SMS_GW_HOST:SMS_GW_PORT and
+    -- skips the core entirely.
+    sc_uri  = os.getenv("SMS_SC_URI") or "",
+    sc_addr = os.getenv("SMS_SC_ADDR") or "+123456789",
+    direct  = (os.getenv("SMS_DIRECT") or "0") ~= "0",
+    gw_host = os.getenv("SMS_GW_HOST") or "",
+    gw_port = tonumber(os.getenv("SMS_GW_PORT") or "5065"),
+}
+
+-- The content matrix. Each entry is submitted and the received text is
+-- compared byte for byte with what was sent, which is the assertion that
+-- finds the UDH fill-bit and TP-UDL-units bugs and the one thing a
+-- hand-typed alphabet table cannot fake. `alpha` nil means let the codec
+-- choose (GSM 7-bit when it fits, UCS2 otherwise), as a handset does.
+--
+-- SMS_MATRIX=gsm7,ucs2 restricts it by name; SMS_MATRIX=off sends the
+-- first entry only, for a pure-throughput run where the payload is noise.
+-- The non-ASCII text is written as literal UTF-8 bytes, NOT as \u{...}:
+-- Lua 5.1 has no \u escape and silently drops the backslash, so
+-- "5\u{20AC}" would become the eight ASCII characters "5u{20AC}". The
+-- round-trip assertion would still pass — both ends mangle it the same
+-- way — while never exercising the extension table or a surrogate pair,
+-- which is precisely the coverage this matrix exists for.
+local SMS_MATRIX = {
+    { name = "gsm7",   text = "IMS SMS test 1234567890" },
+    { name = "ext",    text = "cost 5€: {a|b} ~ [x] \\y" },
+    { name = "accent", text = "èéùìòÇØÅßÉ¤¡§¿ÄÖÑÜàäöñü" },
+    { name = "ucs2",   text = "Привет, мир — SMS over IMS" },
+    { name = "emoji",  text = "delivered 🙂👍 ok" },
+    { name = "binary", text = "\0\1\2\3\127\255\0\254", alpha = "8bit" },
+    { name = "full",   text = string.rep("A", 160) },       -- exactly 160 septets
+    { name = "concat", text = string.rep("concatenated 1234567890 ", 18) },
 }
 
 -- Per-event logging. The trace is ~18 lines per subscriber at ~1.6 us of
@@ -329,6 +396,13 @@ local function make_sub(i)
         def_bearer = nil, ded_bearer = nil,  -- default / dedicated (Create Bearer)
         media_tft = nil,                     -- {bearer=, tuples={...}} once programmed
         call = nil,                          -- the call this subscriber is in
+        -- SMS phase. sms_wait is what this subscriber is expected to receive
+        -- (deliveries are matched against it by content, not arrival order);
+        -- sms_groups reassembles the parts of a concatenated message, keyed by
+        -- its concatenation reference; sms_cseq is the CSeq of the MESSAGE
+        -- requests it originates, a separate sequence from the calls' because
+        -- they are separate dialogs.
+        sms_wait = nil, sms_groups = nil, sms_cseq = 0,
     }
 end
 
@@ -404,9 +478,16 @@ local function build_register(sub, authz, sec_name, sec_hdr, expires)
         :header(sip.H_TO, ("<%s>"):format(sub.impu))
         :header(sip.H_CALL_ID, ("%s@%s"):format(sub.imsi, sub.ue_addr))
         :header(sip.H_CSEQ, ("%d REGISTER"):format(sub.cseq))
+        -- TS 24.341 §5.3.2.2: a UE that does SMS over IP says so with the
+        -- +g.3gpp.smsip feature tag on its Contact. In a real network MT
+        -- routing depends on it — the IP-SM-GW checks the registered
+        -- contact's capabilities before choosing IP delivery over the
+        -- circuit-switched fallback — so it goes on every REGISTER, not
+        -- only when the SMS phase is enabled. The ims stack's own test
+        -- client sends it too (ims/images/test/src/sip.py).
         :header(sip.H_CONTACT, expires == 0
                 and ("<sip:%s:%d>;expires=0"):format(sub.ue_addr, sub.port_uc)   -- de-REGISTER: bind removal
-                or  ("<sip:%s:%d>"):format(sub.ue_addr, sub.port_uc))
+                or  ("<sip:%s:%d>;%s"):format(sub.ue_addr, sub.port_uc, sms.FEATURE_TAG))
         :header_u32(sip.H_EXPIRES, expires or REG_EXPIRES)
         :header(sip.H_AUTHORIZATION, authz)
     if sec_hdr then b:header_name(sec_name, sec_hdr) end
@@ -828,6 +909,33 @@ local function run()
                   exp_loss = {}, rtt = {}, mos = {} },
     }
 
+    -- ---- SMS phase state ----
+    -- Messages in flight, keyed both ways: by the Call-ID of the MESSAGE we
+    -- sent (to match its 202/4xx) and by RP-MR (to match the RP-ACK, which
+    -- comes back in a NEW out-of-dialog MESSAGE, TS 24.341 §5.3.2.4 — so
+    -- there is no dialog to match it against).
+    local msgs, msg_by_callid, msg_by_mr = {}, {}, {}
+    -- A status report arrives AFTER its message has settled — that is the
+    -- point of TP-SRR: the SC reports once the recipient actually has the
+    -- message, which is later than the RP-ACK that closed the submit. So the
+    -- correlation for it has to outlive msg_by_mr, which msg_finish clears.
+    local rep_by_mr = {}
+    local mpending, mguard = 0, nil
+    local sstats = {
+        pairs_total = 0, eligible = 0,
+        attempted = 0, accepted = 0, acked = 0, delivered = 0, verified = 0,
+        orphans = 0,                          -- deliveries matching no submit
+        first_submit = nil, last_delivery = nil,
+        reports = 0,                          -- status reports received
+        by_cause = {},                        -- RP-ERROR cause -> count
+        by_status = {},                       -- non-2xx SIP finals
+        stage = {},                           -- where a failed message died
+        mismatch = {},                        -- matrix name -> count
+        by_matrix = {},                       -- matrix name -> { sent, ok }
+        kpi = { accept = {}, ack = {}, transit = {}, deliver_ok = {},
+                report = {}, total = {} },
+    }
+
     -- Per-subscriber SIP deadline over the shared loop.
     local function disarm(sub) if sub.timer then loop:cancel(sub.timer); sub.timer = nil end end
     local function arm(sub, ms, fn) disarm(sub); sub.timer = loop:after(ms, function() sub.timer = nil; fn() end) end
@@ -863,6 +971,7 @@ local function run()
     local begin_registration, on_sip_readable, handle_sip, on_401, on_registered
     local begin_teardown, begin_deregister, del_done
     local dispatch_sip, begin_calls, after_calls, call_request, call_response
+    local begin_sms, after_sms, sms_request, sms_response
 
     -- A subscriber reached a terminal state; when the last one does, wait a
     -- little for late Create Bearer Requests, then stop the loop.
@@ -883,6 +992,9 @@ local function run()
         end)
     end
     after_calls = function()
+        if SMS.on then begin_sms() else after_sms() end
+    end
+    after_sms = function()
         if DEREG then begin_deregister() else begin_teardown() end
     end
     local function fail(sub, msg)
@@ -1488,6 +1600,11 @@ local function run()
         elseif m.method == sip.CANCEL then
             if c then call_fail(c, "cancelled by the network", nil) end
             return
+        elseif m.method == sip.MESSAGE then
+            -- A MESSAGE creates no dialog (RFC 3428 §4), so there is no
+            -- Call-ID to match it against: the SMS layer sorts it out from
+            -- the RPDU in the body.
+            return sms_request(sub, m, which)
         end
         if VERBOSE then
             slog(sub, "call", ("ignoring in-dialog %s"):format(m.method_name))
@@ -1563,6 +1680,7 @@ local function run()
         if m.request then return call_request(sub, m, which) end
         local okc, cs = pcall(function() return m:cseq() end)
         if okc and cs.method == sip.REGISTER then return handle_sip(sub, m) end
+        if okc and cs.method == sip.MESSAGE then return sms_response(sub, m) end
         return call_response(sub, m)
     end
 
@@ -1657,6 +1775,582 @@ local function run()
                 end
             end
             if spacing > 0 then loop:after((i - 1) * spacing, fire) else fire() end
+        end
+    end
+
+    -- ---- the SMS phase ----------------------------------------------------
+    --
+    -- One message is a chain of hops, and each is timed:
+    --
+    --   t0  submit        MESSAGE(RP-DATA / SMS-SUBMIT) to the SC address
+    --   t1  202 Accepted  the IP-SM-GW took responsibility (TS 24.341 §5.3.2.4)
+    --   t2  MT MESSAGE    the recipient receives RP-DATA / SMS-DELIVER
+    --   t3  200 OK        the recipient's SIP hop for that delivery
+    --   t4  RP-ACK out    the recipient's relay-layer acknowledgement
+    --   t5  RP-ACK in     the gateway's report back to the sender
+    --   t6  report        the SMS-STATUS-REPORT, when TP-SRR was set
+    --
+    -- t0 and t2 are readings of ONE monotonic clock in THIS process, so
+    -- t2-t0 is a true one-way core latency carrying no clock skew — the same
+    -- property the call phase's mo_transit has, and the reason both ends of
+    -- every pair live in one process.
+    --
+    -- Nothing new is needed on the datapath: SMS is signalling and rides the
+    -- ESP TFT the protected REGISTER already installed. That is asserted
+    -- rather than assumed — the phase counts its own datagrams through the
+    -- same mark_pkt() the registration does, so a message that never left
+    -- shows up as a send failure and not as a silent timeout.
+
+    local SMS_SC_URI = SMS.sc_uri ~= "" and SMS.sc_uri
+                       or ("sip:smsc@" .. ims_realm)
+
+    local ALPHA = { gsm7 = sms.ALPHA_GSM7, ucs2 = sms.ALPHA_UCS2,
+                    ["8bit"] = sms.ALPHA_8BIT }
+
+    -- The matrix, filtered by SMS_MATRIX and repeated to per_sub length.
+    local function sms_plan()
+        local want = os.getenv("SMS_MATRIX")
+        local base = {}
+        if want == "off" then
+            base[1] = SMS_MATRIX[1]
+        elseif want and want ~= "" then
+            local keep = {}
+            for n in want:gmatch("[^,]+") do keep[n:gsub("%s", "")] = true end
+            for _, it in ipairs(SMS_MATRIX) do
+                if keep[it.name] then base[#base + 1] = it end
+            end
+            if #base == 0 then base[1] = SMS_MATRIX[1] end
+        else
+            for _, it in ipairs(SMS_MATRIX) do base[#base + 1] = it end
+        end
+        local n = SMS.per_sub or #base
+        local out = {}
+        for i = 1, n do out[i] = base[(i - 1) % #base + 1] end
+        return out
+    end
+
+    local function sbump(t, k) t[k] = (t[k] or 0) + 1 end
+
+    -- Where a submit goes, and from which port. Direct mode skips the core
+    -- entirely (proving the codec and the gateway without the S-CSCF's iFC);
+    -- otherwise it is an originating request exactly like the INVITE, which
+    -- means the P-CSCF's own URI marked `orig` ahead of the Service-Route —
+    -- see build_invite for why the marking has to be on that first entry.
+    local function build_sms_message(sub, ruri, body, cseq, br)
+        local b = BUILDER:request(sip.MESSAGE, ruri)
+        if not SMS.direct then
+            local pport = (sub.ch and sub.ch.ss_raw and sub.ch.p_port_s)
+                          or PCSCF_SIP_PORT
+            b:header(sip.H_ROUTE, ("<sip:orig@%s:%d;lr>"):format(sub.pcscf, pport))
+            for _, r in ipairs(sub.svc_route or {}) do b:header(sip.H_ROUTE, r) end
+        end
+        b:header(sip.H_VIA, ("SIP/2.0/UDP %s:%d;branch=%s"):format(
+                                sub.ue_addr, sub.port_uc, br))
+            :header_u32(sip.H_MAX_FORWARDS, 70)
+            :header(sip.H_FROM, ("<%s>;tag=%s-m%d"):format(sub.impu, sub.imsi, cseq))
+            :header(sip.H_TO, ("<%s>"):format(ruri))
+            :header(sip.H_CALL_ID, ("sms-%s-%d@%s"):format(sub.imsi, cseq, sub.ue_addr))
+            :header(sip.H_CSEQ, ("%d MESSAGE"):format(cseq))
+            :header(sip.H_CONTACT, ("<sip:%s:%d>;%s"):format(
+                                       sub.ue_addr, sub.port_uc, sms.FEATURE_TAG))
+            :header(sip.H_P_PREFERRED_IDENTITY, ("<%s>"):format(sub.impu))
+            :header(sip.H_CONTENT_TYPE, sms.CONTENT_TYPE)
+        return b:done(body)
+    end
+
+    local function send_sms(sub, wire, what)
+        if SMS.direct then
+            dump(("[%d] -> %s"):format(sub.i, what), wire)
+            local ok, err = pcall(function()
+                sub.sock:sendto(wire, SMS.gw_host, SMS.gw_port)
+            end)
+            if ok then
+                stats.tx = stats.tx + 1; mark_pkt()
+                if VERBOSE then
+                    slog(sub, "-> " .. what, ("%dB -> %s:%d (direct)"):format(
+                                                 #wire, SMS.gw_host, SMS.gw_port))
+                end
+            else
+                slog(sub, "-> " .. what, "send failed: " .. why(err))
+            end
+            return ok
+        end
+        return send_call(sub, sub.sock, "mo", wire, what)
+    end
+
+    -- Out-of-dialog answer to a MESSAGE we received. A MESSAGE creates no
+    -- dialog (RFC 3428 §4), so there is no route set to echo and no to-tag
+    -- to remember — just the RFC 3261 §8.2.6 fields, from this UE's
+    -- protected server port back to the P-CSCF's protected client port.
+    local function sms_respond(sub, req, status, reason)
+        local b    = BUILDER:response(status, reason)
+        local vias = req:header_values("Via")
+        for i = 0, vias:size() - 1 do b:header(sip.H_VIA, vias[i]) end
+        local to = req:header("To")
+        if not to:find(";tag=", 1, true) then
+            to = to .. (";tag=%s-r"):format(sub.imsi)
+        end
+        b:header(sip.H_FROM, req:header("From"))
+            :header(sip.H_TO, to)
+            :header(sip.H_CALL_ID, req:header("Call-ID"))
+            :header(sip.H_CSEQ, req:header("CSeq"))
+            :header(sip.H_CONTACT, ("<sip:%s:%d>"):format(sub.ue_addr, sub.port_uc))
+        local wire = b:done()
+        if SMS.direct then
+            pcall(function() sub.sock:sendto(wire, SMS.gw_host, SMS.gw_port) end)
+            stats.tx = stats.tx + 1; mark_pkt()
+        else
+            send_call(sub, sub.sock, "mt", wire, ("%d %s (MESSAGE)"):format(status, reason))
+        end
+    end
+
+    -- One counter for "work still outstanding", decremented by a finished
+    -- message AND by the scheduler releasing its own sentinel. Without the
+    -- sentinel a spaced run (SMS_MPS>0) would end the phase the moment its
+    -- FIRST message settled, because the rest had not been issued yet and
+    -- the count was legitimately zero.
+    local function mdec()
+        mpending = mpending - 1
+        if mpending > 0 then return end
+        if mguard then loop:cancel(mguard); mguard = nil end
+        after_sms()
+    end
+
+    local function msg_finish(msg, ok, stage, detail)
+        if msg.done then return end
+        msg.done = true
+        if msg.timer then loop:cancel(msg.timer); msg.timer = nil end
+        msg_by_callid[msg.call_id] = nil
+        msg_by_mr[msg.mr_key] = nil
+        if not ok then
+            sbump(sstats.stage, stage or "unknown")
+            slog(msg.mo, "sms", ("message %d (%s) FAILED at %s: %s"):format(
+                                    msg.i, msg.item.name, stage or "?",
+                                    detail or "?"))
+        end
+        mdec()
+    end
+
+    local function marm(msg)
+        if msg.timer then loop:cancel(msg.timer) end
+        msg.timer = loop:after(SMS.t_ms, function()
+            msg.timer = nil
+            -- Name the furthest hop that DID happen, so "the gateway never
+            -- answered" and "the gateway answered but the recipient never got
+            -- it" are not reported as the same failure.
+            local stage, detail
+            if not msg.t.t1 then stage, detail = "accept", "no 202 for the submit"
+            elseif not msg.t.t2 then stage, detail = "transit", "accepted, but never delivered"
+            elseif not msg.t.t4 then stage, detail = "mt_ack", "delivered, but the recipient never acknowledged"
+            elseif not msg.t.t5 then stage, detail = "mo_ack", "delivered, but no RP-ACK came back to the sender"
+            else stage, detail = "unknown", "every hop completed but the message never settled" end
+            msg_finish(msg, false, stage, detail)
+        end)
+    end
+
+    -- Record a message as fully accounted for: the recipient has it and the
+    -- sender has been told. A status report, when asked for, is a separate
+    -- (later) event and does not hold the message open.
+    local function msg_settle(msg)
+        local t, k = msg.t, sstats.kpi
+        local function push(list, a, b)
+            if t[a] and t[b] then list[#list + 1] = t[b] - t[a] end
+        end
+        push(k.accept,     "t0", "t1")
+        push(k.transit,    "t0", "t2")   -- MO submit -> MT deliver, one clock
+        push(k.deliver_ok, "t2", "t3")
+        push(k.total,      "t0", "t4")
+        push(k.ack,        "t0", "t5")
+        -- No status-report figure here: it arrives after the message has
+        -- settled, so the report branch records it directly (see rep_by_mr).
+        if t.t2 then sstats.last_delivery = t.t2 end
+        msg_finish(msg, true)
+    end
+
+    -- Everything a delivered message has to satisfy before it counts. The
+    -- text comparison is the point of the whole phase: a byte difference
+    -- here is a codec bug (the septet alignment, the length units, an
+    -- alphabet mapping) that no amount of successful signalling reveals.
+    local function verify(msg, got)
+        local m = sstats.by_matrix[msg.item.name]
+        if not m then m = { sent = 0, ok = 0 }; sstats.by_matrix[msg.item.name] = m end
+        if got == msg.text then
+            m.ok = m.ok + 1
+            sstats.verified = sstats.verified + 1
+            return true
+        end
+        sbump(sstats.mismatch, msg.item.name)
+        slog(msg.mt, "sms", ("content MISMATCH (%s): sent %d bytes, received %d"):format(
+                                msg.item.name, #msg.text, #got))
+        return false
+    end
+
+    -- A DELIVER arrived at `sub`. Returns the message record this delivery
+    -- belongs to, plus — once every part of a concatenated message is in —
+    -- the reassembled text and the list of records to verify against it.
+    --
+    -- A concatenated message is N SIP MESSAGEs, each with its own 202 and its
+    -- own RP-ACK, so N records are outstanding and all N have to settle. Only
+    -- the last part can be verified, because only then is there a whole text
+    -- to compare — so the verification is applied to every member at that
+    -- point. Counting the group as one message instead would make `submitted`
+    -- and `delivered` disagree by the part count.
+    local function match_delivery(sub, tpdu, text)
+        local wait = sub.sms_wait
+        if not wait or #wait == 0 then return nil, nil, nil end
+
+        if tpdu:has_concat() then
+            local c     = tpdu:concat()
+            local group = sub.sms_groups[c.ref]
+            if not group then return nil, nil, nil end
+            local member = group.members[c.seq]
+            if not group.parts[c.seq] then
+                group.parts[c.seq] = text
+                group.got = group.got + 1
+            end
+            if group.got < group.total then return member, nil, nil end
+            sub.sms_groups[c.ref] = nil
+            for _, m in ipairs(group.members) do
+                for i, w in ipairs(wait) do
+                    if w == m then table.remove(wait, i); break end
+                end
+            end
+            return member, table.concat(group.parts, "", 1, group.total),
+                   group.members
+        end
+
+        -- Single part: match on the content, so a corrupted body becomes a
+        -- mismatch rather than a misattributed success.
+        for i, m in ipairs(wait) do
+            if not m.group and m.text == text then
+                table.remove(wait, i)
+                return m, text, { m }
+            end
+        end
+        -- Nothing matched: attribute it to the oldest outstanding single-part
+        -- message so the difference is counted rather than lost.
+        for i, m in ipairs(wait) do
+            if not m.group then
+                table.remove(wait, i)
+                return m, text, { m }
+            end
+        end
+        return nil, nil, nil
+    end
+
+    -- A MESSAGE request arrived on a UE's socket. It is either a delivery to
+    -- this UE, a relay-layer report about something this UE sent, or a status
+    -- report; the RPDU says which, and the direction is SC -> MS in all three
+    -- cases because everything reaching a UE comes from the network side.
+    sms_request = function(sub, req, which)
+        local ct = req:header("Content-Type"):lower()
+        if not ct:find("vnd.3gpp.sms", 1, true) then
+            slog(sub, "sms", ("MESSAGE with Content-Type %q -- 415"):format(ct))
+            return sms_respond(sub, req, 415, "Unsupported Media Type")
+        end
+
+        local okp, rp = pcall(sms.parse_rpdu, req.body, sms.DIR_SC_TO_MS)
+        if not okp then
+            slog(sub, "sms", "unparseable RPDU: " .. why(rp))
+            return sms_respond(sub, req, 400, "Bad Request")
+        end
+
+        -- The gateway's report about a message THIS UE submitted.
+        if rp.type == sms.RP_T_ACK or rp.type == sms.RP_T_ERROR then
+            sms_respond(sub, req, 200, "OK")
+            local msg = msg_by_mr[("%d:%d"):format(sub.i, rp.mr)]
+            if not msg then
+                return slog(sub, "sms", ("%s RP-MR %d matches no submit"):format(
+                                            rp:type_name(), rp.mr))
+            end
+            if rp.type == sms.RP_T_ERROR then
+                sbump(sstats.by_cause, rp.cause)
+                return msg_finish(msg, false, "rp_error",
+                                  ("RP-ERROR %d (%s)"):format(rp.cause, rp:cause_name()))
+            end
+            sstats.acked = sstats.acked + 1
+            msg.t.t5 = now()
+            slog(sub, "sms", ("RP-ACK for message %d (%s) after %d ms"):format(
+                                 msg.i, msg.item.name, msg.t.t5 - msg.t.t0))
+            -- The sender is satisfied. The recipient may already have
+            -- acknowledged (the gateway is a store-and-forward hop, so the
+            -- order is not fixed); settle once both are in.
+            if msg.t.t4 then msg_settle(msg) end
+            return
+        end
+
+        if rp.type ~= sms.RP_T_DATA or not rp:has_tpdu() then
+            return sms_respond(sub, req, 400, "Bad Request")
+        end
+
+        local okt, tpdu = pcall(function() return rp:tpdu() end)
+        if not okt then
+            slog(sub, "sms", "unparseable TPDU: " .. why(tpdu))
+            return sms_respond(sub, req, 400, "Bad Request")
+        end
+
+        -- A status report: the SC saying what became of a submitted message.
+        if tpdu.type == sms.T_STATUS_REPORT then
+            sms_respond(sub, req, 200, "OK")
+            local ack = sms.ack(sms.DIR_MS_TO_SC, rp.mr)
+            sub.sms_cseq = (sub.sms_cseq or 0) + 1
+            send_sms(sub, build_sms_message(sub, SMS_SC_URI, ack, sub.sms_cseq,
+                          ("z9hG4bK-smsr-%s-%d"):format(sub.imsi, sub.sms_cseq)),
+                     "MESSAGE (RP-ACK for a status report)")
+            sstats.reports = sstats.reports + 1
+            local msg = rep_by_mr[("%d:%d"):format(sub.i, tpdu.mr)]
+            if msg then
+                -- Recorded straight into the distribution: the message has
+                -- already settled, so msg_settle will not run again.
+                local k = sstats.kpi.report
+                k[#k + 1] = now() - msg.t.t0
+                if not tpdu:delivered() then
+                    sbump(sstats.stage, "report_failed")
+                    slog(sub, "sms", ("status report for message %d says %s"):format(
+                                         msg.i, tpdu:status_name()))
+                else
+                    slog(sub, "sms", ("status report for message %d: %s"):format(
+                                         msg.i, tpdu:status_name()))
+                end
+            else
+                slog(sub, "sms", ("status report TP-MR %d: %s"):format(
+                                     tpdu.mr, tpdu:status_name()))
+            end
+            return
+        end
+
+        if tpdu.type ~= sms.T_DELIVER then
+            slog(sub, "sms", ("ignoring a delivered %s"):format(tpdu:type_name()))
+            return sms_respond(sub, req, 200, "OK")
+        end
+
+        -- A delivery. Answer the SIP hop first, then the relay layer.
+        local t2 = now()
+        sms_respond(sub, req, 200, "OK")
+        local t3 = now()
+        sstats.delivered = sstats.delivered + 1
+
+        local okx, text = pcall(function() return tpdu:text() end)
+        if not okx then
+            slog(sub, "sms", "undecodable user data: " .. why(text))
+            text = ""
+        end
+
+        -- RP-ACK back towards the SC: a NEW out-of-dialog MESSAGE from this
+        -- UE (TS 24.341 §5.3.2.6), not a body on the 200 OK.
+        local ack = sms.ack(sms.DIR_MS_TO_SC, rp.mr)
+        sub.sms_cseq = (sub.sms_cseq or 0) + 1
+        local br = ("z9hG4bK-smsa-%s-%d"):format(sub.imsi, sub.sms_cseq)
+        local sent = send_sms(sub, build_sms_message(sub, SMS_SC_URI, ack,
+                                                     sub.sms_cseq, br),
+                              ("MESSAGE (RP-ACK, RP-MR %d)"):format(rp.mr))
+        local t4 = sent and now() or nil
+
+        local msg, whole, members = match_delivery(sub, tpdu, text)
+        if not msg then
+            sstats.orphans = sstats.orphans + 1
+            return slog(sub, "sms",
+                ("delivery from %s matches no submit (%d bytes)")
+                :format(tpdu.addr:display(), #text))
+        end
+
+        -- Timestamp the part that actually arrived, whichever it is.
+        msg.t.t2, msg.t.t3, msg.t.t4 = msg.t.t2 or t2, t3, t4
+        if not whole then
+            if VERBOSE then
+                local c = tpdu:concat()
+                slog(sub, "sms", ("part %d/%d of reference %d in"):format(
+                                     c.seq, c.total, c.ref))
+            end
+            return
+        end
+
+        slog(sub, "sms", ("delivered message %d (%s) from %s in %d ms"):format(
+                             msg.i, msg.item.name, tpdu.addr:display(),
+                             t2 - msg.t.t0))
+        -- The whole text exists now, so every record in the group is verified
+        -- against it and settles as soon as its own RP-ACK is in.
+        for _, m in ipairs(members) do
+            verify(m, whole)
+            if m.t.t5 then msg_settle(m) end
+        end
+    end
+
+    -- Responses to a MESSAGE we sent: the 202 for a submit, or the 200 for an
+    -- RP-ACK we relayed (which needs no bookkeeping).
+    sms_response = function(sub, m)
+        local msg = msg_by_callid[m:call_id()]
+        if not msg then
+            if m.status >= 300 then
+                sbump(sstats.by_status, m.status)
+                slog(sub, "sms", ("%d %s for a MESSAGE we no longer track"):format(
+                                     m.status, m.reason))
+            end
+            return
+        end
+        if m.status < 200 then return end          -- a provisional, if any
+        if m.status >= 300 then
+            sbump(sstats.by_status, m.status)
+            return msg_finish(msg, false, "accept",
+                              ("%d %s"):format(m.status, m.reason))
+        end
+        if msg.t.t1 then return end                -- retransmitted 202
+        msg.t.t1 = now()
+        sstats.accepted = sstats.accepted + 1
+        slog(sub, "sms", ("%d %s for message %d (%s) after %d ms"):format(
+                             m.status, m.reason, msg.i, msg.item.name,
+                             msg.t.t1 - msg.t.t0))
+    end
+
+    begin_sms = function()
+        -- Structural pairs, as in the call phase: 1<->2, 3<->4, ... The odd
+        -- index submits, the even index receives. The denominator stays the
+        -- structural count, so a registration failure cannot turn into a
+        -- perfect SMS success rate.
+        sstats.pairs_total = math.floor(#subs / 2)
+        local list = {}
+        for p = 1, sstats.pairs_total do
+            local mo, mt = subs[2 * p - 1], subs[2 * p]
+            local ready = mo.registered and mt.registered and mo.sock and mt.sock
+                and (SMS.direct or #(mo.svc_route or {}) > 0)
+            if ready then
+                sstats.eligible = sstats.eligible + 1
+                if not SMS.pairs or #list < SMS.pairs then
+                    list[#list + 1] = { mo = mo, mt = mt }
+                end
+            end
+        end
+
+        local plan = sms_plan()
+        if #list == 0 then
+            banner(("SMS — none sent (%d/%d pair(s) eligible; a message needs BOTH ends registered%s)")
+                :format(sstats.eligible, sstats.pairs_total,
+                        SMS.direct and "" or " with a Service-Route"))
+            return after_sms()
+        end
+
+        local names = {}
+        for _, it in ipairs(plan) do names[#names + 1] = it.name end
+        banner(("SMS — %d of %d eligible pair(s) (%d structural), %d message(s) each%s")
+            :format(#list, sstats.eligible, sstats.pairs_total, #plan,
+                    SMS.mps > 0 and (" at %.1f msg/s"):format(SMS.mps) or " in one burst"))
+        line("destination", SMS.direct
+            and ("%s:%d (direct, bypassing the core)"):format(SMS.gw_host, SMS.gw_port)
+            or SMS_SC_URI)
+        line("content", table.concat(names, " "))
+        if SMS.srr then line("status reports", "requested (TP-SRR)") end
+
+        -- Build the work list first, so the deadline can be sized from it.
+        local work = {}
+        for _, p in ipairs(list) do
+            p.mt.sms_wait   = p.mt.sms_wait or {}
+            p.mt.sms_groups = p.mt.sms_groups or {}
+            for _, item in ipairs(plan) do
+                work[#work + 1] = { mo = p.mo, mt = p.mt, item = item }
+            end
+        end
+
+        if SMS.direct and SMS.gw_host == "" then
+            banner("SMS — SMS_DIRECT=1 needs SMS_GW_HOST; skipping the phase")
+            return after_sms()
+        end
+
+        local spacing = SMS.mps > 0 and math.floor(1000 / SMS.mps) or 0
+        mpending = 0
+        local mr_seq = 0
+
+        -- One submit, possibly split into several messages.
+        local function submit(w, idx)
+            local mo, mt, item = w.mo, w.mt, w.item
+            local alpha = item.alpha and ALPHA[item.alpha] or sms.ALPHA_AUTO
+
+            -- The recipient's "MSISDN". The subscribers here have no MSISDN of
+            -- their own — they are generated from an IMSI range — so the IMSI
+            -- IS the number, and ipsmgw.lua's default rule turns those digits
+            -- straight back into sip:<digits>@<realm>, which is exactly the
+            -- IMPU this run registered. Nothing has to be provisioned.
+            local to = mt.imsi
+
+            local okp, parts = pcall(function()
+                mr_seq = mr_seq + 1
+                local args = { to = to, text = item.text, sc = SMS.sc_addr,
+                               alphabet = alpha, srr = SMS.srr,
+                               mr = mr_seq % 256 }
+                return sms.parts(sms.submit_parts(args, mr_seq % 65536, false))
+            end)
+            if not okp then
+                banner(("SMS — cannot build %q: %s"):format(item.name, why(parts)))
+                return
+            end
+
+            -- A multi-part message needs a record the recipient can find by
+            -- concatenation reference, holding every part's message record so
+            -- all of them settle when the last part arrives.
+            local group = nil
+            if #parts > 1 then
+                group = { ref = mr_seq % 65536, total = #parts, got = 0,
+                          parts = {}, members = {} }
+                mt.sms_groups[group.ref] = group
+            end
+            for pi, rpdu in ipairs(parts) do
+                mo.sms_cseq = (mo.sms_cseq or 0) + 1
+                local mr = (mr_seq + pi - 1) % 256
+                local br = ("z9hG4bK-sms-%s-%d"):format(mo.imsi, mo.sms_cseq)
+                local wire = build_sms_message(mo, SMS_SC_URI, rpdu, mo.sms_cseq, br)
+                local msg = {
+                    i = idx, mo = mo, mt = mt, item = item,
+                    text = item.text, group = group,
+                    mr = mr, mr_key = ("%d:%d"):format(mo.i, mr),
+                    call_id = ("sms-%s-%d@%s"):format(mo.imsi, mo.sms_cseq, mo.ue_addr),
+                    t = {}, done = false,
+                }
+                msgs[#msgs + 1] = msg
+                msg_by_callid[msg.call_id] = msg
+                msg_by_mr[msg.mr_key] = msg
+                rep_by_mr[msg.mr_key] = msg
+                mt.sms_wait[#mt.sms_wait + 1] = msg
+                if group then group.members[pi] = msg end
+                mpending = mpending + 1
+                sstats.attempted = sstats.attempted + 1
+                local mm = sstats.by_matrix[item.name]
+                if not mm then mm = { sent = 0, ok = 0 }; sstats.by_matrix[item.name] = mm end
+                mm.sent = mm.sent + 1
+
+                msg.t.t0 = now()
+                sstats.first_submit = sstats.first_submit or msg.t.t0
+                if send_sms(mo, wire, ("MESSAGE submit %d/%d (%s -> %s)"):format(
+                                          pi, #parts, item.name, to)) then
+                    marm(msg)
+                else
+                    msg_finish(msg, false, "send", "MESSAGE send failed")
+                end
+            end
+        end
+
+        -- Overall deadline so a lost report cannot hang the run.
+        mguard = loop:after(spacing * #work + SMS.t_ms + 5000, function()
+            mguard = nil
+            for _, msg in ipairs(msgs) do
+                if not msg.done then
+                    msg_finish(msg, false, "guard", "SMS phase deadline")
+                end
+            end
+            if mpending > 0 then mpending = 0; after_sms() end
+        end)
+
+        -- The sentinel: one unit of outstanding work standing for "not every
+        -- submit has been issued yet". Released after the last one, so a
+        -- message that settles before its successors are even scheduled
+        -- cannot end the phase early.
+        mpending = 1
+        if spacing > 0 then
+            for i, w in ipairs(work) do
+                loop:after((i - 1) * spacing, function() submit(w, i) end)
+            end
+            loop:after((#work - 1) * spacing + 1, mdec)
+        else
+            for i, w in ipairs(work) do submit(w, i) end
+            mdec()
         end
     end
 
@@ -2191,6 +2885,7 @@ local function run()
         if counted > 0 then M.calls = M.calls + 1 end
     end
     stats.calls = cstats
+    if SMS.on then stats.sms = sstats end
 
     -- Datapath counters, read while the datapath is still loaded. Aggregated
     -- over every bearer the run programmed, because the error tallies are the
@@ -2439,6 +3134,105 @@ if cs and cs.pairs_total > 0 then
     end
 end
 
+-- ---- the SMS phase --------------------------------------------------------
+--
+-- Validity first (did the content survive), then the per-hop latencies. The
+-- percentiles are reported rather than means for the same reason the call
+-- phase reports them: a mean hides the knee, and the knee is the finding.
+local ss = stats.sms
+if ss and ss.pairs_total > 0 then
+    banner(("SMS — %d delivered / %d submitted (%d of %d structural pair(s) eligible)")
+        :format(ss.delivered, ss.attempted, ss.eligible, ss.pairs_total))
+    if ss.attempted > 0 then
+        line("delivery rate", ("%.1f%%"):format(ss.delivered / ss.attempted * 100))
+        line("accepted (202)", ("%d  (%.1f%%)"):format(
+            ss.accepted, ss.accepted / ss.attempted * 100))
+        line("acknowledged (RP-ACK)", ("%d  (%.1f%%)"):format(
+            ss.acked, ss.acked / ss.attempted * 100))
+    end
+    if ss.reports > 0 then line("status reports", tostring(ss.reports)) end
+    if ss.orphans > 0 then
+        line("UNMATCHED deliveries", ("%d — arrived but match no submit"):format(
+            ss.orphans))
+    end
+
+    -- Content integrity: the assertion the whole phase exists for. A byte
+    -- difference is a codec bug — the UDH septet alignment, the TP-UDL units,
+    -- an alphabet mapping — and no amount of successful signalling reveals it.
+    local nmis = 0
+    for _, n in pairs(ss.mismatch) do nmis = nmis + n end
+    if next(ss.by_matrix) then
+        local names = {}
+        for n in pairs(ss.by_matrix) do names[#names + 1] = n end
+        table.sort(names)
+        local parts = {}
+        for _, n in ipairs(names) do
+            local m = ss.by_matrix[n]
+            parts[#parts + 1] = ("%s %d/%d"):format(n, m.ok, m.sent)
+        end
+        line("content verified", table.concat(parts, "  "))
+    end
+    if nmis > 0 then
+        line("CONTENT MISMATCHES", ("%d — the received text differs from what was sent")
+            :format(nmis))
+        for n, c in pairs(ss.mismatch) do
+            print(("     %-28s %d"):format(n, c))
+        end
+    end
+
+    -- Failure attribution: the furthest hop each failed message reached.
+    local SMS_STAGES = {
+        { key = "send",     label = "MESSAGE send failed" },
+        { key = "accept",   label = "no 202 for the submit" },
+        { key = "rp_error", label = "refused (RP-ERROR)" },
+        { key = "transit",  label = "accepted, never delivered" },
+        { key = "mt_ack",   label = "delivered, recipient never acknowledged" },
+        { key = "mo_ack",   label = "delivered, no RP-ACK to the sender" },
+        { key = "report_failed", label = "status report says not delivered" },
+        { key = "guard",    label = "SMS phase deadline" },
+        { key = "unknown",  label = "other" },
+    }
+    local nfail = 0
+    for _, n in pairs(ss.stage) do nfail = nfail + n end
+    if nfail > 0 then
+        line("failed", tostring(nfail))
+        for _, s in ipairs(SMS_STAGES) do
+            local n = ss.stage[s.key]
+            if n then print(("     %-45s %d"):format(s.label, n)) end
+        end
+    end
+    if next(ss.by_cause) then
+        local cs2 = {}
+        for c, n in pairs(ss.by_cause) do cs2[#cs2 + 1] = { c = c, n = n } end
+        table.sort(cs2, function(a, b) return a.n > b.n end)
+        for _, e in ipairs(cs2) do
+            print(("     RP-ERROR %-36s %d"):format(sms.rp_cause_name(e.c), e.n))
+        end
+    end
+    if next(ss.by_status) then
+        local st = {}
+        for s, n in pairs(ss.by_status) do st[#st + 1] = { s = s, n = n } end
+        table.sort(st, function(a, b) return a.n > b.n end)
+        for _, e in ipairs(st) do
+            print(("     SIP %-40s %d"):format(("%d %s"):format(
+                e.s, sip.status_phrase(e.s)), e.n))
+        end
+    end
+
+    local k = ss.kpi
+    banner("SMS latency (percentiles, not means — a mean hides the knee)")
+    line("submit -> 202 Accepted", dist(summarize(k.accept), "ms"))
+    line("submit -> MT delivery",  dist(summarize(k.transit), "ms"))
+    line("delivery -> 200 OK",     dist(summarize(k.deliver_ok), "ms"))
+    line("submit -> recipient ACK", dist(summarize(k.total), "ms"))
+    line("submit -> sender RP-ACK", dist(summarize(k.ack), "ms"))
+    if #k.report > 0 then
+        line("submit -> status report", dist(summarize(k.report), "ms"))
+    end
+    print("   submit -> MT delivery is a true one-way core latency: both marks are")
+    print("   readings of ONE monotonic clock in this process, so no skew is in it.")
+end
+
 -- Throughput: per-second rates for the load. Each rate is measured from the
 -- first Create Session Request (stats.start) to the last event of its kind, so
 -- the 3s grace + teardown don't dilute the active-burst figures. per_s returns
@@ -2476,8 +3270,21 @@ if stats.burst then
         :format(b.n, b.offer, b.total, b.n / math.max(b.total, 1) * 1000))
 end
 
--- A run passes when every subscriber registered and every call it actually
--- placed was answered. A run with no eligible pair (IMS_SUBS=1, or the call
--- phase switched off) is judged on its registrations alone.
+if ss and ss.attempted > 0 and ss.first_submit then
+    local w = ((ss.last_delivery or ss.first_submit) - ss.first_submit) / 1000
+    line("messages submitted", ("%d  (%d delivered, %d verified)")
+        :format(ss.attempted, ss.delivered, ss.verified))
+    line("messages delivered", w > 0
+        and ("%d in %.2fs  ->  %.1f/s"):format(ss.delivered, w, ss.delivered / w)
+        or  ("%d (single burst, under one clock tick)"):format(ss.delivered))
+end
+
+-- A run passes when every subscriber registered, every call it actually placed
+-- was answered, and every message it sent arrived with its content intact. A
+-- phase that was switched off, or had no eligible pair (IMS_SUBS=1), is not
+-- held against the run — but a message that arrived corrupted is, because that
+-- is the failure the phase exists to catch.
 local calls_ok = not cs or cs.attempted == 0 or cs.answered == cs.attempted
-os.exit((ok == #subs and calls_ok) and 0 or 1)
+local sms_ok = not ss or ss.attempted == 0
+    or (ss.delivered == ss.attempted and ss.verified == ss.attempted)
+os.exit((ok == #subs and calls_ok and sms_ok) and 0 or 1)

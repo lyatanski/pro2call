@@ -30,6 +30,7 @@ add_subdirectory(diam)
 add_subdirectory(net)
 add_subdirectory(sip)
 add_subdirectory(sdp)
+add_subdirectory(sms)
 add_subdirectory(rtp)
 add_subdirectory(nlmsg)
 
