@@ -38,8 +38,10 @@ spec ("diam_dict: generated Diameter dictionary") {
         }
 
         it ("iterates the whole registry in sorted order") {
+            /* The registry holds only what the pinned specs define for
+             * the covered applications — around 950 AVPs. */
             const size_t n = diam_dict_count();
-            check(n > 1000);
+            check(n > 900);
             check(diam_dict_at(0) != NULL);
             check(diam_dict_at(n) == NULL);
             for (size_t i = 1; i < n; i++) {

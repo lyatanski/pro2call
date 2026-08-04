@@ -248,14 +248,14 @@ local function on_mar(m)
         log("   <- MAR without a numeric IMPI (%s) -> UNABLE_TO_COMPLY", impi or "?")
         return cx_answer(m):put_u32(diam.AVP_RESULT_CODE, RC_NOCOMP):done()
     end
-    local want = ou32(m, diam.AVP_3GPP_SIP_NUMBER_AUTH_ITEMS, V3GPP) or 1
+    local want = ou32(m, diam.AVP_SIP_NUMBER_AUTH_ITEMS, V3GPP) or 1
     if want < 1 then want = 1 end
     if want > 5 then want = 5 end
     local scheme = "Digest-AKAv1-MD5"
-    if m:has(diam.AVP_3GPP_SIP_AUTH_DATA_ITEM, V3GPP) then
-        local it = m:find(diam.AVP_3GPP_SIP_AUTH_DATA_ITEM, V3GPP)
-        if it:has_child(diam.AVP_3GPP_SIP_AUTHENTICATION_SCHEME, V3GPP) then
-            local sc = it:child(diam.AVP_3GPP_SIP_AUTHENTICATION_SCHEME, V3GPP):str()
+    if m:has(diam.AVP_SIP_AUTH_DATA_ITEM, V3GPP) then
+        local it = m:find(diam.AVP_SIP_AUTH_DATA_ITEM, V3GPP)
+        if it:has_child(diam.AVP_SIP_AUTHENTICATION_SCHEME, V3GPP) then
+            local sc = it:child(diam.AVP_SIP_AUTHENTICATION_SCHEME, V3GPP):str()
             if sc ~= "" and sc:lower() ~= "unknown" then scheme = sc end
         end
     end
@@ -265,7 +265,7 @@ local function on_mar(m)
         :put_u32(diam.AVP_RESULT_CODE, RC_OK)
         :put_str(diam.AVP_USER_NAME, impi)
         :put_str(diam.AVP_PUBLIC_IDENTITY, impu or ("sip:" .. impi))
-        :put_u32(diam.AVP_3GPP_SIP_NUMBER_AUTH_ITEMS, want)
+        :put_u32(diam.AVP_SIP_NUMBER_AUTH_ITEMS, want)
 
     local first_rand
     for i = 1, want do
@@ -273,11 +273,11 @@ local function on_mar(m)
         local rand = ipsec.md5(imsi .. "|" .. hex(sqn) .. "|cx_hss")
         local v = ipsec.aka_milenage(K, OPc, rand, sqn, AMF)
         local autn = xorstr(v.sqn, v.ak) .. AMF .. v.mac        -- 6+2+8 = 16 bytes
-        b:begin_group(diam.AVP_3GPP_SIP_AUTH_DATA_ITEM)
-            :put_u32(diam.AVP_3GPP_SIP_ITEM_NUMBER, i)
-            :put_str(diam.AVP_3GPP_SIP_AUTHENTICATION_SCHEME, scheme)
-            :put_str(diam.AVP_3GPP_SIP_AUTHENTICATE, rand .. autn)   -- RAND || AUTN
-            :put_str(diam.AVP_3GPP_SIP_AUTHORIZATION, v.res)         -- XRES
+        b:begin_group(diam.AVP_SIP_AUTH_DATA_ITEM)
+            :put_u32(diam.AVP_SIP_ITEM_NUMBER, i)
+            :put_str(diam.AVP_SIP_AUTHENTICATION_SCHEME, scheme)
+            :put_str(diam.AVP_SIP_AUTHENTICATE, rand .. autn)   -- RAND || AUTN
+            :put_str(diam.AVP_SIP_AUTHORIZATION, v.res)         -- XRES
             -- CK/IK codes 625/626 collide with standard AVPs, so name the
             -- 3GPP vendor explicitly (else VENDOR_AUTO picks the IETF entry
             -- and writes vendor 0 — the S-CSCF then can't find them).

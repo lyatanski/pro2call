@@ -9,8 +9,10 @@ import (
 // registry, application ids and command codes extracted from the
 // dictionary files, plus the curation applied in curate() (main.go).
 type Spec struct {
-	Doc     string // "RFC 6733; 3GPP TS 29.229, ..."
-	Release string // dictionary snapshot tag
+	Doc string // one-line summary of what the profile covers
+	// Sources is one line per pinned specification, each naming its
+	// exact release: "TS 29.229 v19.0.0", "RFC 6733".
+	Sources []string
 
 	Vendors  []*Vendor
 	Apps     []*App
@@ -56,6 +58,7 @@ type AVP struct {
 	Type      string // one of Types
 	Mandatory bool   // spec says the M bit must be set
 	App       string // defining app, informative
+	Src       string // defining document, e.g. "TS 29.229" or "RFC 6733"
 	Enums     []*Enum
 }
 

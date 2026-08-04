@@ -85,9 +85,9 @@ local mar = cx(diam.Builder():request(diam.CMD_MULTIMEDIA_AUTH, diam.APP_CX),
     :put_str(diam.AVP_USER_NAME, IMPI)
     :put_str(diam.AVP_PUBLIC_IDENTITY, IMPU)
     :put_str(diam.AVP_SERVER_NAME, "sip:scscf.ims.example.net")
-    :put_u32(diam.AVP_3GPP_SIP_NUMBER_AUTH_ITEMS, 1)
-    :begin_group(diam.AVP_3GPP_SIP_AUTH_DATA_ITEM)
-        :put_str(diam.AVP_3GPP_SIP_AUTHENTICATION_SCHEME, "Digest-AKAv1-MD5")
+    :put_u32(diam.AVP_SIP_NUMBER_AUTH_ITEMS, 1)
+    :begin_group(diam.AVP_SIP_AUTH_DATA_ITEM)
+        :put_str(diam.AVP_SIP_AUTHENTICATION_SCHEME, "Digest-AKAv1-MD5")
     :end_group()
     :done()
 show("S-CSCF sends MAR", mar)
@@ -97,20 +97,20 @@ local maa = cx(diam.Builder():answer(req.cmd, req.app),
                req:str(diam.AVP_SESSION_ID), "hss.ims.example.net")
     :put_u32(diam.AVP_RESULT_CODE, 2001)
     :put_str(diam.AVP_USER_NAME, IMPI)
-    :put_u32(diam.AVP_3GPP_SIP_NUMBER_AUTH_ITEMS, 1)
-    :begin_group(diam.AVP_3GPP_SIP_AUTH_DATA_ITEM)
-        :put_str(diam.AVP_3GPP_SIP_AUTHENTICATION_SCHEME, "Digest-AKAv1-MD5")
-        :put_str(diam.AVP_3GPP_SIP_AUTHENTICATE,   "\x0a\x0b\x0c\x0d RAND||AUTN")
-        :put_str(diam.AVP_3GPP_SIP_AUTHORIZATION,  "\x01\x02\x03\x04 XRES")
+    :put_u32(diam.AVP_SIP_NUMBER_AUTH_ITEMS, 1)
+    :begin_group(diam.AVP_SIP_AUTH_DATA_ITEM)
+        :put_str(diam.AVP_SIP_AUTHENTICATION_SCHEME, "Digest-AKAv1-MD5")
+        :put_str(diam.AVP_SIP_AUTHENTICATE,   "\x0a\x0b\x0c\x0d RAND||AUTN")
+        :put_str(diam.AVP_SIP_AUTHORIZATION,  "\x01\x02\x03\x04 XRES")
     :end_group()
     :done()
 show("HSS answers MAA", maa)
 
 ans = diam.parse(maa)
-local vector = ans:find(diam.AVP_3GPP_SIP_AUTH_DATA_ITEM, diam.VENDOR_3GPP)
+local vector = ans:find(diam.AVP_SIP_AUTH_DATA_ITEM, diam.VENDOR_3GPP)
 print(("S-CSCF: got %s vector (%d bytes challenge)\n"):format(
-    vector:child(diam.AVP_3GPP_SIP_AUTHENTICATION_SCHEME, diam.VENDOR_3GPP):str(),
-    #vector:child(diam.AVP_3GPP_SIP_AUTHENTICATE, diam.VENDOR_3GPP):str()))
+    vector:child(diam.AVP_SIP_AUTHENTICATION_SCHEME, diam.VENDOR_3GPP):str(),
+    #vector:child(diam.AVP_SIP_AUTHENTICATE, diam.VENDOR_3GPP):str()))
 
 -- S-CSCF -> HSS: claim the registration, pull the profile ----------------
 

@@ -38,6 +38,7 @@ subdirectory; the deeper per-module READMEs carry the usage detail.
 ### diam
 - RFC 6733 — Diameter base protocol.
 - RFC 4006 — Diameter Credit-Control application (Ro).
+- RFC 7155 — Diameter NAS application (the AA command and access AVPs Rx reuses).
 - 3GPP TS 29.229 — Cx interface (IMS HSS).
 - 3GPP TS 29.212 — Gx interface (PCEF/PCRF policy and charging control).
 - 3GPP TS 29.214 — Rx interface (policy/media authorization).
@@ -81,10 +82,11 @@ cmake -B build && cmake --build build
 ctest --test-dir build
 ```
 
-The generated codec layers (`gtp/v?/gen`, `diam/gen`) are committed, so a
-normal build needs no Go toolchain; the SWIG bindings and the GTP-U eBPF
-datapath are auto-detected and skipped cleanly when their toolchains
-(SWIG/Python, clang/libbpf) are absent.
+The generated codec layers (`gtp/gen`, `diam/gen`) are produced at build
+time from the specifications pinned beside them and exist only in the
+build tree, so a build needs a Go toolchain; the SWIG bindings and the
+GTP-U eBPF datapath are auto-detected and skipped cleanly when their
+toolchains (SWIG/Python, clang/libbpf) are absent.
 
 ### Lint and format
 

@@ -66,7 +66,8 @@ check(diam.avp_name(999999, 0) == nil, "unknown avp_name is nil")
 -- dictionary metadata ---------------------------------------------------
 local e = diam.dict_get(diam.AVP_SESSION_ID, 0)
 check(e ~= nil and e.type == diam.TYPE_UTF8_STRING, "dict entry type")
-check(diam.dict_count() > 1000, "dict_count")
+-- only what the pinned specs define for the covered applications (~950)
+check(diam.dict_count() > 900, "dict_count")
 
 -- build -------------------------------------------------------------------
 local wire = diam.Builder()

@@ -3,14 +3,17 @@
 Diameter (RFC 6733) message and AVP codec with a generated dictionary
 covering the 3GPP application interfaces this project cares about:
 
-| interface | application id                   | spec         |
-|-----------|----------------------------------|--------------|
-| base      | 0                                | RFC 6733     |
-| Cx        | 16777216                         | TS 29.229    |
-| Gx        | 16777238                         | TS 29.212    |
-| Rx        | 16777236                         | TS 29.214    |
-| Ro        | 4 (credit-control, RFC 4006)     | TS 32.299    |
-| Rf        | 3 (base accounting)              | TS 32.299    |
+| interface | application id                   | spec, at the pinned release |
+|-----------|----------------------------------|-----------------------------|
+| base      | 0                                | RFC 6733                    |
+| Cx        | 16777216                         | TS 29.229 v19.0.0           |
+| Sh        | 16777217                         | TS 29.329 v19.1.0           |
+| Gx        | 16777238                         | TS 29.212 v19.1.0           |
+| Rx        | 16777236                         | TS 29.214 v19.3.0           |
+| S6c       | 16777312                         | TS 29.338 v19.3.0           |
+| SGd       | 16777313                         | TS 29.338 v19.3.0           |
+| Ro        | 4 (credit-control, RFC 4006)     | TS 32.299 v19.0.0           |
+| Rf        | 3 (base accounting)              | TS 32.299 v19.0.0           |
 
 ## Layout
 
@@ -20,9 +23,16 @@ covering the 3GPP application interfaces this project cares about:
     src/diam_fsm.c
     gen/              dictionary-layer generator (Go, runs at build
                       time; diam_dict.h/.c exist only in the build tree)
-      dict/             Wireshark Diameter dictionary files (source data)
-      main.go           curation: app selection, enum allowlist, labels
+      specs/            the pinned specifications — source data
+      main.go           source pinning and curation: which releases,
+                        app ids, enum allowlist, labels
+      docx.go           WordprocessingML reader (3GPP .docx)
+      reg3gpp.go        AVP/command/enum extraction from the 29-series
+      rfc.go            the same from the IETF RFCs
       templates/        C syntax of the generated dictionary layer
+      dict/             Wireshark Diameter dictionaries — cross-check
+      diff.go           the comparison against them
+      testdata/         the reviewed baseline of that comparison
 
 ## Codec
 
@@ -83,13 +93,55 @@ STATE_MAINTAINED`) have nothing to track — do not create a machine.
 
 ## Dictionary generation
 
-The dictionary layer (`diam_dict.h`/`diam_dict.c`) is generated into
-the build tree by `gen/`, a dependency-free Go program that parses the
-Wireshark project's Diameter dictionary files committed under
-`gen/dict/` (field-by-field transcriptions of the standards' AVP
-registries; refresh them from
-<https://github.com/wireshark/wireshark/tree/master/resources/protocols/diameter>).
-The curation — which applications to keep, which AVPs get Enumerated
-constants, labels — is the config block at the top of `gen/main.go`.
-Generation runs automatically as part of the build; building diam
-requires a Go toolchain.
+The dictionary layer (`diam_dict.h`/`diam_dict.c`) is generated into the
+build tree by `gen/`, a dependency-free Go program that extracts the AVP
+registries from the specifications themselves, pinned under `gen/specs/`:
+the 3GPP `.docx` releases and the IETF RFCs. Generation runs
+automatically as part of the build; building diam requires a Go
+toolchain.
+
+Every source names one exact release, so the dictionary is attributable
+to a 3GPP release rather than to a third party's snapshot of one. The
+3GPP filename encodes it — `29229-j00.docx` is TS 29.229 v19.0.0, each
+character of the version code being one field (0-9 then a-z for 10-35).
+To retarget a release, drop the new `.docx` in and bump its `ver` in the
+`specSources` table in `gen/main.go`; generating two releases and
+diffing the output shows exactly what changed.
+
+What is read from where:
+
+| construct         | source                                            |
+|-------------------|---------------------------------------------------|
+| AVP code, type, M | the registry table (`Value Type` / `Must` columns) |
+| Enumerated values | the AVP's own subclause, in prose                 |
+| command codes     | the command-code table                            |
+| application ids   | stated in `gen/main.go` beside their spec         |
+
+The curation — which releases, which registries, which AVPs get
+Enumerated constants, labels — is the config block at the top of
+`gen/main.go`. Extraction warns and skips rather than guessing: a
+registry row whose type defers to an unpinned spec, or whose flag rules
+cannot be read, is reported on stderr.
+
+### The Wireshark cross-check
+
+`gen/dict/` still holds the Wireshark Diameter dictionary files, no
+longer as input but as an independent transcription of the same
+standards. `go run . -diff` reports every AVP the two disagree about,
+and `gen/testdata/wireshark.diff` is the reviewed baseline of that
+report; `gen/diff_test.go` fails when it changes, which is also the
+`diam_dict_cross_check` ctest. So a new disagreement — an extraction
+bug, or a genuine change in a spec — has to be looked at rather than
+passing silently. After reviewing one, accept it with:
+
+```sh
+cd diam/gen && go test -run TestWiresharkDiff -update
+```
+
+The differences are grouped `RENAME` / `TYPE` / `SPEC` / `DICT`. The
+current baseline is ~1130 lines, and the bulk of it is not error: 759
+`DICT` entries are AVPs from specs outside this profile (S6a, T6a, 5G)
+that Wireshark keeps in one flat `<base>` registry, and most `TYPE`
+entries are M-bit rules a spec states and the dictionary omits. Where
+the two genuinely conflict the specification is authoritative — RFC 6733
+§8.4 defines `Result-Code` as `Unsigned32`, not `Enumerated`.

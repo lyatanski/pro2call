@@ -1,7 +1,15 @@
 {{- /* Diameter dictionary layer: tables. Data is Model. */ -}}
-/* Diameter dictionary — generated at build time by diamgen from
- * {{.Spec.Doc}} ({{.Spec.Release}}). DO NOT EDIT; change diam/gen
- * (the dictionaries, curation or templates) instead. */
+/* Diameter dictionary — generated at build time by diamgen.
+ *
+ * Covers {{.Spec.Doc}},
+ * extracted from these exact releases:
+ *
+{{- range .Spec.Sources}}
+ *     {{.}}
+{{- end}}
+ *
+ * DO NOT EDIT; change diam/gen (the pinned specs under gen/specs, the
+ * curation in gen/main.go, or the templates) instead. */
 
 #include "diam_dict.h"
 #include "diam.h"

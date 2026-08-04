@@ -4,12 +4,18 @@
 // of RFC 6733 and the 3GPP application specs (TS 29.229 Cx, TS 29.214
 // Rx, TS 32.299 Ro/Rf, ...), committed under dict/.
 //
-// The 3GPP/ETSI spec documents themselves are .docx prose whose AVP
-// tables do not carry the data type in a mechanically reliable form;
-// the dictionary files are the standards' registries already
-// transcribed field by field, so extraction stays a parse, not an
-// interpretation. Provenance per AVP is the enclosing <application>
-// (or the base registry) and is recorded in the AVP's App field.
+// This is no longer the generator's input. The dictionary is built from
+// the specifications themselves (reg3gpp.go, rfc.go); what remains here
+// serves diff.go, which compares the two so that a disagreement between
+// them has to be reviewed. Keeping a second, independently maintained
+// transcription of the same registries is what makes that check worth
+// anything.
+//
+// Refresh the files from
+// <https://github.com/wireshark/wireshark/tree/master/resources/protocols/diameter>;
+// the snapshot here is wireshark master 2026-07. Provenance per AVP is
+// the enclosing <application> (or the base registry) and is recorded in
+// the AVP's App field.
 package main
 
 import (
