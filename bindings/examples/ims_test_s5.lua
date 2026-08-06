@@ -19,7 +19,8 @@
 --   1. REGISTER (unprotected, UDP:5060) with a Security-Client offer.
 --   2. 401 with the AKA challenge (RAND||AUTN) and the P-CSCF's
 --      Security-Server (its SPIs and protected ports).
---   3. Verify AUTN, derive CK/IK, install four transport-mode ESP SAs.
+--   3. Verify AUTN, derive CK/IK, install four transport-mode ESP SAs
+--      (ealg=null — integrity-only ESP, see security_client below).
 --   4. REGISTER (protected, ESP) to the P-CSCF's protected server port with
 --      the AKAv1-MD5 digest and a Security-Verify; then 200 OK.
 --
@@ -422,6 +423,13 @@ end
 -- The UE's Security-Client offer (RFC 3329 / TS 33.203): its two inbound
 -- SPIs, its protected ports and the ESP algorithms.
 --
+-- ealg=null: confidentiality is OPTIONAL in TS 33.203 (§6.3, Annex I — only
+-- integrity is mandatory), so the SAs run ESP-NULL. Integrity still covers
+-- every protected message with IK, the SPI/port plumbing is unchanged, and
+-- the SIP stays readable in a capture while the kernel skips the cipher.
+-- kamailio's ims_ipsec_pcscf maps this offer to the kernel's cipher_null;
+-- it is the only ealg we offer, so it is the one it must select.
+--
 -- port-c and port-s are deliberately the SAME port here, which is what makes
 -- terminating requests (the MT INVITE, a BYE from the far end) reach the UE at
 -- all. TS 33.203 §6.3 pairs them the other way — SA1 is
@@ -440,7 +448,7 @@ end
 -- still carries the REGISTER exchange exactly as before. A P-CSCF that follows
 -- §6.3 strictly is unaffected: it would simply send to the same port.
 local function security_client(sub)
-    return ("ipsec-3gpp; alg=hmac-sha-1-96; ealg=aes-cbc; " ..
+    return ("ipsec-3gpp; alg=hmac-sha-1-96; ealg=null; " ..
             "spi-c=%d; spi-s=%d; port-c=%d; port-s=%d")
         :format(sub.spi_uc, sub.spi_us, sub.port_uc, sub.port_uc)
 end
@@ -766,16 +774,18 @@ local function mos_estimate(delay_ms, loss_pct)
 end
 
 -- Install the four transport-mode ESP SAs and steering policies (TS 33.203
--- Annex I: IK integrity-protects, CK encrypts). Keyed by the receiver's SPI;
--- the UE-side SPIs/ports and PAA are per-subscriber so a shared Xfrm handle
--- keeps every subscriber's SAs distinct.
+-- Annex I: IK integrity-protects; encryption with CK is optional and we
+-- negotiated ealg=null, so the cipher is cipher_null with a zero-length key
+-- and CK goes unused). Keyed by the receiver's SPI; the UE-side SPIs/ports
+-- and PAA are per-subscriber so a shared Xfrm handle keeps every
+-- subscriber's SAs distinct.
 local function establish_sas(xfrm, sub, ch, keys)
     local function esp_sa(src, dst, spi, reqid)
         local sa = ipsec.Sa()
         sa.src, sa.dst, sa.spi = src, dst, spi
         sa.proto, sa.mode, sa.reqid = ipsec.PROTO_ESP, ipsec.TRANSPORT, reqid
-        sa.enc_alg,  sa.enc_key  = "cbc(aes)",   keys.ck
-        sa.auth_alg, sa.auth_key = "hmac(sha1)", keys.ik
+        sa.enc_alg,  sa.enc_key  = "ecb(cipher_null)", ""
+        sa.auth_alg, sa.auth_key = "hmac(sha1)",       keys.ik
         return sa
     end
     local function esp_policy(dir, src, dst, sport, dport, reqid)
@@ -803,9 +813,9 @@ local function establish_sas(xfrm, sub, ch, keys)
         esp_policy(ipsec.DIR_IN,  pcscf, ue, ch.p_port_s, sub.port_uc, sub.spi_uc),
         esp_policy(ipsec.DIR_IN,  pcscf, ue, ch.p_port_c, sub.port_uc, sub.spi_us),
     }
-    -- hex() of two 16-byte keys: build it only if it will be printed.
+    -- hex() of a 16-byte key: build it only if it will be printed.
     if VERBOSE then
-        slog(sub, "ESP keys", ("enc(CK)=%s auth(IK)=%s"):format(hex(keys.ck), hex(keys.ik)))
+        slog(sub, "ESP keys", ("enc=null auth(IK)=%s"):format(hex(keys.ik)))
     end
     for j, sa in ipairs(sas) do
         attempt(sub, ("ESP SA %d (spi %#x)"):format(j, sa.spi), function() xfrm:sa_add(sa) end)
@@ -1737,7 +1747,7 @@ local function run()
             -- ((5062,5063) then (5063,5064)). When the MO's protected SERVER
             -- port is also the MT's protected CLIENT port, this P-CSCF sends
             -- the terminating INVITE from the wrong pair: it matches no ESP
-            -- policy for the callee, so it leaves unencrypted (or not at all)
+            -- policy for the callee, so it leaves unprotected (or not at all)
             -- and the callee never rings. Flag it up front, so the failure is
             -- attributed to a stack that is under-provisioned for concurrent
             -- UEs rather than looking like a core routing bug.

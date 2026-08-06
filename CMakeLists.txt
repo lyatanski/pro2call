@@ -31,6 +31,7 @@ add_subdirectory(net)
 add_subdirectory(sip)
 add_subdirectory(sdp)
 add_subdirectory(sms)
+add_subdirectory(json)
 add_subdirectory(rtp)
 add_subdirectory(nlmsg)
 

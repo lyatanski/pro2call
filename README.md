@@ -17,6 +17,7 @@ subdirectory; the deeper per-module READMEs carry the usage detail.
 | [`sip/`](sip) | SIP message codec — zero-copy parse, buffer-writing encode, enum-resolved methods and headers — plus the RFC 3261 transaction state machines. |
 | [`sdp/`](sdp) | SDP session-description codec — zero-copy single-pass parse, enum-resolved attributes. |
 | [`sms/`](sms) | SMS codec for SMS over IMS: TS 23.040 TPDUs, the TS 24.011 relay layer, and the TS 23.038 alphabets and data coding schemes. See [`sms/README.md`](sms/README.md). |
+| [`json/`](json) | JSON codec — zero-copy parse into a caller-owned node pool, JSON Pointer lookup, and a writer that owns the punctuation. The text payload layer: 5G SBI bodies, and the configuration and results the tools themselves read and write. |
 | [`rtp/`](rtp) | RTP/RTCP codec with the RFC 3550 receiver-side source tracker (sequence validation, loss, jitter). |
 | [`nlmsg/`](netlink) | Kernel configuration over netlink: IPsec SA/policy management (`xfrm`, NETLINK_XFRM) and interface address add/del (`rtnl`, RTNETLINK `RTM_*ADDR`). |
 | [`bindings/`](bindings) | SWIG bindings (Lua) over C++ facades of the C libraries. |
@@ -62,6 +63,16 @@ subdirectory; the deeper per-module READMEs carry the usage detail.
 - 3GPP TS 24.341 — SMS over IP: the `+g.3gpp.smsip` feature tag, the
   `application/vnd.3gpp.sms` body, and the MO/MT procedures over SIP MESSAGE.
 - 3GPP TS 23.204 — architecture for SMS over generic IP (the IP-SM-GW).
+
+### json
+- RFC 8259 — JSON: the interchange format (strict: no trailing commas,
+  comments, unquoted names, NaN or Infinity).
+- RFC 6901 — JSON Pointer, the member path syntax `json_ptr()` resolves
+  and RFC 6902 (JSON Patch) bodies carry.
+- RFC 3629 — UTF-8, for the `\uXXXX` escapes and surrogate pairs of
+  RFC 8259 §7 and the encoding validator.
+- 3GPP TS 29.500 — 5G SBI: JSON over HTTP/2 is the payload of every
+  service operation (the reason this codec is here).
 
 ### rtp
 - RFC 3550 — RTP: transport for real-time applications (SR/RR/SDES/BYE, source tracker).

@@ -41,6 +41,7 @@ file(GLOB_RECURSE CLANG_TOOL_SOURCES CONFIGURE_DEPENDS
      ${PROJECT_SOURCE_DIR}/net/*.[ch]
      ${PROJECT_SOURCE_DIR}/sip/*.[ch]
      ${PROJECT_SOURCE_DIR}/sdp/*.[ch]
+     ${PROJECT_SOURCE_DIR}/json/*.[ch]
      ${PROJECT_SOURCE_DIR}/rtp/*.[ch]
      ${PROJECT_SOURCE_DIR}/netlink/*.[ch]
      ${PROJECT_SOURCE_DIR}/diam/*.[ch]

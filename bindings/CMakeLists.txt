@@ -9,6 +9,7 @@
 #   diam,  diamxx,  swig/diam.i,  Diameter stack
 #   rtp,   rtpxx,   swig/rtp.i,   RTP/RTCP media session
 #   net,   netxx,   swig/net.i,   event loop + UDP socket
+#   json,  jsonxx,  swig/json.i,  JSON codec (SBI bodies, config)
 #
 # Optional: without SWIG or lua's development files the whole directory is skipped
 
@@ -32,7 +33,7 @@ include(UseSWIG)
 
 # Everything linked into an extension module must be PIC. Applied here so
 # the C libraries pay for it only when bindings build.
-foreach(dep task net gtp2 gtpu xfrm rtnl sip sdp sms diam rtp)
+foreach(dep task net gtp2 gtpu xfrm rtnl sip sdp sms json diam rtp)
     set_target_properties(${dep} PROPERTIES POSITION_INDEPENDENT_CODE ON)
 endforeach()
 
@@ -242,6 +243,43 @@ if(NOT MSVC)
     target_compile_options(sms_lua PRIVATE -w)   # generated wrapper code
 endif()
 
+# --- json (jsonxx facade)
+# The text-payload codec: 5G SBI bodies, JSON Patch pointers, and the
+# configuration/results the scripts themselves read and write. Nothing but
+# the C codec behind it — no loop, no socket. The Lua module adds two
+# hand-written converters (json.decode / json.encode) that build native
+# tables straight from the node pool, so they live in swig/json.i rather
+# than in the facade.
+add_library(jsonxx STATIC cxx/src/json.cpp)
+target_include_directories(jsonxx PUBLIC cxx/inc)
+target_link_libraries(jsonxx PUBLIC json)
+set_target_properties(jsonxx PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+set_property(SOURCE swig/json.i PROPERTY CPLUSPLUS ON)
+set_property(SOURCE swig/json.i PROPERTY USE_TARGET_INCLUDE_DIRECTORIES ON)
+# The C codec header carries the node flags, error codes and depth bound
+# the facade and the converters use, so a change there must re-run SWIG
+# rather than leave the Lua constant table stale.
+set_property(SOURCE swig/json.i PROPERTY DEPENDS
+    swig/common.i cxx/inc/jsonxx.hpp
+    ${CMAKE_SOURCE_DIR}/json/inc/json.h)
+# The CMake target is json_lua because `json` is the C library; the
+# loadable module is still json.so for `require("json")`.
+swig_add_library(json_lua
+    TYPE MODULE
+    LANGUAGE lua
+    OUTPUT_DIR ${CMAKE_CURRENT_BINARY_DIR}/lua
+    SOURCES swig/json.i)
+set_target_properties(json_lua PROPERTIES
+    PREFIX ""
+    OUTPUT_NAME json
+    LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/lua)
+target_include_directories(json_lua PRIVATE ${LUA_INCLUDE_DIR})
+target_link_libraries(json_lua PRIVATE jsonxx ${LUA_LIBRARIES})
+if(NOT MSVC)
+    target_compile_options(json_lua PRIVATE -w)   # generated wrapper code
+endif()
+
 # --- rtp (rtpxx facade)
 # The media session (cxx/src/rtp.cpp) registers its socket pair and its
 # report timer with net::Loop from the netxx facade — the same loop the
@@ -321,7 +359,7 @@ endif()
 
 # SWIG wrapper code is generated; keep clang-tidy (ENABLE_CLANG_TIDY)
 # off those targets. The facade libraries above stay covered.
-foreach(mod gtp_lua ipsec sip_lua sdp_lua sms_lua diam_lua rtp_lua net_lua)
+foreach(mod gtp_lua ipsec sip_lua sdp_lua sms_lua json_lua diam_lua rtp_lua net_lua)
     set_target_properties(${mod} PROPERTIES C_CLANG_TIDY "" CXX_CLANG_TIDY "")
 endforeach()
 
@@ -376,6 +414,16 @@ if(BUILD_TESTING AND Lua_FOUND AND LUA_INTERPRETER)
              COMMAND ${LUA_INTERPRETER}
                      ${CMAKE_CURRENT_SOURCE_DIR}/test/test_sms_bindings.lua)
     set_tests_properties(bindings_lua_sms PROPERTIES
+        ENVIRONMENT "LUA_CPATH=${CMAKE_CURRENT_BINARY_DIR}/lua/?.so")
+
+    # The table converters are hand-written Lua C rather than SWIG
+    # output, so this covers both them and the wrapped Doc/Builder — and
+    # loads json beside sip/sdp/diam/net at the end, which is the
+    # class-name collision check for the types it introduces.
+    add_test(NAME bindings_lua_json
+             COMMAND ${LUA_INTERPRETER}
+                     ${CMAKE_CURRENT_SOURCE_DIR}/test/test_json_bindings.lua)
+    set_tests_properties(bindings_lua_json PROPERTIES
         ENVIRONMENT "LUA_CPATH=${CMAKE_CURRENT_BINARY_DIR}/lua/?.so")
 
     # sdp and sip both wrap a class called Msg and one called Builder;

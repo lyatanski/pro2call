@@ -2,7 +2,8 @@
 
 SWIG bindings for the C libraries. The GTP stack (`gtp`) is exposed as
 both a Python and a Lua module; the IPsec/XFRM (`ipsec`), SIP codec
-(`sip`), SDP codec (`sdp`), SMS codec (`sms`), Diameter codec (`diam`),
+(`sip`), SDP codec (`sdp`), SMS codec (`sms`), JSON codec (`json`),
+Diameter codec (`diam`),
 RTP session (`rtp`) and transport layer (`net`) modules are Lua. Each is the same two-layer pattern; the GTP module described below
 is the most involved:
 
@@ -48,7 +49,8 @@ lua -e 'print(require("gtp").GTPC_PORT)'
 `ctest` runs the binding suites — `test/test_bindings.py` and the Lua
 `test_gtp_bindings.lua` / `test_sip_bindings.lua` /
 `test_diam_bindings.lua` / `test_sdp_bindings.lua` /
-`test_sms_bindings.lua` / `test_rtp_bindings.lua` /
+`test_sms_bindings.lua` / `test_json_bindings.lua` /
+`test_rtp_bindings.lua` /
 `test_net_bindings.lua` / `test_bindings.lua` (ipsec) — along with the C
 tests. Two of them are coexistence tests rather than codec tests:
 `test_sdp_sip_coexist.lua` and `test_sms_coexist.lua` load several
@@ -397,6 +399,79 @@ timestamp, keeping TP-PID/TP-DCS/TP-UDHI/TP-UD **byte for byte**. Both
 emulators use it, and it is what makes an end-to-end "what arrived equals
 what was sent" assertion mean something rather than testing the codec
 against itself.
+
+## Lua: json
+
+The `json` module wraps the jsonxx facade (`cxx/inc/jsonxx.hpp`) over the
+JSON codec ([`json/`](../json)): the text payload layer. 5G SBI carries
+every service operation as JSON over HTTP/2, a PATCH body is a JSON Patch
+whose paths are JSON Pointers, and the scripts here read their own
+configuration and write their own results in it.
+
+Three shapes, because JSON gets used three ways:
+
+```lua
+local json = require("json")
+
+-- 1. a whole body as a table (the common case)
+local t = json.decode(body)
+print(t.supi, t.qosFlows[1].qfi)
+local out = json.encode{ supi = t.supi, pduSessionId = 5 }
+
+-- 2. two members out of forty, without building any table
+local d = json.parse(body)
+local dnn = d:str_or("/dnn", "internet")
+if d:has("/sNssai/sst") then sst = d:num("/sNssai/sst") end
+
+-- 3. one document built exactly: member order, integers, and a subtree
+--    passed through byte for byte
+local body = json.Builder():obj()
+    :field("supi", supi)
+    :field_int("pduSessionId", 5)
+    :field_frag("sNssai", d:text("/sNssai"))
+    :obj_end():done()
+```
+
+`decode`/`encode` are hand-written Lua C rather than SWIG output: a table
+is built straight out of the node pool and read straight into the writer,
+so neither direction goes through an intermediate C++ tree. `json.parse`
+returns a `Doc` that materializes only what is asked for, addressed by
+JSON Pointer (`""` is the whole document, `"/a/0/b"` a member of an
+element of a member) — the right way round for a forty-member SBI body
+when three members matter.
+
+The four mappings that have no obvious answer, and what this one does:
+
+- **null** has no Lua value, so it decodes to `json.null`, a unique
+  sentinel that encodes back to null — a member that is present-but-null
+  stays distinguishable from one that is absent (`json.is_null(v)`).
+  A second argument chooses something else: `json.decode(body, nil)`
+  drops null members, `json.decode(body, false)` makes them false.
+- **an empty table** encodes as `{}`. An empty array decodes with a
+  marker that encodes back as `[]`, so a decode/encode round trip does
+  not silently turn one into the other; `json.array{}` and
+  `json.object{}` set that marker by hand.
+- **array or object** for a non-empty table: keys 1..n make an array,
+  anything else an object. A table that is both, or an array with a
+  hole, raises rather than being guessed at — quietly dropping elements
+  shows up much later as a peer's 400.
+- **numbers** are all doubles in Lua 5.1, so an integral one is written
+  as an integer (`5`, not `5.0`), and an identifier no double holds
+  exactly is read with `d:text("/volume")`, which hands back its literal
+  digits.
+
+Errors are Lua errors, and a rejected body says where it gave up
+(`json.decode: parse at byte 11: not JSON`), which is the difference
+between a diagnosis and a shrug on a 4 KiB payload. The Builder refuses
+to write JSON no peer could parse: a mismatched close, a member name
+outside an object, a value where a name is due, an unclosed document at
+`done()`. Its buffer grows, so a big body is not a capacity to guess.
+
+`json.pretty(v)` is `json.encode(v, 2)`, for a log line or a fixture a
+human will read; `json.encode(v, { indent = 2 })` is the same thing
+spelled as an option. Values are byte strings throughout, so a body whose
+strings carry an embedded NUL (escaped on the wire, a byte in Lua)
+survives both directions, and a SIP body in between.
 
 ## Lua: diam
 
