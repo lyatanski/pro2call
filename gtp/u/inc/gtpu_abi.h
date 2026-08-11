@@ -58,6 +58,7 @@ struct gtpu_hdr {
 
 #define GTPU_MAX_BEARERS   (1u << 20) /* 1 M simultaneous bearers */
 #define GTPU_MAX_TFT       (1u << 16)
+#define GTPU_MAX_FRAG      (1u << 12) /* datagrams mid-fragmentation, LRU */
 #define GTPU_STATS_ENTRIES 4096 /* power of two; slot = teid & mask */
 #define GTPU_STATS_MASK    (GTPU_STATS_ENTRIES - 1)
 #define GTPU_RINGBUF_SIZE  (4u << 20)

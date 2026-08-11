@@ -71,6 +71,35 @@ struct {
     __uint(max_entries, GTPU_MAX_TFT);
 } teid_tft_map SEC(".maps");
 
+/* Which bearer the head of a fragmented datagram went out on.
+ *
+ * Only the first fragment carries the L4 header, so the ones after it have
+ * no ports to classify on and a TFT keyed on a port cannot match them —
+ * they would fall through unencapsulated while their head rides the tunnel,
+ * and the far end never reassembles. TS 23.060 §15.3 says what to do
+ * instead: every fragment follows the bearer the first one selected. This
+ * is that memory, keyed by the datagram's identity (RFC 791: source,
+ * destination, protocol and identification are what make a fragment belong
+ * to a datagram).
+ *
+ * Datapath-private — the loader neither reads nor sizes it. LRU because
+ * nothing here learns that a datagram was reassembled: an entry outlives
+ * one sendmsg by microseconds and is then evicted rather than deleted. */
+struct gtpu_frag_key {
+    __u8   family;    /* AF_INET; IPv6 fragments need the ext-header walk */
+    __u8   proto;     /* inner IPPROTO_* */
+    __be16 id;        /* IPv4 identification, network order */
+    __u8   saddr[16]; /* inner src */
+    __u8   daddr[16]; /* inner dst */
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __type(key, struct gtpu_frag_key);
+    __type(value, struct gtpu_tx_tun);
+    __uint(max_entries, GTPU_MAX_FRAG);
+} tx_frag_map SEC(".maps");
+
 struct {
     __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
     __type(key, __u32); /* teid & GTPU_STATS_MASK */
@@ -470,6 +499,11 @@ int gtpu_encap(struct __sk_buff* skb)
     __u32 l4_off          = 0;     /* 0 = no L4 header in this frame */
     __u32 inner_l4_len    = 0;     /* L4 header + payload; 0 = do not checksum */
 
+    /* Fragment state, for the classification below. */
+    __be16 frag_id   = 0; /* IPv4 id: what its fragments have in common */
+    __u8   frag_head = 0; /* the fragment at offset 0, the one with ports */
+    __u8   frag_tail = 0; /* every fragment after it, which has none */
+
     if (eth->h_proto == bpf_htons(ETH_P_IP)) {
         struct iphdr* ip = (void*)(eth + 1);
         if ((void*)(ip + 1) > data_end) return TC_ACT_OK;
@@ -479,6 +513,12 @@ int gtpu_encap(struct __sk_buff* skb)
         __builtin_memcpy(ue_addr, &ip->daddr, 4);
         __builtin_memcpy(inner_saddr, &ip->saddr, 4);
         __u32 ihl_bytes = (__u32)ip->ihl * 4;
+        /* MF set or a non-zero offset: one piece of a larger datagram. */
+        if (ip->frag_off & bpf_htons(0x3fff)) {
+            frag_id   = ip->id;
+            frag_tail = !!(ip->frag_off & bpf_htons(0x1fff));
+            frag_head = !frag_tail;
+        }
         /* Ports exist only in first fragments. */
         if (!(ip->frag_off & bpf_htons(0x1fff)))
             l4_off = ETH_HLEN + ihl_bytes;
@@ -512,9 +552,27 @@ int gtpu_encap(struct __sk_buff* skb)
         }
     }
 
-    struct gtpu_tx_tun* tun =
-        tx_classify(family, ue_addr, inner_saddr, proto, ue_port, remote_port);
+    /* A fragment after the first has no ports, so tx_classify() would probe
+     * only the {0,0} tier and miss the port-keyed filter its own head just
+     * matched — the head would ride the tunnel and the rest would leave in
+     * the clear. Follow the head instead (see tx_frag_map), falling back to
+     * classifying on what this frame does carry when there is no memory of
+     * one: a port-wildcard filter (ESP, say) still matches on its own. */
+    struct gtpu_frag_key fk;
+    __builtin_memset(&fk, 0, sizeof fk);
+    fk.family = family;
+    fk.proto  = proto;
+    fk.id     = frag_id;
+    __builtin_memcpy(fk.saddr, inner_saddr, 16);
+    __builtin_memcpy(fk.daddr, ue_addr, 16);
+
+    struct gtpu_tx_tun* tun = NULL;
+    if (frag_tail) tun = bpf_map_lookup_elem(&tx_frag_map, &fk);
+    if (!tun)
+        tun = tx_classify(family, ue_addr, inner_saddr, proto, ue_port,
+                          remote_port);
     if (!tun) return TC_ACT_OK; /* not tunnel traffic — pass through */
+    if (frag_head) bpf_map_update_elem(&tx_frag_map, &fk, tun, BPF_ANY);
 
     struct gtpu_stats*  st  = stats_slot(tun->local_teid);
     struct gtpu_config* cfg = config_get();

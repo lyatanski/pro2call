@@ -134,6 +134,24 @@ static size_t inner_esp4(uint8_t* p, const uint8_t src[4], const uint8_t dst[4])
     return off + sizeof esp;
 }
 
+/* One fragment of a larger IPv4 datagram: off8 is the fragment offset in
+ * 8-byte units and more sets MF. Only the fragment at offset 0 carries the
+ * L4 header, so `body` is a UDP header plus data for that one and payload
+ * bytes for the rest — which is the whole point: the others have no ports. */
+static size_t inner_frag4(uint8_t* p, const uint8_t src[4],
+                          const uint8_t dst[4], uint8_t proto, uint16_t id,
+                          uint16_t off8, int more, const uint8_t* body,
+                          size_t body_len)
+{
+    size_t off = ipv4_push(p, src, dst, proto, (uint16_t)body_len);
+    be16p(p + 4, id);
+    be16p(p + 6, (uint16_t)((more ? 0x2000 : 0) | (off8 & 0x1fff)));
+    be16p(p + 10, 0); /* ipv4_push summed a header without these; redo it */
+    be16p(p + 10, (uint16_t)~fold16(sum16(p, 20, 0)));
+    memcpy(p + off, body, body_len);
+    return off + body_len;
+}
+
 /* Full outer frame: Eth + IPv4 + UDP:2152 + GTP-U (+ PSC ext). */
 static size_t gpdu4(uint8_t* p, uint8_t msg_type, uint32_t teid, int with_ext,
                     const uint8_t* inner, size_t inner_len)
@@ -631,6 +649,73 @@ spec ("gtpu_bpf") {
             check(run_prog(encap_fd, in, ln, out, &olen, &ret) == 0);
             check(ret == TC_ACT_REDIRECT);
             check(be16g(out + 14 + 20 + 8 + 6) == 0x2006);
+        }
+
+        it ("keeps every fragment of one datagram on its bearer", !!g) {
+            uint8_t  frag[256], in[512], out[4096];
+            uint32_t ret;
+            size_t   olen, ln, ilen;
+
+            /* A SIP answer too big for the path leaves as two frames: the
+             * first with the UDP header, the second with body only. UE3's
+             * filter is keyed on dst port 5060, which the second frame does
+             * not carry, so classifying it on its own would miss and it
+             * would leave in the clear — a 200 OK whose tail never arrives
+             * is a call that rings and never connects. */
+            uint8_t head[24]; /* UDP header + 16 bytes of a longer body */
+            udp_push(head, 5088, 5060, 1440);
+            memset(head + 8, 'A', 16);
+            uint8_t tail[16];
+            memset(tail, 'B', sizeof tail);
+
+            ilen = inner_frag4(frag, UE3, PCSCF, 17, 0x1234, 0, 1, head,
+                               sizeof head);
+            ln   = eth_push(in, 0x0800);
+            memcpy(in + ln, frag, ilen);
+            ln += ilen;
+            check(run_prog(encap_fd, in, ln, out, &olen, &ret) == 0);
+            check(ret == TC_ACT_REDIRECT);
+            check(be16g(out + 14 + 20 + 8 + 6) == 0x2007);
+
+            ilen = inner_frag4(frag, UE3, PCSCF, 17, 0x1234, 3, 0, tail,
+                               sizeof tail);
+            ln   = eth_push(in, 0x0800);
+            memcpy(in + ln, frag, ilen);
+            ln += ilen;
+            check(run_prog(encap_fd, in, ln, out, &olen, &ret) == 0);
+            check(ret == TC_ACT_REDIRECT);
+            check(be16g(out + 14 + 20 + 8 + 6) == 0x2007);
+
+            /* UE4's fragment of its own datagram goes to UE4's bearer: the
+             * memory is keyed by the datagram, not shared between UEs. */
+            ilen = inner_frag4(frag, UE4, PCSCF, 17, 0x1234, 0, 1, head,
+                               sizeof head);
+            ln   = eth_push(in, 0x0800);
+            memcpy(in + ln, frag, ilen);
+            ln += ilen;
+            check(run_prog(encap_fd, in, ln, out, &olen, &ret) == 0);
+            check(ret == TC_ACT_REDIRECT);
+            check(be16g(out + 14 + 20 + 8 + 6) == 0x2008);
+
+            ilen = inner_frag4(frag, UE4, PCSCF, 17, 0x1234, 3, 0, tail,
+                               sizeof tail);
+            ln   = eth_push(in, 0x0800);
+            memcpy(in + ln, frag, ilen);
+            ln += ilen;
+            check(run_prog(encap_fd, in, ln, out, &olen, &ret) == 0);
+            check(ret == TC_ACT_REDIRECT);
+            check(be16g(out + 14 + 20 + 8 + 6) == 0x2008);
+
+            /* No memory of the head — the fragment still classifies on what
+             * it does carry, and a port-wildcard filter (ESP) matches. */
+            ilen = inner_frag4(frag, UE3, PCSCF, 50, 0x5678, 3, 0, tail,
+                               sizeof tail);
+            ln   = eth_push(in, 0x0800);
+            memcpy(in + ln, frag, ilen);
+            ln += ilen;
+            check(run_prog(encap_fd, in, ln, out, &olen, &ret) == 0);
+            check(ret == TC_ACT_REDIRECT);
+            check(be16g(out + 14 + 20 + 8 + 6) == 0x2007);
         }
 
         it ("keeps non-matching traffic on the default bearer", !!g) {
