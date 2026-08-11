@@ -1,7 +1,8 @@
 /* SWIG interface for the net transport layer — wraps the netxx C++
  * facade (bindings/cxx/inc/netxx.hpp) over the C net library (net/): the
  * epoll event loop, a non-blocking UDP socket, a TCP/SCTP stream socket,
- * the DNS resolver, the interface-address helpers, and net.IpPool — the
+ * the DNS resolver, the interface address and route helpers, and
+ * net.IpPool — the
  * address allocator from task/inc/ippool.h with its literal-string
  * surface (a PGW's PDN addresses, a DHCP server's leases).
  *

@@ -724,6 +724,10 @@ end
 -- for it in. Without that, an 882-byte ACK came back as a 1480-byte downlink
 -- and vanished, which looks exactly like the far end ignoring the request.
 --
+-- The uplink half of the same sum is not about message size at all — it is a
+-- route MTU, so the kernel fragments before the datapath's TC hook rather than
+-- losing the packet at it. See set_pcscf_mtu in run().
+--
 -- An ACK or a BYE from the MO goes to the dialog's remote target through its
 -- route set, with the local/remote URI+tag pair as the 200 OK settled it. The
 -- ACK for a 2xx is its own transaction, hence its own branch; the ACK for a
@@ -904,6 +908,10 @@ local function run()
     -- 0.0.0.0 gives an invalid outer source and F-TEID address.
     local gtpu_ifname = os.getenv("GTPU_IFACE") or "eth0"
     local inner_name  = os.getenv("GTPU_INNER_IFACE") or "eth0"
+    -- The MTU put on the route toward the P-CSCF: 1500 less the 36 bytes of
+    -- GTP-U the datapath adds. See set_pcscf_mtu below; 0 leaves routing
+    -- untouched.
+    local inner_mtu   = tonumber(os.getenv("GTPU_INNER_MTU") or "1464") or 1464
     local sgw_auto = false
     if sgw_ip == "0.0.0.0" then
         local ip = net.if_addr4(gtpu_ifname)
@@ -1227,6 +1235,60 @@ local function run()
         slog(sub, "PAA local route", ok
             and ("%s/32 dev lo"):format(sub.ue_addr)
             or  ("could not add %s/32 (need CAP_NET_ADMIN?): %s"):format(sub.ue_addr, why(err)))
+    end
+
+    -- ---- the uplink size budget: the route MTU toward the P-CSCF ----
+    --
+    -- The other half of the sum the "downlink size budget" comment above
+    -- describes, seen from this end. A UE's signalling rides transport-mode
+    -- ESP to the P-CSCF and the datapath then adds 36 bytes of GTP-U at TC
+    -- egress — where nothing can fragment, because a TC program cannot split
+    -- a packet. So a datagram that fits the 1500-byte link before
+    -- encapsulation and not after is dropped there, and the only trace of it
+    -- is one number in this run's own summary ("datapath drops ... no
+    -- neighbour 2").
+    --
+    -- It lands on exactly one message: the 200 OK answering an MT INVITE,
+    -- which carries the SDP answer plus the dialog's whole route set — 5
+    -- Record-Route and 6 Via, since a call between two subscribers of one
+    -- core crosses P-CSCF -> S-CSCF -> I-CSCF -> S-CSCF -> P-CSCF — so ~1470
+    -- bytes of SIP, 1513 with UDP and the ESP overhead, 1549 encapsulated.
+    -- The MO gets its 180 and then nothing, and the call is reported as
+    -- failed after ringing with the answer never on the wire.
+    --
+    -- The fix is to make the kernel fragment *before* the hook: the route to
+    -- the P-CSCF carries the MTU that is actually available, so the ESP
+    -- datagram leaves as two G-PDUs that both fit and the P-CSCF reassembles
+    -- them. Only that route is touched — the interface MTU has to stay 1500,
+    -- since the encapsulated packets themselves go out at up to that size.
+    --
+    -- One /32 per P-CSCF, installed once and removed at teardown (the less
+    -- specific route it shadows is left in place, so this adds and removes a
+    -- route rather than rewriting the container's routing). The dev is
+    -- $GTPU_INNER_IFACE, not $GTPU_IFACE: encap attaches to the *inner*
+    -- interface's TC egress (gtpu_ebpf_attach), so that is the path a UE
+    -- packet has to take to be encapsulated at all, and the only one whose
+    -- MTU decides whether it survives. The two are the same interface on a
+    -- single-NIC deployment. Only with the datapath up: without GTP-U there
+    -- is no encapsulation to make room for and the interface MTU is already
+    -- the truth.
+    --
+    -- Attempted (so a refusal is reported once, not once per subscriber) and
+    -- installed (what teardown removes) are separate: 400 subscribers share
+    -- one P-CSCF and one route.
+    local mtu_routes, mtu_tried = {}, {}
+    local function set_pcscf_mtu(sub)
+        if not (up and inner_mtu > 0 and sub.pcscf) then return end
+        if mtu_tried[sub.pcscf] then return end
+        mtu_tried[sub.pcscf] = true
+        local r = net.Route()
+        r.dst, r.prefixlen, r.dev, r.mtu = sub.pcscf, 32, inner_name, inner_mtu
+        local ok, err = pcall(function() net.route_add(r) end)
+        if ok then mtu_routes[sub.pcscf] = r end
+        line("P-CSCF route MTU", ok
+            and ("%s/32 dev %s mtu %d (GTP-U leaves 1500-36)"):format(sub.pcscf, inner_name, inner_mtu)
+            or  ("could not set %d toward %s (need CAP_NET_ADMIN?): %s — an answered call's 200 OK will not fit")
+                :format(inner_mtu, sub.pcscf, why(err)))
     end
 
     -- Confirm a downlink reply arrived through the decap entry.
@@ -2569,6 +2631,7 @@ local function run()
             return fail(sub, "no P-CSCF/UE address from Create Session")
         end
         add_paa_route(sub)
+        set_pcscf_mtu(sub)
 
         -- encap resolves the outer L2 with bpf_fib_lookup (reads the neighbour
         -- table, never ARPs); a throwaway datagram warms the peer's entry.
@@ -3033,6 +3096,9 @@ local function run()
         end
         if sub.paa_added then pcall(function() net.addr_del("lo", sub.ue_addr, 32) end) end
     end
+    -- The P-CSCF /32 that carried the tunnel MTU; removing it uncovers the
+    -- route it shadowed.
+    for _, r in pairs(mtu_routes) do pcall(function() net.route_del(r) end) end
     if not rok then io.stderr:write("loop error: " .. why(rerr) .. "\n") end
     return subs, stats
 end

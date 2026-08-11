@@ -189,6 +189,40 @@ do
         "addr_del raises for an unknown interface")
 end
 
+-- routes ---------------------------------------------------------------
+do
+    -- A fresh Route is the "nothing said" route: no destination, no
+    -- gateway, no dev, and no per-route MTU or metric.
+    local r = net.Route()
+    check(r.dst == "" and r.gateway == "" and r.dev == "", "Route addresses default empty")
+    check(r.prefixlen == 0 and r.mtu == 0 and r.metric == 0, "Route numbers default to 0")
+
+    r.dst, r.prefixlen, r.dev, r.mtu = "10.10.0.5", 32, "lo", 1464
+    check(r.dst == "10.10.0.5" and r.prefixlen == 32, "Route destination round-trips")
+    check(r.dev == "lo" and r.mtu == 1464, "Route dev and mtu round-trip")
+
+    -- Same as addr_add: the dev is resolved before any privileged netlink
+    -- op, and the message builder rejects a malformed route, so both fail
+    -- the same way with or without CAP_NET_ADMIN. The live
+    -- install/replace/remove round-trip is covered by netlink/rtnl's C test.
+    local bad_dev = net.Route()
+    bad_dev.dst, bad_dev.prefixlen, bad_dev.dev = "10.10.0.5", 32, "nosuchif0"
+    check(raises(function() net.route_add(bad_dev) end),
+        "route_add raises for an unknown interface")
+    check(raises(function() net.route_del(bad_dev) end),
+        "route_del raises for an unknown interface")
+
+    -- Neither a destination nor a gateway: nothing to route, and no
+    -- address family to infer either.
+    check(raises(function() net.route_add(net.Route()) end),
+        "route_add raises with neither destination nor gateway")
+
+    local too_long = net.Route()
+    too_long.dst, too_long.prefixlen = "10.10.0.5", 33
+    check(raises(function() net.route_add(too_long) end),
+        "route_add raises for a prefix longer than the family allows")
+end
+
 -- stream socket: listen / connect / accept / send / recv / close --------
 do
     check(net.PROTO_TCP == 0, "PROTO_TCP")

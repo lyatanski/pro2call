@@ -604,6 +604,34 @@ RTNETLINK ([`netlink/rtnl/`](../netlink/rtnl)), so a script can make an
 address locally deliverable without shelling out to `ip` (they need
 CAP_NET_ADMIN and raise on failure).
 
+Routes come from the same place: `net.route_add(r)` / `net.route_del(r)`
+take a `net.Route` (`dst`, `prefixlen`, `gateway`, `dev`, `mtu`, `metric`)
+and are `ip route replace` / `ip route del`. An empty `dst` is the default
+route; whatever the Route leaves out takes the value `ip route` would pick,
+so a Route with a `gateway` is scope universe and one with only a `dev` is
+scope link. `route_add` replaces any route for the same destination, so
+installing one twice is not an error.
+
+`mtu` is the reason this exists — it is the per-route MTU, and what a
+sender needs when something past its socket grows the packet and cannot
+fragment. The eBPF GTP-U datapath is exactly that: it adds 36 bytes at TC
+egress, where a program cannot split a packet, so a datagram that fits the
+1500-byte link before encapsulation and not after is dropped there with no
+ICMP to learn from. Lowering the MTU of the route toward the far end makes
+the kernel fragment on the way out instead, while the interface MTU stays
+what the encapsulated packets need:
+
+```lua
+local r = net.Route()
+r.dst, r.prefixlen, r.dev, r.mtu = pcscf, 32, "eth0", 1464  -- 1500 - 36
+net.route_add(r)                                            -- ip route replace
+```
+
+[`examples/ims_test_s5.lua`](examples/ims_test_s5.lua) does this for the
+P-CSCF address the PCO returned (`GTPU_INNER_MTU`, 0 to leave routing
+alone) and removes the /32 at teardown — without it the 200 OK answering an
+MT INVITE, the one message big enough to matter, never reaches the network.
+
 ### net.IpPool
 
 `net.IpPool` is the address allocator from

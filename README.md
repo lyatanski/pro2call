@@ -19,7 +19,7 @@ subdirectory; the deeper per-module READMEs carry the usage detail.
 | [`sms/`](sms) | SMS codec for SMS over IMS: TS 23.040 TPDUs, the TS 24.011 relay layer, and the TS 23.038 alphabets and data coding schemes. See [`sms/README.md`](sms/README.md). |
 | [`json/`](json) | JSON codec — zero-copy parse into a caller-owned node pool, JSON Pointer lookup, and a writer that owns the punctuation. The text payload layer: 5G SBI bodies, and the configuration and results the tools themselves read and write. |
 | [`rtp/`](rtp) | RTP/RTCP codec with the RFC 3550 receiver-side source tracker (sequence validation, loss, jitter). |
-| [`nlmsg/`](netlink) | Kernel configuration over netlink: IPsec SA/policy management (`xfrm`, NETLINK_XFRM) and interface address add/del (`rtnl`, RTNETLINK `RTM_*ADDR`). |
+| [`nlmsg/`](netlink) | Kernel configuration over netlink: IPsec SA/policy management (`xfrm`, NETLINK_XFRM), interface address add/del and route install/remove including the per-route MTU (`rtnl`, RTNETLINK `RTM_*ADDR` / `RTM_*ROUTE`). |
 | [`bindings/`](bindings) | SWIG bindings (Lua) over C++ facades of the C libraries. |
 
 ## Specifications

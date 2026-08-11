@@ -216,10 +216,30 @@ std::string if_addr4(const std::string& name)
     return out;
 }
 
-/* Run one RTNETLINK address op on a throwaway socket, turning a non-OK
- * return into a net::Error. Interface-address ops are rare and stateless,
- * so a per-call socket keeps this a pair of free functions beside
+/* Open a throwaway RTNETLINK socket. Address and route ops are rare and
+ * stateless, so a per-call socket keeps them free functions beside
  * if_index/if_addr4, with no handle for the script to own. */
+static void rtnl_begin(rtnl_sock& s)
+{
+    if (rtnl_open(&s) != RTNL_OK)
+        throw Error(std::string("rtnl_open: ") + std::strerror(errno),
+                    RTNL_E_SYS);
+}
+
+/* Turn a non-OK rtnl return into a net::Error. The kernel's own errno is
+ * what separates "not permitted" from "no such process" (a delete of a
+ * route that is not installed), so a rejected request reports it. */
+static void rtnl_fail(const char* doing, int rc, int nl)
+{
+    std::string what = doing;
+    if (rc == RTNL_E_ACK)
+        what += std::string(": kernel rejected it (") + std::strerror(nl) + ")";
+    else if (rc == RTNL_E_SYS) what += std::string(": ") + std::strerror(errno);
+    else if (rc == RTNL_E_INVAL) what += ": invalid argument";
+    else what += ": error";
+    throw Error(what, rc);
+}
+
 static void rtnl_addr_op(const char* doing, const std::string& name,
                          const std::string& addr, uint8_t prefixlen, bool add)
 {
@@ -227,9 +247,7 @@ static void rtnl_addr_op(const char* doing, const std::string& name,
     if (idx == 0) throw Error(std::string(doing) + ": no such interface");
 
     rtnl_sock s;
-    if (rtnl_open(&s) != RTNL_OK)
-        throw Error(std::string("rtnl_open: ") + std::strerror(errno),
-                    RTNL_E_SYS);
+    rtnl_begin(s);
 
     rtnl_addr a;
     std::memset(&a, 0, sizeof a);
@@ -240,15 +258,7 @@ static void rtnl_addr_op(const char* doing, const std::string& name,
     int rc = add ? rtnl_addr_add(&s, &a) : rtnl_addr_del(&s, &a);
     int nl = s.nl_errno;
     rtnl_close(&s);
-    if (rc == RTNL_OK) return;
-
-    std::string what = doing;
-    if (rc == RTNL_E_ACK)
-        what += std::string(": kernel rejected it (") + std::strerror(nl) + ")";
-    else if (rc == RTNL_E_SYS) what += std::string(": ") + std::strerror(errno);
-    else if (rc == RTNL_E_INVAL) what += ": invalid argument";
-    else what += ": error";
-    throw Error(what, rc);
+    if (rc != RTNL_OK) rtnl_fail(doing, rc, nl);
 }
 
 void addr_add(const std::string& name, const std::string& addr,
@@ -261,6 +271,44 @@ void addr_del(const std::string& name, const std::string& addr,
               uint8_t prefixlen)
 {
     rtnl_addr_op("addr_del", name, addr, prefixlen, false);
+}
+
+/* The dev is optional here, unlike an address: a route through a gateway
+ * needs no output interface, since the gateway's own route names one. */
+static void rtnl_route_op(const char* doing, const Route& r, bool add)
+{
+    uint32_t idx = 0;
+    if (!r.dev.empty()) {
+        idx = if_nametoindex(r.dev.c_str());
+        if (idx == 0) throw Error(std::string(doing) + ": no such interface");
+    }
+
+    rtnl_sock s;
+    rtnl_begin(s);
+
+    rtnl_route rt;
+    std::memset(&rt, 0, sizeof rt);
+    rt.dst      = r.dst.empty() ? nullptr : r.dst.c_str();
+    rt.dstlen   = r.prefixlen;
+    rt.gateway  = r.gateway.empty() ? nullptr : r.gateway.c_str();
+    rt.ifindex  = idx;
+    rt.mtu      = r.mtu;
+    rt.priority = r.metric;
+
+    int rc = add ? rtnl_route_add(&s, &rt) : rtnl_route_del(&s, &rt);
+    int nl = s.nl_errno;
+    rtnl_close(&s);
+    if (rc != RTNL_OK) rtnl_fail(doing, rc, nl);
+}
+
+void route_add(const Route& r)
+{
+    rtnl_route_op("route_add", r, true);
+}
+
+void route_del(const Route& r)
+{
+    rtnl_route_op("route_del", r, false);
 }
 
 /* ---- UdpSocket ---- */

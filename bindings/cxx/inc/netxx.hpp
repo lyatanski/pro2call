@@ -156,6 +156,39 @@ void addr_add(const std::string& name, const std::string& addr,
 void addr_del(const std::string& name, const std::string& addr,
               uint8_t prefixlen);
 
+/* A route, as `ip route replace <dst>/<prefixlen> [via <gateway>] [dev
+ * <dev>] [mtu <mtu>] [metric <metric>]` installs it. An empty dst with
+ * prefixlen 0 is the default route (and then the family comes from the
+ * gateway); everything the route does not say — table, protocol, type,
+ * scope — takes the value `ip route` picks, so a route with a gateway is
+ * scope universe and one with only a dev is scope link.
+ *
+ * mtu is the per-route MTU. It is what a sender needs when something
+ * downstream of it grows the packet and cannot fragment — a TC/eBPF hook
+ * adding GTP-U encapsulation, say: a datagram that fits the link before
+ * the hook and not after is dropped there, silently. Lowering the MTU on
+ * the route toward that destination makes the kernel fragment on the way
+ * out instead, while the interface MTU stays what the encapsulated
+ * packets need. */
+struct Route {
+    std::string dst;           /* destination prefix; "" = default route */
+    uint8_t     prefixlen = 0; /* its length in bits                     */
+    std::string gateway;       /* next hop; "" = on-link, needs dev      */
+    std::string dev;           /* output interface name; "" = unset      */
+    uint32_t    mtu    = 0;    /* per-route MTU; 0 = leave it alone      */
+    uint32_t    metric = 0;    /* route priority; 0 = kernel default     */
+};
+
+/* Install (replacing any route for the same destination, so repeatable)
+ * or remove a route over RTNETLINK (netlink/rtnl) — `ip route replace` /
+ * `ip route del` without the external tool. A delete keys on what the
+ * Route names: the destination, narrowed by dev/gateway/metric when
+ * several routes share it. Both need CAP_NET_ADMIN and throw net::Error
+ * on failure, including an unknown interface name and a delete of a route
+ * that is not there. */
+void route_add(const Route& r);
+void route_del(const Route& r);
+
 /* ---- UDP socket ---- */
 
 /* A datagram from UdpSocket::recv: data/host/port on success, or
