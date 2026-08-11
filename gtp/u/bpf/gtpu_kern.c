@@ -248,6 +248,20 @@ int gtpu_decap(struct __sk_buff* skb)
             __u8 next = 0;
             if (bpf_skb_load_bytes(skb, gtpu_off + 11, &next, 1))
                 return TC_ACT_OK;
+            /* Unrolled deliberately, not for speed. Left as a loop, the
+             * verifier widens `hop` to an unbounded scalar on the last
+             * iteration and keeps the back edge, so it explores the
+             * speculative side of the bound check. On that path the
+             * load_bytes below writes a stack slot LLVM overlays with the
+             * __u32 map key of config_get()/stats_slot(), which an
+             * unprivileged verifier must sanitise for Spectre v4 — and it
+             * then wants a speculation barrier *after* a call instruction,
+             * which it cannot place, so it aborts the whole load with
+             * "verifier bug: speculation barrier after jump instruction"
+             * and EFAULT. Unrolling removes the bound check, and with it
+             * the speculative path. GTPU_EXT_MAX_HOPS is 5; the body is a
+             * handful of instructions. */
+#pragma unroll
             for (int hop = 0; hop < GTPU_EXT_MAX_HOPS && next; hop++) {
                 __u8 extlen = 0;
                 if (bpf_skb_load_bytes(skb, payload_off, &extlen, 1))
