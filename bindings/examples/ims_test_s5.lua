@@ -35,6 +35,17 @@
 --   MT --180 Ringing--> ... --> MO,  then after CALL_ANSWER_MS a 200 OK with
 --   the answer SDP; MO ACKs, media runs for CALL_HOLD_MS, MO sends BYE.
 --
+-- The callee is dialled by NUMBER: the Request-URI and To of that INVITE are
+-- the tel URI of its MSISDN (CALL_URI=tel, the default) — what a handset does,
+-- and one more link of the chain under test rather than assumed, because the
+-- number only routes if the HSS returned it as a public identity of the
+-- callee's subscription, so the terminating side has to resolve
+-- MSISDN -> IMPU -> registered contact. The numbers are derived from the IMSI
+-- (see "the subscriber's number" below) and bindings/examples/cx_hss.lua
+-- derives the same ones; CALL_URI=sip dials the registered sip IMPU instead,
+-- which is what to fall back to against an HSS that has no MSISDNs for the
+-- range.
+--
 -- The dialog layer is the sip module's own: a `sip.Dialog` (RFC 3261 §12) per
 -- call with `sip.Transaction(INVITE_CLIENT)` on the MO side and
 -- `INVITE_SERVER` on the MT side, fed the traffic and read back for state —
@@ -107,6 +118,25 @@ local function mnc3(n) return (#n == 2) and ("0" .. n) or n end
 local ims_realm = os.getenv("IMS_REALM")
     or ("ims.mnc%s.mcc%s.3gppnetwork.org"):format(mnc3(mnc), mcc)
 
+-- ---- the subscriber's number (MSISDN) ---------------------------------
+--
+-- These subscribers are generated from an IMSI range, so their number is
+-- derived rather than provisioned: an E.164 country code (IMS_MSISDN_CC)
+-- followed by the last IMS_MSISDN_DIGITS digits of the IMSI.
+-- bindings/examples/cx_hss.lua applies the SAME rule to the SAME two
+-- variables and returns the number as a public identity in the profile it
+-- hands the S-CSCF, which is what makes a call dialled by number reach the
+-- callee — see CALL.uri. Against a real HSS, set these to match the MSISDNs
+-- it provisions for the IMSI range, or CALL_URI=sip to dial the sip IMPU and
+-- leave numbers out of it altogether.
+local MSISDN_CC     = (os.getenv("IMS_MSISDN_CC") or "+99"):gsub("^%+", "")
+local MSISDN_DIGITS = tonumber(os.getenv("IMS_MSISDN_DIGITS") or "10") or 10
+
+local function msisdn_of(imsi)
+    local tail = (MSISDN_DIGITS > 0) and imsi:sub(-MSISDN_DIGITS) or imsi
+    return MSISDN_CC .. tail
+end
+
 -- GTP-C retransmission (TS 29.274 §7.6): 1s T3-RESPONSE, up to 3 sends. The
 -- 1s default is more aggressive than the spec's 3s, which shows at scale — a
 -- 1000-wide Create Session burst queues behind a single-threaded PGW/SMF, so
@@ -139,6 +169,17 @@ local DEREG = (os.getenv("IMS_DEREG") or "1") ~= "0"
 local CALL = {
     on    = (os.getenv("IMS_CALL") or "1") ~= "0",  -- run the phase at all
     pairs = tonumber(os.getenv("CALL_PAIRS") or ""), -- nil = every eligible pair
+    -- How the callee is addressed — the Request-URI and the To of the INVITE.
+    -- A handset dials a number, so "tel" (tel:+<msisdn>, RFC 3966) is the
+    -- default and the thing worth exercising: it only works if the HSS
+    -- returned that number as a public identity, so the whole
+    -- MSISDN -> IMPU -> registered contact chain is under test rather than
+    -- assumed. The alternatives are for when it is not the chain being
+    -- measured: "phone" is the sip:+<msisdn>@<realm>;user=phone form
+    -- (TS 23.003 §13.4) for a core that will not route a tel: Request-URI,
+    -- and "sip" dials the sip IMPU the UE registered, which needs no number
+    -- anywhere.
+    uri = (os.getenv("CALL_URI") or "tel"):lower(),
     -- Offered call arrival rate: the independent variable of the experiment —
     -- a knee cannot be found without being able to set the offered rate. It is
     -- NOT a remedy for failures; 0 (the default) is a single burst, consistent
@@ -156,6 +197,13 @@ local CALL = {
     -- that does not match our negotiated 5-tuple drops the uplink outright.
     bearer    = os.getenv("MEDIA_BEARER") or "auto",
 }
+-- Caught at startup rather than at the first INVITE: an unrecognised value
+-- would otherwise silently fall through to one of the three forms and the run
+-- would report the wrong thing as measured.
+if CALL.uri ~= "tel" and CALL.uri ~= "phone" and CALL.uri ~= "sip" then
+    io.stderr:write(("CALL_URI=%q is not one of tel|phone|sip\n"):format(CALL.uri))
+    os.exit(2)
+end
 local MEDIA = {
     pt       = tonumber(os.getenv("MEDIA_PT") or "0"),        -- 0 = G.711 PCMU
     rate     = tonumber(os.getenv("MEDIA_RATE") or "8000"),   -- codec clock
@@ -357,15 +405,31 @@ end
 -- ---- per-subscriber identity ------------------------------------------
 
 -- IMSI i = base + (i-1) (< 2^53, so exact as a double), 15 digits; IMPU/IMPI
--- follow from it. Keys stay shared, so the HSS must provision this range.
+-- and the number follow from it. Keys stay shared, so the HSS must provision
+-- this range.
+--
+-- `dial` is how OTHER subscribers address this one (CALL.uri): the tel URI of
+-- its number, that number's sip;user=phone form, or its sip IMPU. It is a
+-- separate field from impu on purpose — the UE keeps identifying *itself* by
+-- the IMPU it registered (From, P-Preferred-Identity, the RTCP CNAME), which
+-- is the identity the P-CSCF matches its registration on, while the number is
+-- only ever a destination.
 local function make_sub(i)
     local idx  = i - 1
     local imsi = ("%015.0f"):format(tonumber(base_imsi) + idx)
+    local impu = ("sip:%s@%s"):format(imsi, ims_realm)
+    local msisdn = msisdn_of(imsi)
+    local tel   = ("tel:+%s"):format(msisdn)
+    local phone = ("sip:+%s@%s;user=phone"):format(msisdn, ims_realm)
     return {
         i = i, idx = idx,
         imsi = imsi,
-        impu = ("sip:%s@%s"):format(imsi, ims_realm),
+        impu = impu,
         impi = ("%s@%s"):format(imsi, ims_realm),
+        msisdn = msisdn,
+        dial = (CALL.uri == "sip") and impu
+               or (CALL.uri == "phone") and phone
+               or tel,
         up_teid  = S5_UP_TEID_BASE + idx * 0x10,       -- default bearer S5/S8-U TEID
         ded_teid = S5_UP_TEID_BASE + idx * 0x10 + 1,   -- dedicated (media) bearer TEID
         port_uc  = PORT_UC_BASE + idx * 4,             -- UE protected client port
@@ -574,7 +638,10 @@ end
 -- timers a refresh cycle, and neither buys a measurement (see the header).
 local function build_invite(c)
     local mo = c.mo
-    local b  = BUILDER:request(sip.INVITE, c.mt.impu)
+    -- The dialled address (CALL.uri): by default the callee's tel URI, so the
+    -- Request-URI carries a number and the core has to resolve it through the
+    -- HSS profile to the callee's registered contact.
+    local b  = BUILDER:request(sip.INVITE, c.callee)
     -- TS 24.229 §5.1.2A.1: the preloaded Route of an initial request is the
     -- P-CSCF's own URI — at its protected server port, since IPsec is in use —
     -- followed by the Service-Route values, in order.
@@ -604,7 +671,11 @@ local function build_invite(c)
         -- same PAA:port_uc the protected REGISTER left from, over the same SA.
         :header(sip.H_CONTACT, ("<sip:%s:%d>"):format(mo.ue_addr, mo.port_uc))
         -- The P-CSCF checks this against the registration and re-asserts it as
-        -- P-Asserted-Identity (proxy.cfg route[MORIG]).
+        -- P-Asserted-Identity (proxy.cfg route[MORIG]) — so it stays the sip
+        -- IMPU this UE registered even when it dials a number: the caller's
+        -- own tel URI is an alias of the same subscription, and asserting an
+        -- alias is only accepted if the P-CSCF learnt it from P-Associated-URI,
+        -- which turns a working call into a 403 on some stacks for nothing.
         :header(sip.H_P_PREFERRED_IDENTITY, ("<%s>"):format(mo.impu))
         :header(sip.H_ALLOW, "INVITE, ACK, CANCEL, BYE")
     -- No Security-Verify: RFC 3329 §2.2 wants it on the request that follows
@@ -660,7 +731,7 @@ end
 -- (and needs no route set — it goes where the INVITE went).
 local function build_in_dialog(c, method, mname, cseq, branch, route)
     local mo = c.mo
-    local b  = BUILDER:request(method, c.target or c.mt.impu)
+    local b  = BUILDER:request(method, c.target or c.callee)
     for _, r in ipairs(route or {}) do b:header(sip.H_ROUTE, r) end
     b:header(sip.H_VIA, ("SIP/2.0/UDP %s:%d;branch=%s"):format(mo.ue_addr, mo.port_uc, branch))
         :header_u32(sip.H_MAX_FORWARDS, 70)
@@ -844,7 +915,15 @@ local function run()
         :format(NSUBS, sgw_ip, pgw_ip))
     if sgw_auto then line("SGW address", ("%s (auto from %s)"):format(sgw_ip, gtpu_ifname)) end
     if pgw_ip ~= pgw_host then line("PGW address", ("%s -> %s"):format(pgw_host, pgw_ip)) end
-    line("IMSI range", ("%s .. %s (shared keys)"):format(base_imsi, ("%015.0f"):format(tonumber(base_imsi) + NSUBS - 1)))
+    -- Both ends formatted the way make_sub does it, so the numbers below are
+    -- the numbers the subscribers actually carry (IMS_IMSI may be short).
+    local first_imsi = ("%015.0f"):format(tonumber(base_imsi))
+    local last_imsi  = ("%015.0f"):format(tonumber(base_imsi) + NSUBS - 1)
+    line("IMSI range", ("%s .. %s (shared keys)"):format(base_imsi, last_imsi))
+    -- The numbers the call phase dials, and the rule that produced them, so a
+    -- mismatch with the HSS side is visible before the first INVITE.
+    line("MSISDN range", ("+%s .. +%s  (+%s + last %d IMSI digits)")
+        :format(msisdn_of(first_imsi), msisdn_of(last_imsi), MSISDN_CC, MSISDN_DIGITS))
 
     local loop = net.Loop()
     local ok, ep = pcall(gtp.Endpoint, loop, sgw_ip)     -- binds sgw_ip:2123 (GTP-C)
@@ -1360,8 +1439,13 @@ local function run()
             route_mo = {}, route_mt = {},
             t = {}, stage = "invite",
         }
+        -- From identifies the caller (its registered IMPU); To is the address
+        -- dialled, which by default is the callee's number and not an identity
+        -- this process ever registered. The far end matches the call on the
+        -- Call-ID, so it does not have to recognise the form.
+        c.callee   = mt.dial
         c.from_hdr = ("<%s>;tag=%s"):format(mo.impu, c.from_tag)
-        c.to_hdr   = ("<%s>"):format(mt.impu)
+        c.to_hdr   = ("<%s>"):format(c.callee)
         return c
     end
 
@@ -1462,7 +1546,7 @@ local function run()
         cstats.answered = cstats.answered + 1
         cstats.last_answer = c.t.t6
         c.to_hdr  = m:header("To")
-        c.target  = contact_uri(m) or c.mt.impu
+        c.target  = contact_uri(m) or c.callee
         c.route_mo = route_set(m, true)
 
         if c.media and c.sess_mo then
@@ -1724,6 +1808,12 @@ local function run()
         banner(("Calls — %d of %d eligible pair(s) (%d structural), %d carrying RTP%s")
             :format(#list, cstats.eligible, cstats.pairs_total, nmedia,
                     CALL.cps > 0 and (" at %.1f call/s"):format(CALL.cps) or " in one burst"))
+        -- What is actually dialled, spelled out: a run that fails because the
+        -- HSS profile carries no such identity is otherwise indistinguishable
+        -- from a routing fault, and this is the line that tells them apart.
+        line("dialled address", ("%s   (CALL_URI=%s%s)"):format(
+            list[1].mt.dial, CALL.uri,
+            CALL.uri == "sip" and "" or ", needs the number in the HSS profile"))
 
         cpending = #list
         local spacing = CALL.cps > 0 and math.floor(1000 / CALL.cps) or 0
@@ -1772,7 +1862,8 @@ local function run()
                 c.t.t0 = now()
                 cstats.first_invite = cstats.first_invite or c.t.t0
                 cstats.attempted = cstats.attempted + 1
-                if send_call(p.mo, p.mo.sock, "mo", wire, ("INVITE (call %d -> %s)"):format(i, p.mt.imsi)) then
+                if send_call(p.mo, p.mo.sock, "mo", wire,
+                             ("INVITE (call %d -> %s)"):format(i, c.callee)) then
                     -- The message names what did arrive, so "the core never
                     -- answered" and "the core answered but the callee never
                     -- rang" are not reported as the same failure.
@@ -2274,11 +2365,15 @@ local function run()
             local mo, mt, item = w.mo, w.mt, w.item
             local alpha = item.alpha and ALPHA[item.alpha] or sms.ALPHA_AUTO
 
-            -- The recipient's "MSISDN". The subscribers here have no MSISDN of
-            -- their own — they are generated from an IMSI range — so the IMSI
-            -- IS the number, and ipsmgw.lua's default rule turns those digits
-            -- straight back into sip:<digits>@<realm>, which is exactly the
-            -- IMPU this run registered. Nothing has to be provisioned.
+            -- The recipient's number in TP-DA. Deliberately the IMSI digits
+            -- and NOT mt.msisdn: an SMS is resolved by the IP-SM-GW, not by
+            -- the HSS profile, and ipsmgw.lua's default rule turns the digits
+            -- it is given straight back into sip:<digits>@<realm> — which is
+            -- the IMPU this run registered, so nothing has to be provisioned
+            -- or configured. The MSISDN form works too, but only once the
+            -- gateway is told to produce the matching identity: run it with
+            -- IPSMGW_TEL=1 (sip:+<digits>@<realm>;user=phone, the alias
+            -- cx_hss.lua puts in the profile) and set `to` to mt.msisdn.
             local to = mt.imsi
 
             local okp, parts = pcall(function()
@@ -3091,6 +3186,24 @@ if cs and cs.pairs_total > 0 then
     table.sort(by_st, function(a, b) return a.n > b.n end)
     for _, e in ipairs(by_st) do
         line(("failed %d %s"):format(e.st, sip.status_phrase(e.st)), tostring(e.n))
+    end
+
+    -- A number the HSS profile does not carry is its own failure, and an easy
+    -- one to misread: the I-CSCF answers 404 (no such public identity) or the
+    -- S-CSCF 480 (the identity exists but nothing is registered against it)
+    -- while registration, IPsec and the datapath all look healthy. Name it,
+    -- with both fixes, whenever a number was dialled and those came back.
+    if CALL.uri ~= "sip"
+       and (cs.by_status[404] or cs.by_status[604] or cs.by_status[480]) then
+        line("DIALLED NUMBER UNRESOLVED", ("the callee was addressed as %s")
+            :format(subs[2] and subs[2].dial or ("a " .. CALL.uri .. " URI")))
+        line("", "the HSS must return that number as a public identity of the")
+        line("", "callee's subscription: cx_hss.lua does (HSS_MSISDN, and the")
+        line("", "same IMS_MSISDN_CC / IMS_MSISDN_DIGITS as here), a real HSS")
+        line("", "needs the MSISDN provisioned for the IMSI range. CALL_URI=phone")
+        line("", "dials the sip;user=phone form instead if the core will not route")
+        line("", "a tel: Request-URI, CALL_URI=sip dials the sip IMPU and needs no")
+        line("", "number at all.")
     end
 
     -- ---- media quality ----

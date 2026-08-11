@@ -673,8 +673,14 @@ All in Lua; run each with `LUA_CPATH=<build>/bindings/lua/?.so lua …`.
   UAR/UAA, MAR/MAA (a real Milenage vector minted with `ipsec.aka_milenage`
   from the shared USIM secret, for any IMSI, so the range registers without
   provisioning), SAR/SAA (returns the IMS subscription profile) and
-  LIR/LIA. Point the CSCFs' Diameter peer at it to run the IMS core with no
-  real HSS behind it (load testing the CSCF chain, not the HSS).
+  LIR/LIA. The profile carries the subscriber's number as well as the IMPU
+  it registered — `tel:+<msisdn>` and the `sip;user=phone` form, derived
+  from the IMSI by the same rule
+  [`examples/ims_test_s5.lua`](examples/ims_test_s5.lua) dials with
+  (`IMS_MSISDN_CC`, `IMS_MSISDN_DIGITS`), so a call placed to a number
+  resolves to the registered contact with nothing provisioned. Point the
+  CSCFs' Diameter peer at it to run the IMS core with no real HSS behind it
+  (load testing the CSCF chain, not the HSS).
 - [`examples/pgw_stub.lua`](examples/pgw_stub.lua) — a PGW stub: the
   S5/S8 anchor a test SGW attaches to, standing in for a real PGW-C+U.
   Three parts on one `net.Loop`: **GTP-C** in `gtp.Endpoint`'s server role

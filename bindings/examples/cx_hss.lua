@@ -10,6 +10,7 @@
 --   LUA_CPATH=<build>/bindings/lua/?.so \
 --     [HSS_PORT=3868] [HSS_PROTO=tcp|sctp] [HSS_REALM=mnc01.mcc001.3gppnetwork.org] \
 --     [HSS_SCSCF=sip:scscf.ims.<realm>] [IMS_K=..] [IMS_OPC=..] [HSS_VERBOSE=1] \
+--     [IMS_MSISDN_CC=+99] [IMS_MSISDN_DIGITS=10] [HSS_MSISDN=both|tel|phone|off] \
 --     lua cx_hss.lua
 --
 -- What it speaks:
@@ -26,6 +27,12 @@
 -- whole IMSI range registers end-to-end without provisioning. That removes
 -- both the mongo/HSS bottleneck and the "HSS User Unknown" provisioning
 -- ceiling, leaving the CSCF chain as the thing under load.
+--
+-- The subscriber's number is derived the same way, from the IMSI (see "the
+-- subscriber's number" below), and SAA returns it as a public identity of
+-- the subscription — tel:+<msisdn> plus its sip;user=phone equivalent — so
+-- the S-CSCF registers those alongside sip:<imsi>@realm and a call dialled
+-- by number reaches the UE. Again: nothing provisioned.
 --
 -- One net.Loop drives a listening TCP (or SCTP) socket: each accepted
 -- connection is a peer whose byte stream is de-framed by the Diameter
@@ -124,6 +131,44 @@ end
 local function imsi_of(impi)
     return impi and impi:match("^(%d+)") or nil
 end
+
+-- The home domain an IMPU lives in, so an alias minted for it lands in the
+-- same domain the S-CSCF just registered rather than in this HSS's idea of
+-- the home realm (the two differ as soon as IMS_REALM is overridden).
+local function domain_of(impu)
+    return impu and impu:match("^sips?:[^@]*@([^;>%s]+)") or nil
+end
+
+-- ---- the subscriber's number ------------------------------------------
+--
+-- A real HSS holds the MSISDN with the subscription. These subscribers are
+-- generated from an IMSI range instead, so the number is *derived*: an
+-- E.164 country code (IMS_MSISDN_CC) followed by the last
+-- IMS_MSISDN_DIGITS digits of the IMSI. The rule needs no range arithmetic
+-- and no lookup — it is keyed on the IMSI alone — so any IMSI gets a number
+-- with nothing provisioned, the same property the Milenage side has, and
+-- bindings/examples/ims_test_s5.lua computes the identical number from the
+-- same two variables. That is what lets it dial its peers by number.
+local MSISDN_CC     = (os.getenv("IMS_MSISDN_CC") or "+99"):gsub("^%+", "")
+local MSISDN_DIGITS = tonumber(os.getenv("IMS_MSISDN_DIGITS") or "10") or 10
+
+local function msisdn_of(imsi)
+    if not imsi or imsi == "" then return nil end
+    local tail = (MSISDN_DIGITS > 0) and imsi:sub(-MSISDN_DIGITS) or imsi
+    return MSISDN_CC .. tail
+end
+
+-- Which MSISDN identities go in the profile. Each one the S-CSCF stores is
+-- another usrloc record and another subscription per registration, so this
+-- is worth being able to turn down when the run is measuring registration
+-- throughput rather than placing calls:
+--
+--   both (default)  the tel URI and its sip;user=phone equivalent
+--   tel / phone     one of them only
+--   off             no MSISDN identity at all (the pre-MSISDN profile)
+local MSISDN_IMPU = (os.getenv("HSS_MSISDN") or "both"):lower()
+local WANT_TEL   = MSISDN_IMPU == "both" or MSISDN_IMPU == "tel"
+local WANT_PHONE = MSISDN_IMPU == "both" or MSISDN_IMPU == "phone"
 
 -- ---- per-subscriber state ---------------------------------------------
 
@@ -347,19 +392,55 @@ end
 local IPSMGW      = os.getenv("HSS_IPSMGW")
 local IPSMGW_TERM = (os.getenv("HSS_IPSMGW_TERM") or "1") ~= "0"
 
--- A minimal but complete IMS subscription (TS 29.228 Annex): one unbarred
--- public identity, plus the SMS iFC when an IP-SM-GW is configured.
+-- The public identities of the subscription, in the order the S-CSCF stores
+-- them: the IMPU it is claiming (the one the UE registered), then the
+-- subscriber's number in both forms a terminating request can arrive as —
+-- the tel URI a handset dials (RFC 3966) and its sip;user=phone equivalent
+-- (TS 23.003 §13.4), which is what a core that rewrites tel: into sip:
+-- produces. Whichever form the CSCF chain hands to the location lookup, a
+-- record exists for it.
+--
+-- They all sit in ONE ServiceProfile, which is what makes them an implicit
+-- registration set (TS 23.228 §4.3.3.4): the S-CSCF registers them together
+-- against the same contact and returns them in P-Associated-URI, so an
+-- INVITE to the number reaches the UE that registered sip:<imsi>@realm —
+-- and it shares the iFC below, so a MESSAGE addressed to the number
+-- triggers the IP-SM-GW too. Sharing one profile is also the cheap way
+-- round: a second ServiceProfile would need its own iFC copy.
+local function identities(impi, impu)
+    local out, seen = {}, {}
+    local function add(u)
+        if u and u ~= "" and not seen[u] then seen[u] = true; out[#out + 1] = u end
+    end
+    add(impu)
+    local msisdn = msisdn_of(imsi_of(impi))
+    if msisdn then
+        if WANT_TEL then add("tel:+" .. msisdn) end
+        if WANT_PHONE then
+            add(("sip:+%s@%s;user=phone"):format(msisdn, domain_of(impu) or HOME_REALM))
+        end
+    end
+    return out
+end
+
+-- A minimal but complete IMS subscription (TS 29.228 Annex): the unbarred
+-- public identities above, plus the SMS iFC when an IP-SM-GW is configured.
 local function profile(impi, impu)
     local parts = {
         '<?xml version="1.0" encoding="UTF-8"?>',
         '<IMSSubscription>',
         '<PrivateID>', impi, '</PrivateID>',
         '<ServiceProfile>',
-        '<PublicIdentity>',
-        '<BarringIndication>0</BarringIndication>',
-        '<Identity>', impu, '</Identity>',
-        '</PublicIdentity>',
     }
+    for _, id in ipairs(identities(impi, impu)) do
+        parts[#parts + 1] = '<PublicIdentity>'
+        -- Element order is the TS 29.228 Annex E schema's own sequence
+        -- (BarringIndication before Identity); a parser that validates
+        -- against it rejects the other way round.
+        parts[#parts + 1] = '<BarringIndication>0</BarringIndication>'
+        parts[#parts + 1] = '<Identity>' .. id .. '</Identity>'
+        parts[#parts + 1] = '</PublicIdentity>'
+    end
     if IPSMGW then
         parts[#parts + 1] = ifc(IPSMGW, 0, 0)               -- originating
         if IPSMGW_TERM then
@@ -389,7 +470,12 @@ local function on_sar(m)
     else
         if s then s.registered = true end
         b:put_str(diam.AVP_CX_USER_DATA, profile(impi or "", impu))
-        log("   <- SAR %s (type %d, register)   -> SAA + profile", impu, sat)
+        -- Name the number the profile carried: a call dialled by MSISDN that
+        -- the S-CSCF cannot place is nearly always this line disagreeing with
+        -- what the caller dialled.
+        local msisdn = (WANT_TEL or WANT_PHONE) and msisdn_of(imsi) or nil
+        log("   <- SAR %s (type %d, register)   -> SAA + profile (%s)", impu, sat,
+            msisdn and ("+" .. msisdn) or "no MSISDN")
     end
     return b:done()
 end
@@ -522,6 +608,14 @@ end
 
 -- ---- run --------------------------------------------------------------
 
+-- Caught here rather than by silently returning the pre-MSISDN profile: a
+-- typo in HSS_MSISDN would otherwise look like the S-CSCF refusing to route
+-- a dialled number.
+if not (WANT_TEL or WANT_PHONE or MSISDN_IMPU == "off") then
+    io.stderr:write(("HSS_MSISDN=%q is not one of both|tel|phone|off\n"):format(MSISDN_IMPU))
+    os.exit(2)
+end
+
 local ok, lst = pcall(net.StreamListener, BIND, PORT, PROTO_ID)
 if not ok then
     io.stderr:write(("cannot listen on %s:%d/%s: %s\n"):format(BIND, PORT, PROTO, why(lst)))
@@ -534,6 +628,23 @@ log("   listen         %s:%d/%s", BIND, PORT, PROTO)
 log("   Origin-Host    %s", ORIGIN_HOST)
 log("   Origin-Realm   %s", ORIGIN_REALM)
 log("   S-CSCF         %s", SCSCF)
+do
+    -- Spell the rule out with a worked example, and check the result is a
+    -- number at all: an over-long country code or digit count produces an
+    -- E.164 violation (TS 23.003 §3.3 caps the MSISDN at 15 digits) that the
+    -- CSCFs would accept and then fail to match against anything.
+    local ex = msisdn_of("001010000000001")
+    if WANT_TEL or WANT_PHONE then
+        log("   MSISDN         +%s = +%s + last %d IMSI digits%s  [%s]",
+            ex, MSISDN_CC, MSISDN_DIGITS,
+            #ex > 15 and "  !! over 15 digits, not a valid E.164 number" or "",
+            MSISDN_IMPU)
+        if WANT_TEL then log("   profile IMPU   tel:+%s", ex) end
+        if WANT_PHONE then log("   profile IMPU   sip:+%s@%s;user=phone", ex, HOME_REALM) end
+    else
+        log("   MSISDN         none in the profile (HSS_MSISDN=off)")
+    end
+end
 log("   SMS iFC        %s", IPSMGW
     and ("%s (orig%s)"):format(IPSMGW, IPSMGW_TERM and " + term" or " only")
     or "none (set HSS_IPSMGW to put an IP-SM-GW in the MESSAGE path)")
