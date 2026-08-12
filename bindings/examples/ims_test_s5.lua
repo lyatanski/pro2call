@@ -23,6 +23,21 @@
 --      (ealg=null — integrity-only ESP, see security_client below).
 --   4. REGISTER (protected, ESP) to the P-CSCF's protected server port with
 --      the AKAv1-MD5 digest and a Security-Verify; then 200 OK.
+--   5. SUBSCRIBE to the reg event package (RFC 3680) of its own public
+--      identity, and the NOTIFY back carrying the registration state the
+--      network holds for it.
+--
+-- That last step is the half of TS 24.229 §5.1.1.3 no REGISTER exchange
+-- covers: the subscription is what carries de-registration and
+-- network-initiated re-authentication back to the handset, so a core that
+-- registers UEs and never notifies them looks perfectly healthy right up to
+-- the day it has something to tell them. It earns its place here twice over.
+-- The NOTIFY is the first *terminating* request a UE receives, so the
+-- P-CSCF's inbound SA is exercised — and the shared-protected-port fault
+-- described below found — before any call depends on it; and the reginfo
+-- body lists the implicit registration set, which says whether the number
+-- the call phase is about to dial is an identity of the callee at all.
+-- IMS_REG_EVENT=0 skips the phase.
 --
 -- Once registration settles the subscribers call each other: pairs 1<->2,
 -- 3<->4, ... where the odd index originates (MO) and the even one terminates
@@ -150,6 +165,30 @@ local SIP_T_MS   = tonumber(os.getenv("SIP_T_MS") or "5000")  -- SIP response de
 local AUTH_CAP   = 2           -- give up after this many 401 challenges
 local REG_EXPIRES = tonumber(os.getenv("IMS_EXPIRES") or "600000") -- ~7 days
 local DEREG = (os.getenv("IMS_DEREG") or "1") ~= "0"
+
+-- ---- registration-state subscription (RFC 3680 / TS 24.229 §5.1.1.3) ---
+--
+-- The reg event package: after the 200 OK the UE SUBSCRIBEs to the
+-- registration state of its own public identity and the S-CSCF NOTIFYs it
+-- with a reginfo document. See the header for why this is worth a phase of
+-- its own rather than a line in the registration one.
+--
+-- The knobs are named REG_EVENT_*, not SUBS_*: IMS_SUBS is the subscriber
+-- COUNT, and two knobs a letter apart meaning "how many UEs" and "the reg
+-- event" would be read as each other sooner or later.
+local REGEV = {
+    on = (os.getenv("IMS_REG_EVENT") or "1") ~= "0",
+    -- RFC 3680 §5 leaves the default to the notifier; one hour is what a UE
+    -- asks for and is long enough that nothing expires inside a run. The
+    -- S-CSCF may grant less (its own subscription_max_expires), which is
+    -- reported rather than argued with.
+    expires = tonumber(os.getenv("REG_EVENT_EXPIRES") or "3600"),
+    t_ms    = tonumber(os.getenv("REG_EVENT_T_MS") or "10000"),  -- per-subscription deadline
+    -- Offered subscribe rate, like CALL_CPS: the independent variable of an
+    -- experiment, NOT a remedy for failures. 0 (the default) is a single
+    -- burst, consistent with the deliberately unramped registration side.
+    rps     = tonumber(os.getenv("REG_EVENT_RPS") or "0"),
+}
 
 -- ---- call phase -------------------------------------------------------
 --
@@ -458,6 +497,11 @@ local function make_sub(i)
         -- arrive on `sock` too: the UE advertises one protected port in both
         -- roles, so there is no second socket to bind.
         svc_route = nil,
+        -- Reg event (RFC 3680): the subscription this UE opens on its own
+        -- IMPU once registered. Kept on the subscriber, not only in the
+        -- phase's own list, because the subscription outlives the phase — the
+        -- NOTIFY that reports its de-registration arrives at teardown.
+        regev = nil, regev_cseq = 0,
         def_bearer = nil, ded_bearer = nil,  -- default / dedicated (Create Bearer)
         media_tft = nil,                     -- {bearer=, tuples={...}} once programmed
         call = nil,                          -- the call this subscriber is in
@@ -588,6 +632,101 @@ local function parse_challenge(msg)
         p_port_c = ss and tonumber(sip.auth_param(ss, "port-c")),
         p_port_s = ss and tonumber(sip.auth_param(ss, "port-s")),
     }
+end
+
+-- ---- the reg event package (RFC 3680, TS 24.229 §5.1.1.3) -------------
+--
+-- The phase's three helpers hang off REGEV rather than standing as three
+-- more file-scope locals, for the reason the CALL/MEDIA knobs are grouped:
+-- Lua 5.1 caps a function at 60 upvalues and run() sits at that cap, so
+-- three loose locals would be three of them. They are attached here rather
+-- than beside the knobs because the first needs BUILDER, declared above.
+
+-- The UE's SUBSCRIBE to the registration state of its own public identity:
+-- Request-URI, To and From are all its IMPU, and the Event/Accept pair is
+-- what makes it a reg subscription rather than any other package —
+-- kamailio's can_subscribe_to_reg() reads the Event header and answers
+-- anything else with 489 Bad Event.
+--
+-- It is an out-of-dialog ORIGINATING request, so it carries what an INVITE
+-- carries: the P-CSCF's own URI marked `orig` ahead of the Service-Route
+-- (see build_invite for why the marking has to be on that first entry, and
+-- what happens when it is not), and the Contact this UE registered — the
+-- P-CSCF matches usrloc on it in pcscf_is_registered() before it lets an
+-- originating request through at all.
+function REGEV.build(sub, u, expires)
+    local pport = (sub.ch and sub.ch.ss_raw and sub.ch.p_port_s) or PCSCF_SIP_PORT
+    local b = BUILDER:request(sip.SUBSCRIBE, sub.impu)
+    b:header(sip.H_ROUTE, ("<sip:orig@%s:%d;lr>"):format(sub.pcscf, pport))
+    for _, r in ipairs(sub.svc_route or {}) do b:header(sip.H_ROUTE, r) end
+    b:header(sip.H_VIA, ("SIP/2.0/UDP %s:%d;branch=%s"):format(sub.ue_addr, sub.port_uc, u.branch))
+        :header_u32(sip.H_MAX_FORWARDS, 70)
+        :header(sip.H_FROM, ("<%s>;tag=%s"):format(sub.impu, u.from_tag))
+        :header(sip.H_TO, ("<%s>"):format(sub.impu))
+        :header(sip.H_CALL_ID, u.call_id)
+        :header(sip.H_CSEQ, ("%d SUBSCRIBE"):format(u.cseq))
+        :header(sip.H_CONTACT, ("<sip:%s:%d>"):format(sub.ue_addr, sub.port_uc))
+        :header(sip.H_P_PREFERRED_IDENTITY, ("<%s>"):format(sub.impu))
+        :header(sip.H_EVENT, "reg")
+        :header(sip.H_ACCEPT, "application/reginfo+xml")
+        :header_u32(sip.H_EXPIRES, expires)
+    return b:done()
+end
+
+-- One attribute out of an XML start tag. The leading %s is not decoration:
+-- without it "state" would also match the tail of any attribute name ending
+-- in it, and a pattern that quietly reads the wrong attribute is worse than
+-- one that reads none.
+local function xattr(s, k) return s:match('%s' .. k .. '%s*=%s*"([^"]*)"') end
+
+-- The reg event's body (RFC 3680 §5.1, application/reginfo+xml): one
+-- <registration> per public identity of the implicit registration set, each
+-- listing the contacts bound to it. Read with patterns rather than an XML
+-- parser, and deliberately so — the document is machine-generated, flat and
+-- attribute-only, and the two things asserted from it (is this identity
+-- active, is our own contact among its bindings) are two attributes and one
+-- element. A parser would be a dependency for no more information.
+--
+-- Chunked at each opening tag rather than matched as
+-- <registration>...</registration>, so an identity carrying no contacts —
+-- which a notifier is free to write self-closed — is still counted rather
+-- than silently skipped, and a missing identity is exactly the finding this
+-- phase exists to make.
+function REGEV.parse(body)
+    local out, pos = {}, 1
+    while true do
+        local s = body:find("<registration", pos, true)
+        if not s then break end
+        local e = body:find("<registration", s + 13, true) or (#body + 1)
+        local chunk = body:sub(s, e - 1)
+        local head  = chunk:match("^<registration([^>]*)") or ""
+        local r = { aor = xattr(head, "aor") or "", state = xattr(head, "state") or "",
+                    contacts = {} }
+        for c in chunk:gmatch("<contact(.-)</contact>") do
+            r.contacts[#r.contacts + 1] = {
+                state = xattr(c, "state") or "", event = xattr(c, "event") or "",
+                uri   = c:match("<uri>%s*(.-)%s*</uri>") or "",
+            }
+        end
+        out[#out + 1] = r
+        pos = e
+    end
+    return out
+end
+
+-- Two URIs naming the same identity: compared case-insensitively and without
+-- their parameters, so the tel URI this run dials and the one the HSS
+-- provisioned are the same identity even when one carries a phone-context
+-- (RFC 3966 §3) and the other does not.
+function REGEV.same_id(a, b)
+    local function norm(u)
+        local s = (u or ""):lower()
+        s = s:gsub("%s+", "")
+        s = s:gsub("[;>].*$", "")
+        s = s:gsub("^<", "")
+        return s
+    end
+    return norm(a) == norm(b)
 end
 
 -- ---- call signalling (RFC 3261 §12/§13, TS 24.229 §5.1) ---------------
@@ -988,6 +1127,8 @@ local function run()
         pkt_last = nil, sess_last = nil, reg_last = nil,   -- last-event timestamps
     }
     local function mark_pkt() stats.pkt_last = now() end
+    -- Bump a count in a keyed tally (failure stage, SIP status, RP cause).
+    local function sbump(t, k) t[k] = (t[k] or 0) + 1 end
 
     -- ---- call phase state ----
     local calls, by_callid = {}, {}
@@ -1033,6 +1174,27 @@ local function run()
                 report = {}, total = {} },
     }
 
+    -- ---- reg-event phase state ----
+    -- Subscriptions are keyed by the Call-ID of the SUBSCRIBE that opened
+    -- them, which is what both the 200 OK and every NOTIFY of that dialog
+    -- carry. The index is NOT cleared when the phase ends: the S-CSCF sends
+    -- one more NOTIFY when the registration goes away, and matching it is how
+    -- the run can say the UE was told about its own de-registration.
+    local regev_by_callid = {}
+    local upending, uguard = 0, nil
+    local ustats = {
+        eligible = 0, attempted = 0, accepted = 0, notified = 0, verified = 0,
+        terminated = 0,          -- NOTIFYs saying the registration is gone
+        orphans = 0,             -- NOTIFYs matching no subscription of ours
+        first = nil, last = nil,
+        by_status = {},          -- non-2xx finals for the SUBSCRIBE
+        stage = {},              -- where a subscription died, and why
+        states = {},             -- Subscription-State token -> count
+        identities = {},         -- identities per reg-info document
+        dialable = 0,            -- documents listing the address the call phase dials
+        kpi = { accept = {}, notify = {}, ack = {} },
+    }
+
     -- Per-subscriber SIP deadline over the shared loop.
     local function disarm(sub) if sub.timer then loop:cancel(sub.timer); sub.timer = nil end end
     local function arm(sub, ms, fn) disarm(sub); sub.timer = loop:after(ms, function() sub.timer = nil; fn() end) end
@@ -1069,6 +1231,7 @@ local function run()
     local begin_teardown, begin_deregister, del_done
     local dispatch_sip, begin_calls, after_calls, call_request, call_response
     local begin_sms, after_sms, sms_request, sms_response
+    local begin_regev, after_regev, regev_request, regev_response
 
     -- A subscriber reached a terminal state; when the last one does, wait a
     -- little for late Create Bearer Requests, then stop the loop.
@@ -1080,13 +1243,21 @@ local function run()
         if pending > 0 then return end
         if grace then return end
         -- All subscribers terminal: wait briefly for late Create Bearer Requests,
-        -- then place the calls; when they settle, release the IMS registrations
-        -- (de-REGISTER, so the P-CSCF reaps their ESP SAs) and tear the PDN
-        -- connections down (Delete Session).
+        -- then subscribe to the reg event and place the calls; when they settle,
+        -- release the IMS registrations (de-REGISTER, so the P-CSCF reaps their
+        -- ESP SAs) and tear the PDN connections down (Delete Session).
+        --
+        -- The subscription goes first because that is the order a UE does it in
+        -- (TS 24.229 §5.1.1.3, at the 200 OK) and because its NOTIFY is a
+        -- terminating request: if it does not arrive, the MT INVITE that follows
+        -- has the same problem and this phase has already named it.
         grace = loop:after(3000, function()
             grace = nil
-            if CALL.on then begin_calls() else after_calls() end
+            if REGEV.on then begin_regev() else after_regev() end
         end)
+    end
+    after_regev = function()
+        if CALL.on then begin_calls() else after_calls() end
     end
     after_calls = function()
         if SMS.on then begin_sms() else after_sms() end
@@ -1761,6 +1932,11 @@ local function run()
             -- Call-ID to match it against: the SMS layer sorts it out from
             -- the RPDU in the body.
             return sms_request(sub, m, which)
+        elseif m.method == sip.NOTIFY then
+            -- The reg event package: this UE's own registration state, inside
+            -- the dialog its SUBSCRIBE opened — so it IS matched by Call-ID,
+            -- just not against a call.
+            return regev_request(sub, m)
         end
         if VERBOSE then
             slog(sub, "call", ("ignoring in-dialog %s"):format(m.method_name))
@@ -1837,7 +2013,301 @@ local function run()
         local okc, cs = pcall(function() return m:cseq() end)
         if okc and cs.method == sip.REGISTER then return handle_sip(sub, m) end
         if okc and cs.method == sip.MESSAGE then return sms_response(sub, m) end
+        if okc and cs.method == sip.SUBSCRIBE then return regev_response(sub, m) end
         return call_response(sub, m)
+    end
+
+    -- ---- the reg-event phase (RFC 3680, TS 24.229 §5.1.1.3) --------------
+    --
+    -- One subscription per registered UE, to its own registration state, with
+    -- every hop timed:
+    --
+    --   t0  SUBSCRIBE   to its own IMPU, through the Service-Route
+    --   t1  200 OK      the S-CSCF accepted the subscription
+    --   t2  NOTIFY      the reg-info document: the state the network holds
+    --   t3  200 OK      our answer to it (RFC 6665 §4.4.1 — a notifier that
+    --                   gets none tears the subscription down again)
+    --
+    -- t0 and t2 are readings of ONE monotonic clock in this process, so t2-t0
+    -- is a true one-way figure, exactly as the call and SMS phases' transit
+    -- figures are.
+    --
+    -- The 200 OK and the NOTIFY race, and both orders happen: kamailio's
+    -- ims_registrar_scscf sends the first NOTIFY from inside
+    -- subscribe_to_reg(), so it can overtake the reply it was triggered by.
+    -- Neither is treated as the other's precondition — the record settles when
+    -- both are in, and the deadline names whichever is missing.
+
+    -- One unit of outstanding work per subscription, plus the scheduler's own
+    -- sentinel — see mdec() for why a spaced run needs it.
+    local function udec()
+        upending = upending - 1
+        if upending > 0 then return end
+        if uguard then loop:cancel(uguard); uguard = nil end
+        after_regev()
+    end
+
+    -- A failed subscription is attributed to the hop it died at and to the
+    -- reason within it, the way a failed call and a failed registration are —
+    -- "no NOTIFY" and "a NOTIFY describing somebody else's registration" are
+    -- both `reginfo` stage failures and nothing like the same fault.
+    local function regev_finish(u, ok, stage, detail)
+        if u.done then return end
+        u.done = true
+        if u.timer then loop:cancel(u.timer); u.timer = nil end
+        -- regev_by_callid keeps its entry on purpose: the subscription lives
+        -- on past the phase and its last NOTIFY arrives at de-registration.
+        if not ok then
+            local t = ustats.stage[stage or "unknown"]
+            if not t then t = { n = 0, reasons = {} }; ustats.stage[stage or "unknown"] = t end
+            t.n = t.n + 1
+            sbump(t.reasons, detail or "unknown")
+            slog(u.sub, "reg-event", ("subscription FAILED at %s: %s")
+                :format(stage or "?", detail or "?"))
+        end
+        udec()
+    end
+
+    local function uarm(u)
+        if u.timer then loop:cancel(u.timer) end
+        u.timer = loop:after(REGEV.t_ms, function()
+            u.timer = nil
+            -- Name the furthest hop that DID happen: "the S-CSCF never took
+            -- the subscription" and "it took it and never notified" are
+            -- different faults with different fixes.
+            local stage, detail
+            if not u.t.t1 then stage, detail = "accept", "no 200 OK for the SUBSCRIBE"
+            elseif not u.t.t2 then stage, detail = "notify", "subscribed, but no NOTIFY ever came"
+            else stage, detail = "unknown", "both hops completed but the subscription never settled"
+            end
+            regev_finish(u, false, stage, detail)
+        end)
+    end
+
+    local function regev_settle(u)
+        if u.done or not (u.t.t1 and u.t.t2) then return end
+        local t, k = u.t, ustats.kpi
+        local function push(list, a, b)
+            if t[a] and t[b] then list[#list + 1] = t[b] - t[a] end
+        end
+        push(k.accept, "t0", "t1")   -- SUBSCRIBE -> 200 OK
+        push(k.notify, "t0", "t2")   -- SUBSCRIBE -> the state, one clock
+        push(k.ack,    "t2", "t3")   -- our own turnaround on the NOTIFY
+        ustats.last = t.t2
+        regev_finish(u, true)
+    end
+
+    -- Everything a reg-info document has to say before the subscription
+    -- counts: this UE's own identity is registered, and one of the contacts
+    -- bound to it is the contact this UE registered. Anything less means the
+    -- core is telling the UE a registration state that is not the one it is
+    -- in — which is the whole reason to ask.
+    --
+    -- The dialled address is checked at the same time but never failed on: it
+    -- is the call phase's precondition, not this one's, and reporting it here
+    -- is what turns a later "404 for the number" from a mystery into a
+    -- provisioning line that was visible before the first INVITE.
+    local function check_reginfo(u, m)
+        local sub = u.sub
+        local ct  = m:header("Content-Type"):lower()
+        if not ct:find("reginfo+xml", 1, true) then
+            return false, ("NOTIFY body is %s, not application/reginfo+xml")
+                :format(ct ~= "" and ct or "typeless")
+        end
+        local regs = REGEV.parse(m.body)
+        if #regs == 0 then
+            return false, ("reg-info carries no <registration> element (%d bytes)")
+                :format(#m.body)
+        end
+        u.identities = #regs
+        local mine
+        for _, r in ipairs(regs) do
+            if REGEV.same_id(r.aor, sub.impu) then mine = r end
+            if REGEV.same_id(r.aor, sub.dial) and r.state == "active" then u.dialable = true end
+        end
+        if not mine then
+            local names = {}
+            for _, r in ipairs(regs) do names[#names + 1] = r.aor end
+            return false, ("reg-info names %s, not this UE's own identity")
+                :format(#names > 0 and table.concat(names, ",") or "nothing")
+        end
+        u.state = mine.state
+        if mine.state ~= "active" then
+            return false, ("reg-info says this identity is %q, not active"):format(mine.state)
+        end
+        -- The binding, matched on address:port rather than on the whole URI:
+        -- the S-CSCF may hand back the contact with parameters of its own
+        -- (received, expires, the +g.3gpp.smsip feature tag) and none of them
+        -- change which socket the binding points at.
+        local want = ("%s:%d"):format(sub.ue_addr, sub.port_uc)
+        for _, c in ipairs(mine.contacts) do
+            if c.uri:find(want, 1, true) then u.event = c.event; return true end
+        end
+        return false, ("this identity is registered, but to %d other contact(s), not %s")
+            :format(#mine.contacts, want)
+    end
+
+    -- A NOTIFY arrived on a UE's socket: the network's view of that UE's own
+    -- registration. Answer the SIP hop first, then read the body — a notifier
+    -- that gets no 200 OK terminates the subscription, and a run that fails
+    -- the body check would then also have broken the thing it was measuring.
+    regev_request = function(sub, m)
+        local u  = regev_by_callid[m:call_id()]
+        local t2 = now()
+        -- Answered even when it matches nothing we track: 481 would tell the
+        -- S-CSCF to drop a subscription that is most likely ours (a NOTIFY
+        -- that overtook its own 200 OK), and an unmatched one is counted
+        -- below rather than turned into a teardown.
+        send_call(sub, sub.sock, "mt",
+                  build_response({ to_tag = (u and u.from_tag) or ("r%d"):format(sub.i) },
+                                 sub, m, 200, "OK"),
+                  "200 OK (NOTIFY)")
+        local t3 = now()
+
+        local ss    = m:header("Subscription-State"):lower()
+        local state = ss:match("^%s*([%w%-]+)") or "?"
+        if not u then
+            ustats.orphans = ustats.orphans + 1
+            return slog(sub, "reg-event",
+                ("NOTIFY (%s) for a subscription this run does not track"):format(state))
+        end
+        sbump(ustats.states, state)
+
+        -- A later state change on a subscription that has already been
+        -- measured. At teardown this is the S-CSCF telling the UE its
+        -- registration is gone — the half of the reg event that only a
+        -- de-REGISTER exercises, and the one a UE actually needs.
+        if u.done then
+            if state == "terminated" then
+                ustats.terminated = ustats.terminated + 1
+                slog(sub, "reg-event", ("NOTIFY: subscription terminated (%s)")
+                    :format(sip.auth_param(ss, "reason") ~= "" and sip.auth_param(ss, "reason")
+                            or "no reason given"))
+            else
+                slog(sub, "reg-event", ("NOTIFY: %s (state change after the phase)"):format(state))
+            end
+            return
+        end
+
+        -- A NOTIFY we have already read: answered above (the notifier is
+        -- retransmitting because it wants one), counted once. The S-CSCF may
+        -- also send a legitimate second document before the phase settles —
+        -- the first one is the measurement, so this is the same decision.
+        if u.t.t2 then return end
+        u.t.t2, u.t.t3 = t2, t3
+        ustats.notified = ustats.notified + 1
+        local okb, detail = check_reginfo(u, m)
+        if not okb then return regev_finish(u, false, "reginfo", detail) end
+        ustats.verified = ustats.verified + 1
+        ustats.identities[#ustats.identities + 1] = u.identities
+        if u.dialable then ustats.dialable = ustats.dialable + 1 end
+        if VERBOSE then
+            slog(sub, "reg-event", ("%s, %d identity(ies), contact %s after %d ms")
+                :format(u.state, u.identities, u.event ~= "" and u.event or "bound",
+                        t2 - u.t.t0))
+        end
+        regev_settle(u)
+    end
+
+    -- The reply to the SUBSCRIBE. 200 and 202 both create the subscription
+    -- (RFC 6665 §4.1.2.1); anything else means there is none.
+    regev_response = function(sub, m)
+        local u = regev_by_callid[m:call_id()]
+        if not u then
+            if m.status >= 300 then
+                sbump(ustats.by_status, m.status)
+                slog(sub, "reg-event", ("%d %s for a subscription we no longer track")
+                    :format(m.status, m.reason))
+            end
+            return
+        end
+        if m.status < 200 then return end
+        if m.status >= 300 then
+            sbump(ustats.by_status, m.status)
+            return regev_finish(u, false, "accept", ("%d %s"):format(m.status, m.reason))
+        end
+        if u.t.t1 then return end                     -- retransmitted final
+        u.t.t1 = now()
+        ustats.accepted = ustats.accepted + 1
+        -- What the notifier granted, which may be less than we asked for.
+        u.granted = tonumber(m:header("Expires"))
+        if VERBOSE then
+            slog(sub, "reg-event", ("%d %s after %d ms (expires %s)")
+                :format(m.status, m.reason, u.t.t1 - u.t.t0,
+                        u.granted and tostring(u.granted) or "unstated"))
+        end
+        regev_settle(u)
+    end
+
+    begin_regev = function()
+        -- A SUBSCRIBE is an originating request, so it needs exactly what an
+        -- INVITE needs: a live registration and the Service-Route to send it
+        -- through. The denominator stays every subscriber, so a registration
+        -- failure cannot turn into a perfect subscription rate.
+        local list = {}
+        for _, s in ipairs(subs) do
+            if s.registered and s.sock and #(s.svc_route or {}) > 0 then
+                ustats.eligible = ustats.eligible + 1
+                list[#list + 1] = s
+            end
+        end
+        if #list == 0 then
+            banner(("Reg-event — none sent (%d/%d subscriber(s) eligible; a SUBSCRIBE needs a registered UE with a Service-Route)")
+                :format(ustats.eligible, #subs))
+            return after_regev()
+        end
+        banner(("Reg-event — %d of %d subscriber(s) subscribing to their own registration state%s")
+            :format(#list, #subs,
+                    REGEV.rps > 0 and (" at %.1f sub/s"):format(REGEV.rps) or " in one burst"))
+        line("event package", ("reg (RFC 3680), Expires: %d, Accept: application/reginfo+xml")
+            :format(REGEV.expires))
+
+        local spacing = REGEV.rps > 0 and math.floor(1000 / REGEV.rps) or 0
+        local function subscribe(sub)
+            sub.regev_cseq = sub.regev_cseq + 1
+            -- Short identifiers for the same reason the call phase uses them
+            -- (see the downlink size budget): the reg-info NOTIFY is the
+            -- largest thing the network sends a UE outside a call, and every
+            -- byte of the dialog id comes back inside it.
+            local u = {
+                sub = sub, cseq = sub.regev_cseq,
+                call_id  = ("r%d@%s"):format(sub.i, sub.ue_addr),
+                from_tag = ("r%d"):format(sub.i),
+                branch   = ("z9hG4bKr%d-%d"):format(sub.i, sub.regev_cseq),
+                identities = 0, dialable = false, state = "", event = "",
+                t = {}, done = false,
+            }
+            sub.regev = u
+            regev_by_callid[u.call_id] = u
+            upending = upending + 1
+            ustats.attempted = ustats.attempted + 1
+            u.t.t0 = now()
+            ustats.first = ustats.first or u.t.t0
+            if send_call(sub, sub.sock, "mo", REGEV.build(sub, u, REGEV.expires),
+                         ("SUBSCRIBE (reg, %s)"):format(sub.impu)) then
+                uarm(u)
+            else
+                regev_finish(u, false, "send", "SUBSCRIBE send failed")
+            end
+        end
+
+        -- Overall deadline so a lost NOTIFY cannot hang the run.
+        uguard = loop:after(spacing * #list + REGEV.t_ms + 2000, function()
+            uguard = nil
+            for _, u in pairs(regev_by_callid) do
+                if not u.done then regev_finish(u, false, "guard", "reg-event phase deadline") end
+            end
+            if upending > 0 then upending = 0; after_regev() end
+        end)
+
+        upending = 1                      -- the scheduler's sentinel; see mdec()
+        if spacing > 0 then
+            for i, s in ipairs(list) do loop:after((i - 1) * spacing, function() subscribe(s) end) end
+            loop:after((#list - 1) * spacing + 1, udec)
+        else
+            for _, s in ipairs(list) do subscribe(s) end
+            udec()
+        end
     end
 
     -- ---- the call phase ----
@@ -1991,8 +2461,6 @@ local function run()
         for i = 1, n do out[i] = base[(i - 1) % #base + 1] end
         return out
     end
-
-    local function sbump(t, k) t[k] = (t[k] or 0) + 1 end
 
     -- Where a submit goes, and from which port. Direct mode skips the core
     -- entirely (proving the codec and the gateway without the S-CSCF's iFC);
@@ -3054,6 +3522,7 @@ local function run()
     end
     stats.calls = cstats
     if SMS.on then stats.sms = sstats end
+    if REGEV.on then stats.regev = ustats end
 
     -- Datapath counters, read while the datapath is still loaded. Aggregated
     -- over every bearer the run programmed, because the error tallies are the
@@ -3190,6 +3659,109 @@ local function dist(s, unit, fmt)
     fmt = fmt or "%.0f"
     return (("p50 " .. fmt .. "  p95 " .. fmt .. "  p99 " .. fmt .. "  max " .. fmt .. " %s  (n=%d)")
         :format(s.p50, s.p95, s.p99, s.max, unit, s.n))
+end
+
+-- ---- the registration-state subscription ----------------------------------
+--
+-- Validity first, as in the SMS phase: a subscription that was accepted and
+-- notified but whose document describes some other registration state is a
+-- failure, and a louder one than a subscription that was refused outright.
+local us = stats.regev
+if us and us.attempted > 0 then
+    banner(("Reg-event — %d confirmed / %d subscribed (%d of %d subscriber(s) eligible)")
+        :format(us.verified, us.attempted, us.eligible, #subs))
+    line("accepted (200 OK)", ("%d  (%.1f%%)")
+        :format(us.accepted, us.accepted / us.attempted * 100))
+    line("notified (reg-info)", ("%d  (%.1f%%)")
+        :format(us.notified, us.notified / us.attempted * 100))
+    -- The implicit registration set as the network sees it. This is the line
+    -- that says, before any INVITE, whether the callee's number is an identity
+    -- of the callee's subscription at all.
+    local ids = summarize(us.identities)
+    if ids then
+        line("identities per UE", dist(ids, "", "%.0f"))
+    end
+    if us.verified > 0 and CALL.uri ~= "sip" then
+        line("dialled form present", ("%d / %d reg-info document(s) list it")
+            :format(us.dialable, us.verified))
+        if us.dialable < us.verified then
+            line("", "the address the call phase dials is not among the identities the")
+            line("", "HSS returned for these subscribers, so a call to it will come back")
+            line("", "404/604 from the I-CSCF or 480 from the S-CSCF -- the same cause the")
+            line("", "call phase reports as DIALLED NUMBER UNRESOLVED, with the two fixes.")
+        end
+    end
+    if us.terminated > 0 then
+        line("de-registration told", ("%d UE(s) were NOTIFYed that their registration ended")
+            :format(us.terminated))
+    end
+    if us.orphans > 0 then
+        line("UNMATCHED NOTIFYs", ("%d — arrived for no subscription of ours"):format(us.orphans))
+    end
+    if next(us.states) then
+        local st = {}
+        for s, n in pairs(us.states) do st[#st + 1] = ("%s %d"):format(s, n) end
+        table.sort(st)
+        line("subscription states", table.concat(st, "  "))
+    end
+
+    local REGEV_STAGES = {
+        { key = "send",    label = "SUBSCRIBE send failed" },
+        { key = "accept",  label = "no 200 OK for the SUBSCRIBE" },
+        { key = "notify",  label = "subscribed, never notified" },
+        { key = "reginfo", label = "notified, but the state was not this UE's" },
+        { key = "guard",   label = "reg-event phase deadline" },
+        { key = "unknown", label = "other" },
+    }
+    local nfail = 0
+    for _, t in pairs(us.stage) do nfail = nfail + t.n end
+    if nfail > 0 then
+        line("failed", tostring(nfail))
+        for _, s in ipairs(REGEV_STAGES) do
+            local t = us.stage[s.key]
+            if t then
+                print(("     %-45s %d"):format(s.label, t.n))
+                local rs = {}
+                for r, n in pairs(t.reasons) do rs[#rs + 1] = { r = r, n = n } end
+                table.sort(rs, function(a, b) return a.n > b.n end)
+                for _, e in ipairs(rs) do print(("        %-45s %d"):format(e.r, e.n)) end
+            end
+        end
+    end
+    if next(us.by_status) then
+        local st = {}
+        for s, n in pairs(us.by_status) do st[#st + 1] = { s = s, n = n } end
+        table.sort(st, function(a, b) return a.n > b.n end)
+        for _, e in ipairs(st) do
+            print(("     SIP %-40s %d"):format(("%d %s"):format(
+                e.s, sip.status_phrase(e.s)), e.n))
+        end
+        if us.by_status[489] then
+            line("", "489 Bad Event: the S-CSCF does not serve the reg package here.")
+            line("", "kamailio needs ims_registrar_scscf and a route[SUBSCRIBE] that")
+            line("", "calls can_subscribe_to_reg()/subscribe_to_reg(\"location\").")
+        end
+    end
+    -- Accepted but never notified has one cause that is invisible from here
+    -- and worth naming, because it is a property of the path rather than of
+    -- the core: the reg-info document is the largest thing the network sends
+    -- a UE outside a call, and a downlink that does not fit the tunnel is
+    -- lost whole (see the downlink size budget above build_in_dialog).
+    if us.stage.notify then
+        line("", "a subscription accepted and never notified may be a NOTIFY that did")
+        line("", "not fit: with 36 bytes of GTP-U on a 1500-byte path the reg-info")
+        line("", "document plus its headers is the first downlink big enough to be")
+        line("", "fragmented, and a fragment carries no GTP header to classify.")
+    end
+
+    banner("Reg-event latency (percentiles, not means — a mean hides the knee)")
+    line("SUBSCRIBE -> 200 OK", dist(summarize(us.kpi.accept), "ms"))
+    line("SUBSCRIBE -> NOTIFY", dist(summarize(us.kpi.notify), "ms"))
+    line("NOTIFY -> our 200 OK", dist(summarize(us.kpi.ack), "ms"))
+    if summarize(us.kpi.notify) then
+        print("   SUBSCRIBE -> NOTIFY is a true one-way figure: both marks are readings")
+        print("   of ONE monotonic clock in this process, so no skew is in it.")
+    end
 end
 
 if cs and cs.pairs_total > 0 then
@@ -3438,9 +4010,21 @@ local tx_r = per_s(stats.tx, stats.pkt_last)
 local rx_r = per_s(stats.rx, stats.pkt_last)
 banner("Throughput (rates from first Create Session Request)")
 line("sessions created",     ("%d in %.2fs  ->  %.1f/s"):format(stats.sess, sess_w, sess_r))
-line("registrations",        ("%d in %.2fs  ->  %.1f/s"):format(stats.regs, reg_w, reg_r))
+
 line("SIP packets sent",     ("%d  ->  %.1f/s"):format(stats.tx, tx_r))
 line("SIP packets received", ("%d  ->  %.1f/s"):format(stats.rx, rx_r))
+
+line("registrations",        ("%d in %.2fs  ->  %.1f/s"):format(stats.regs, reg_w, reg_r))
+
+-- Subscriptions get their own window too (first SUBSCRIBE to last NOTIFY), so
+-- the registration burst before them does not dilute the figure.
+if us and us.attempted > 0 and us.first then
+    local w = ((us.last or us.first) - us.first) / 1000
+    line("subscriptions", w > 0
+        and ("%d confirmed in %.2fs  ->  %.1f/s"):format(us.verified, w, us.verified / w)
+        or  ("%d confirmed (single burst, under one clock tick)"):format(us.verified))
+end
+
 -- Calls are rated over their own window (first INVITE to last answer) so the
 -- registration phase that precedes them does not dilute the figure, exactly as
 -- the rates above exclude the grace and teardown.
@@ -3468,12 +4052,15 @@ if ss and ss.attempted > 0 and ss.first_submit then
         or  ("%d (single burst, under one clock tick)"):format(ss.delivered))
 end
 
--- A run passes when every subscriber registered, every call it actually placed
--- was answered, and every message it sent arrived with its content intact. A
--- phase that was switched off, or had no eligible pair (IMS_SUBS=1), is not
--- held against the run — but a message that arrived corrupted is, because that
--- is the failure the phase exists to catch.
+-- A run passes when every subscriber registered, every subscription it opened
+-- was confirmed by a document describing that subscriber's own registration,
+-- every call it actually placed was answered, and every message it sent
+-- arrived with its content intact. A phase that was switched off, or had no
+-- eligible pair (IMS_SUBS=1), is not held against the run — but a message that
+-- arrived corrupted is, and so is a reg-info document that described the wrong
+-- state, because those are the failures those phases exist to catch.
 local calls_ok = not cs or cs.attempted == 0 or cs.answered == cs.attempted
 local sms_ok = not ss or ss.attempted == 0
     or (ss.delivered == ss.attempted and ss.verified == ss.attempted)
-os.exit((ok == #subs and calls_ok and sms_ok) and 0 or 1)
+local regev_ok = not us or us.attempted == 0 or us.verified == us.attempted
+os.exit((ok == #subs and regev_ok and calls_ok and sms_ok) and 0 or 1)
