@@ -754,6 +754,24 @@ All in Lua; run each with `LUA_CPATH=<build>/bindings/lua/?.so lua …`.
 - [`examples/ro_credit_control.lua`](examples/ro_credit_control.lua) —
   an online-charging session over Ro (CCR-I/U/T against an OCS), both
   sides, offline.
+- [`examples/ims_test_gm.lua`](examples/ims_test_gm.lua) — IMS
+  registration over Gm with IMS-AKA and IPsec, and nothing else: N
+  subscribers (`IMS_SUBS`) register with a live P-CSCF concurrently on one
+  `net.Loop`, straight over the access network. Per subscriber the
+  unprotected REGISTER offers a Security-Client, the 401 carries the AKA
+  challenge and the P-CSCF's Security-Server, `ipsec.aka_verify` checks
+  AUTN and derives CK/IK, four transport-mode ESP SAs and their steering
+  policies go in over `ipsec.Xfrm`, and the protected REGISTER
+  (AKAv1-MD5, `ipsec.aka_digest`) earns the 200 OK — driven by
+  `sip.Registration` + `sip.AuthChallenge` + a per-REGISTER
+  `sip.Transaction`, and released with an `Expires: 0` REGISTER so the
+  P-CSCF reaps its half of the IPsec state. It reports where each
+  subscriber gave up plus the registration-latency distribution. This is
+  the Gm leg of [`examples/ims_test_s5.lua`](examples/ims_test_s5.lua) with
+  no PDN connection under it and no phase after it, which is what makes it
+  the first probe to run against a core: a failure here is the IMS or the
+  USIM keys, because there is no PGW, datapath or bearer to be the other
+  explanation.
 - [`examples/ims_call_s5.lua`](examples/ims_call_s5.lua) — the UE side
   of an IMS-AKA registration and call over Gm, sent over a real UDP
   socket (`net.UdpSocket`) so it can run against a live IMS core: the
