@@ -48,7 +48,11 @@ API_EXPORT ssize_t net_udp_recv(net_sock*, void*, size_t, net_addr* from,
 
 /* conn: local may be NULL (ephemeral). Returns NET_OK when connected,
  * NET_WANT_WR when timeout_ms < 0 and the connect is in flight (finish
- * with net_sock_done once writable), NET_TIMEOUT or NET_ERR. */
+ * with net_sock_done once writable), NET_TIMEOUT or NET_ERR.
+ *
+ * NET_WANT_WR is the only outcome that leaves an open descriptor behind
+ * without a connection: NET_ERR and NET_TIMEOUT both close it (fd is
+ * -1), so a caller that dials in a retry loop leaks nothing. */
 API_EXPORT int net_tcp_conn(net_sock*, const net_addr* local,
                             const net_addr* peer, int timeout_ms);
 API_EXPORT int net_tcp_bind(net_sock*, const net_addr* local, int backlog);

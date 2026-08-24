@@ -614,7 +614,10 @@ const char* sms_type_name(sms_type_t t)
         "SMS-DELIVER",       "SMS-DELIVER-REPORT", "SMS-SUBMIT",
         "SMS-SUBMIT-REPORT", "SMS-STATUS-REPORT",  "SMS-COMMAND"
     };
-    return t < SMS_T_MAX ? n[t] : "";
+    /* Cast, because the parameter is an enum and so the compare is signed:
+     * these names are reachable from a script (sms.type_name in the Lua
+     * module), which is free to pass a negative integer. */
+    return (unsigned)t < SMS_T_MAX ? n[t] : "";
 }
 
 const char* sms_ton_name(sms_ton_t t)
@@ -622,7 +625,7 @@ const char* sms_ton_name(sms_ton_t t)
     static const char* n[8] = { "unknown",     "international", "national",
                                 "network",     "subscriber",    "alphanumeric",
                                 "abbreviated", "reserved" };
-    return t < 8 ? n[t] : "";
+    return (unsigned)t < 8 ? n[t] : "";
 }
 
 const char* sms_npi_name(sms_npi_t p)

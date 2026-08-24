@@ -278,13 +278,14 @@ spec ("xfrm") {
 
     context ("live kernel transaction") {
         /* Opening the socket needs no privilege, but manipulating SAs
-         * needs CAP_NET_ADMIN — gate on root and skip cleanly otherwise
+         * needs CAP_NET_ADMIN — gate on the capability and skip otherwise
          * (an unprivileged add is rejected with EPERM). */
         xfrm_sock s;
-        int       opened     = xfrm_open(&s);
-        int       privileged = (opened == XFRM_OK) && (geteuid() == 0);
+        int       opened = xfrm_open(&s);
+        int       privileged =
+            (opened == XFRM_OK) && test_has_cap(TEST_CAP_NET_ADMIN);
 
-        xit ("adds and deletes a transport SA", privileged ? 1 : 0) {
+        it ("adds and deletes a transport SA", privileged ? 1 : 0) {
             static const uint8_t akey[20] = { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 };
             xfrm_sa              sa;
             memset(&sa, 0, sizeof sa);

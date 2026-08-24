@@ -212,8 +212,15 @@ static int stream_conn(net_sock* s, const net_addr* local, const net_addr* peer,
     if (errno != EINPROGRESS) return fail(s);
     if (timeout_ms < 0) return NET_WANT_WR;
     int r = net_sock_done(s, timeout_ms);
-    if (r == NET_ERR) return fail(s);
-    return r;
+    if (r != NET_OK) {
+        /* NET_ERR or NET_TIMEOUT: the connect will never complete, so the
+         * descriptor is closed here rather than left for a caller who has
+         * no handle worth keeping. fail() preserves errno; its NET_ERR is
+         * discarded so a timeout still reports itself as one. */
+        fail(s);
+        return r;
+    }
+    return NET_OK;
 }
 
 static int stream_bind(net_sock* s, const net_addr* local, int backlog,

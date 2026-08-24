@@ -772,22 +772,36 @@ All in Lua; run each with `LUA_CPATH=<build>/bindings/lua/?.so lua …`.
   the first probe to run against a core: a failure here is the IMS or the
   USIM keys, because there is no PGW, datapath or bearer to be the other
   explanation.
-- [`examples/ims_call_s5.lua`](examples/ims_call_s5.lua) — the UE side
-  of an IMS-AKA registration and call over Gm, sent over a real UDP
-  socket (`net.UdpSocket`) so it can run against a live IMS core: the
-  Security-Client/Server agreement, Milenage on the USIM secret
-  (`ipsec.aka_verify`) to verify AUTN and derive CK/IK, four
-  transport-mode ESP SAs keyed from those (`ipsec.Xfrm`), then the
-  protected REGISTER (AKAv1-MD5 via `ipsec.md5`) and INVITE, with a
-  `sip.Transaction` tracking each transaction. Given a PGW address it
-  first raises the PDN connection the access rides on — acting as the
-  SGW it sends a GTPv2-C Create Session to the PGW over S5/S8
-  (`gtp.Endpoint`) and registers callbacks for the PGW's responses (the
-  PAA carries the UE's assigned address, `on_user_plane` the PGW's
-  data-plane F-TEID), tearing it down with a Delete Session at the end.
-  Run with no P-CSCF address it instead executes an offline self-test
-  (Milenage known-answer vector, AUTN round-trip, message and SA
-  construction) and needs neither network nor privilege.
+- [`examples/ims_test_s5.lua`](examples/ims_test_s5.lua) — the whole UE
+  side of a VoLTE deployment against a live core, `IMS_SUBS` subscribers
+  at a time on one `net.Loop`. Each raises its own PDN connection over
+  S5/S8 — acting as the SGW it sends a GTPv2-C Create Session to the PGW
+  (`gtp.Endpoint`), whose response carries the UE's address in the PAA and
+  the P-CSCF's in the PCO, and whose bearers are steered by the **eBPF
+  GTP-U** datapath (two TFTs per UE for signalling, UDP:5060 for the plain
+  REGISTER and ESP for the protected one, keyed on the UE's own address so
+  concurrent subscribers registering to the one P-CSCF stay on their own
+  bearers; two more per call for media, homed on the dedicated bearer the
+  Create Bearer Request brings). On top of that access it runs the phases
+  a handset does, each one switchable and separately measured:
+  **registration** (the same IMS-AKA + IPsec exchange
+  [`examples/ims_test_gm.lua`](examples/ims_test_gm.lua) runs on its own),
+  the **reg event** subscription of RFC 3680 (`IMS_REG_EVENT`) whose NOTIFY
+  is the first terminating request a UE receives, **calls** between pairs of
+  subscribers (`IMS_CALL`) dialled by number so the whole
+  MSISDN → IMPU → registered-contact chain is under test — `sip.Dialog` +
+  `sip.Transaction` per leg, `sdp` for the offer and answer, real RTP on a
+  sampled subset (`CALL_MEDIA`) through the rtpengine address the rewritten
+  SDP names — and **SMS over IMS** (`IMS_SMS`, TS 24.341) through
+  [`examples/ipsmgw.lua`](examples/ipsmgw.lua). Offered load is the
+  independent variable throughout (`CALL_CPS`, `SMS_MPS`, an unramped
+  registration burst), and the report is distributions rather than means:
+  call setup decomposed per segment as p50/p95/p99/max, per-direction loss
+  and jitter with a G.107 MOS *estimate* from packet statistics, the stage
+  each subscriber died at, and the datapath's own drop counters. Teardown
+  de-REGISTERs (so the P-CSCF reaps the ESP SAs) and sends a Delete Session
+  per PDN connection. Needs `CAP_NET_ADMIN` for the SAs and the
+  UE-addressed sockets, plus `CAP_BPF` for the datapath.
 
 ## Extending
 

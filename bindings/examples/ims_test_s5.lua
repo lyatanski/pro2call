@@ -497,6 +497,12 @@ local function make_sub(i)
         -- arrive on `sock` too: the UE advertises one protected port in both
         -- roles, so there is no second socket to bind.
         svc_route = nil,
+        -- The non-barred identities the 200 OK associated with this
+        -- registration, in the order the network listed them — see
+        -- associated_uris(). `impu` above is what the UE registered; this is
+        -- what the network calls it afterwards, and the two differ whenever
+        -- the registered IMPU is the barred temporary one.
+        assoc = nil,
         -- Reg event (RFC 3680): the subscription this UE opens on its own
         -- IMPU once registered. Kept on the subscriber, not only in the
         -- phase's own list, because the subscription outlives the phase — the
@@ -768,6 +774,28 @@ local function service_route(m)
     local vals = m:header_values("Service-Route")
     for i = 0, vals:size() - 1 do
         for uri in vals[i]:gmatch("<[^>]*>") do out[#out + 1] = uri end
+    end
+    return out
+end
+
+-- The identities the REGISTER 200 OK associated with this registration
+-- (TS 24.229 §5.1.1.1A), bare — no angle brackets, so they compare as
+-- identities rather than as routes.
+--
+-- This matters because the UE here has no ISIM. It registers with a TEMPORARY
+-- public user identity derived from the IMSI (TS 23.003 §13.4B), and that one
+-- is provisioned BARRED: good for the REGISTER and for nothing else. The
+-- identities the network will actually talk about are the non-barred ones it
+-- returns here — with open5gs's HSS, sip:<msisdn>@<realm> and tel:<msisdn>
+-- (hss_cx_download_user_data). Both CSCF sides filter on that flag: kamailio
+-- builds this header from the unbarred identities (build_p_associated_uri) and
+-- builds a reg-info document from the same set, so a UE that only ever knows
+-- its own IMPU cannot recognise its own registration state.
+local function associated_uris(m)
+    local out  = {}
+    local vals = m:header_values("P-Associated-URI")
+    for i = 0, vals:size() - 1 do
+        for uri in vals[i]:gmatch("<([^>]*)>") do out[#out + 1] = uri end
     end
     return out
 end
@@ -1284,6 +1312,16 @@ local function run()
             slog(sub, "Service-Route", #sub.svc_route > 0
                 and table.concat(sub.svc_route, " ")
                 or  "absent -- this subscriber cannot originate a call")
+        end
+        -- Captured at the same message and for the same reason: it is the one
+        -- place the network says which identities this registration owns, and
+        -- the reg-event phase has nothing to compare a reg-info document
+        -- against without it.
+        sub.assoc = associated_uris(m)
+        if VERBOSE then
+            slog(sub, "P-Associated-URI", #sub.assoc > 0
+                and table.concat(sub.assoc, " ")
+                or  "absent -- the registered IMPU is all this UE is known by")
         end
         slog(sub, "result", ("registered at P-CSCF %s"):format(sub.pcscf or "?"))
         finish(sub)
@@ -2098,10 +2136,10 @@ local function run()
     end
 
     -- Everything a reg-info document has to say before the subscription
-    -- counts: this UE's own identity is registered, and one of the contacts
-    -- bound to it is the contact this UE registered. Anything less means the
-    -- core is telling the UE a registration state that is not the one it is
-    -- in — which is the whole reason to ask.
+    -- counts: one of this UE's own identities is registered, and one of the
+    -- contacts bound to it is the contact this UE registered. Anything less
+    -- means the core is telling the UE a registration state that is not the
+    -- one it is in — which is the whole reason to ask.
     --
     -- The dialled address is checked at the same time but never failed on: it
     -- is the call phase's precondition, not this one's, and reporting it here
@@ -2120,17 +2158,40 @@ local function run()
                 :format(#m.body)
         end
         u.identities = #regs
+        -- "This UE's own identity" is a SET, not the one URI it registered:
+        -- the registered IMPU first, then everything the 200 OK associated
+        -- with it. Without an ISIM the registered IMPU is the temporary,
+        -- barred one and the network deliberately never names it in a
+        -- reg-info document, so matching on it alone fails a core for being
+        -- correct — which is the opposite of what this phase is for.
+        --
+        -- Only the matching moves. The SUBSCRIBE still goes to sub.impu and
+        -- still asserts sub.impu, because that pairing is the one the S-CSCF
+        -- can authorise: can_subscribe_to_reg() accepts the asserted identity
+        -- either as the presentity's own AOR or as an *unbarred* entry in its
+        -- service profile, and the temporary IMPU is neither of those for an
+        -- associated presentity. Subscribing to the associated identity while
+        -- asserting the registered one is a 403.
+        local own = { sub.impu }
+        for _, a in ipairs(sub.assoc or {}) do own[#own + 1] = a end
         local mine
+        for _, id in ipairs(own) do
+            for _, r in ipairs(regs) do
+                if REGEV.same_id(r.aor, id) then mine = r; break end
+            end
+            if mine then break end
+        end
         for _, r in ipairs(regs) do
-            if REGEV.same_id(r.aor, sub.impu) then mine = r end
             if REGEV.same_id(r.aor, sub.dial) and r.state == "active" then u.dialable = true end
         end
         if not mine then
             local names = {}
             for _, r in ipairs(regs) do names[#names + 1] = r.aor end
-            return false, ("reg-info names %s, not this UE's own identity")
-                :format(#names > 0 and table.concat(names, ",") or "nothing")
+            return false, ("reg-info names %s, none of this UE's own identities (%s)")
+                :format(#names > 0 and table.concat(names, ",") or "nothing",
+                        table.concat(own, ","))
         end
+        u.aor = mine.aor
         u.state = mine.state
         if mine.state ~= "active" then
             return false, ("reg-info says this identity is %q, not active"):format(mine.state)
@@ -2202,9 +2263,9 @@ local function run()
         ustats.identities[#ustats.identities + 1] = u.identities
         if u.dialable then ustats.dialable = ustats.dialable + 1 end
         if VERBOSE then
-            slog(sub, "reg-event", ("%s, %d identity(ies), contact %s after %d ms")
-                :format(u.state, u.identities, u.event ~= "" and u.event or "bound",
-                        t2 - u.t.t0))
+            slog(sub, "reg-event", ("%s as %s, %d identity(ies), contact %s after %d ms")
+                :format(u.state, u.aor ~= "" and u.aor or "?", u.identities,
+                        u.event ~= "" and u.event or "bound", t2 - u.t.t0))
         end
         regev_settle(u)
     end
@@ -2275,6 +2336,7 @@ local function run()
                 from_tag = ("r%d"):format(sub.i),
                 branch   = ("z9hG4bKr%d-%d"):format(sub.i, sub.regev_cseq),
                 identities = 0, dialable = false, state = "", event = "",
+                aor = "",   -- which of the UE's identities the document named
                 t = {}, done = false,
             }
             sub.regev = u

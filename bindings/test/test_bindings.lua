@@ -21,15 +21,25 @@ local function check(cond, msg)
         print(string.format("  FAIL %s", msg or "check"))
     end
 end
-local function is_root()
+-- The live SA round-trip below needs CAP_NET_ADMIN, which uid 0 does not
+-- imply: a container runs as root with that capability dropped (Docker's
+-- default), so testing the uid sends an unprivileged process down the
+-- privileged path and the suite fails on EPERM. Read the effective
+-- capability set instead and look for bit 12, CAP_NET_ADMIN. Lua 5.1 has
+-- no bitwise operators, hence the divide: the low 16 bits of CapEff are
+-- read as a number and shifted down to bit 12 arithmetically.
+local function can_net_admin()
     local f = io.open("/proc/self/status")
     if not f then return false end
+    local caps
     for line in f:lines() do
-        local uid = line:match("^Uid:%s+(%d+)")
-        if uid then f:close(); return uid == "0" end
+        caps = line:match("^CapEff:%s+(%x+)")
+        if caps then break end
     end
     f:close()
-    return false
+    if not caps then return false end
+    local low = tonumber(caps:sub(-4), 16)
+    return low ~= nil and math.floor(low / 4096) % 2 == 1
 end
 
 -- constants -----------------------------------------------------------
@@ -74,7 +84,7 @@ check(p.tmpl_dst == "10.0.0.2", "policy tmpl_dst round-trip")
 local x = ipsec.Xfrm()   -- opening the netlink socket needs no privilege
 check(x ~= nil, "Xfrm constructed")
 
-if is_root() then
+if can_net_admin() then
     -- Privileged: a real add/delete round-trip must succeed.
     x:sa_add(sa)
     local id = ipsec.SaId()
@@ -82,7 +92,8 @@ if is_root() then
     x:sa_del(id)
     check(true, "privileged sa_add/sa_del round-trip")
 else
-    -- Unprivileged: the kernel rejects the add; the facade raises.
+    -- No CAP_NET_ADMIN (uid 0 in a default container counts): the kernel
+    -- rejects the add with EPERM and the facade raises.
     local ok, err = pcall(function() x:sa_add(sa) end)
     check(not ok, "unprivileged sa_add raises")
     check(type(err) == "string" and err:find("sa_add"), "error names the operation")

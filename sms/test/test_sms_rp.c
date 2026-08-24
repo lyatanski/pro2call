@@ -1,3 +1,4 @@
+#include <limits.h>
 #include <string.h>
 
 #include "sms_rp.h"
@@ -339,6 +340,11 @@ spec ("sms rp") {
             check(
                 streq(sms_rp_mti_name(SMS_RP_DATA_N_TO_MS), "RP-DATA (n->ms)"));
             check(streq(sms_rp_mti_name((sms_rp_mti_t)7), ""));
+        }
+
+        it ("refuses an out-of-range type from either end") {
+            check(streq(sms_rp_type_name((sms_rp_type_t)-1), ""));
+            check(streq(sms_rp_type_name((sms_rp_type_t)INT_MIN), ""));
         }
     }
 }

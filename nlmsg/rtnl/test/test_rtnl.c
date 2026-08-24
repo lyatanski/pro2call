@@ -379,14 +379,15 @@ spec ("rtnl") {
 
     context ("live kernel transaction") {
         /* Opening the socket needs no privilege, but adding an address
-         * needs CAP_NET_ADMIN — gate on root and skip cleanly otherwise
+         * needs CAP_NET_ADMIN — gate on the capability and skip otherwise
          * (an unprivileged add is rejected with EPERM). Uses a private
          * host address on loopback, then removes it. */
         rtnl_sock s;
-        int       opened     = rtnl_open(&s);
-        int       privileged = (opened == RTNL_OK) && (geteuid() == 0);
+        int       opened = rtnl_open(&s);
+        int       privileged =
+            (opened == RTNL_OK) && test_has_cap(TEST_CAP_NET_ADMIN);
 
-        xit ("adds and deletes a loopback host address", privileged ? 1 : 0) {
+        it ("adds and deletes a loopback host address", privileged ? 1 : 0) {
             rtnl_addr a;
             memset(&a, 0, sizeof a);
             a.addr      = "10.255.255.254";
@@ -400,8 +401,8 @@ spec ("rtnl") {
             check(rtnl_addr_del(&s, &a) == RTNL_OK);
         }
 
-        xit ("installs and removes a host route with an MTU",
-             privileged ? 1 : 0) {
+        it ("installs and removes a host route with an MTU",
+            privileged ? 1 : 0) {
             rtnl_route r;
             memset(&r, 0, sizeof r);
             r.dst     = "10.255.255.253";

@@ -1,3 +1,4 @@
+#include <limits.h>
 #include <string.h>
 
 #include "sms.h"
@@ -664,6 +665,16 @@ spec ("sms tpdu") {
             check(streq(sms_ton_name(SMS_TON_INTERNATIONAL), "international"));
             check(streq(sms_npi_name(SMS_NPI_ISDN), "ISDN/E.164"));
             check(streq(sms_err_name(SMS_E_SHORT), "truncated"));
+        }
+
+        /* Both ends of the range, not just the top: these names are
+         * reachable from a script, which can pass anything. */
+        it ("refuses an out-of-range value from either end") {
+            check(streq(sms_type_name((sms_type_t)-1), ""));
+            check(streq(sms_type_name((sms_type_t)INT_MIN), ""));
+            check(streq(sms_ton_name((sms_ton_t)-1), ""));
+            check(streq(sms_ton_name((sms_ton_t)8), ""));
+            check(streq(sms_npi_name((sms_npi_t)-1), ""));
         }
 
         it ("names the registries a gateway logs") {

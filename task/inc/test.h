@@ -54,6 +54,31 @@ int main(void)
     return !!test_count_fail;
 }
 
+/* Whether this process holds one capability, for the `it(name, count)`
+ * gate on a test that needs a live kernel transaction.
+ *
+ * Effective capabilities, not the uid: a container routinely runs as
+ * root with CAP_NET_ADMIN dropped, so geteuid() == 0 sends a test that
+ * cannot do the work down the path that does it. Degrades to "skip" on
+ * any system without /proc. */
+enum { TEST_CAP_NET_ADMIN = 12 };
+
+static inline int test_has_cap(unsigned cap)
+{
+    FILE* f = fopen("/proc/self/status", "r");
+    if (!f) return 0;
+    char               line[256];
+    unsigned long long eff = 0;
+    int                got = 0;
+    while (fgets(line, sizeof line, f))
+        if (sscanf(line, "CapEff: %llx", &eff) == 1) {
+            got = 1;
+            break;
+        }
+    fclose(f);
+    return got && cap < 64 && (int)((eff >> cap) & 1ULL);
+}
+
 #define TEST_NARGS_IMPL(_1, _2, N, ...) N
 #define TEST_NARGS(...)                 TEST_NARGS_IMPL(__VA_ARGS__, 2, 1, 0)
 #define TEST_CAT_IMPL(a, b)             a##b

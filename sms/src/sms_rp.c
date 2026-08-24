@@ -365,7 +365,9 @@ const char* sms_rp_type_name(sms_rp_type_t t)
 {
     static const char* n[SMS_RP_T_MAX] = { "RP-DATA", "RP-ACK", "RP-ERROR",
                                            "RP-SMMA" };
-    return t < SMS_RP_T_MAX ? n[t] : "";
+    /* Cast: the enum parameter makes the compare signed, and a script can
+     * reach this through the Lua module with any integer. */
+    return (unsigned)t < SMS_RP_T_MAX ? n[t] : "";
 }
 
 const char* sms_rp_mti_name(sms_rp_mti_t mti)

@@ -170,6 +170,20 @@ spec ("net_sock") {
             net_addr dead = srv.local;
             net_sock_close(&srv);
             check(net_tcp_conn(&cli, NULL, &dead, 1000) == NET_ERR);
+            check(cli.fd < 0); /* no descriptor survives a failed dial */
+        }
+
+        /* A dial into TEST-NET-1 (RFC 5737) either times out waiting for a
+         * SYN-ACK or is refused by the routing table; both are failures and
+         * neither may leave an fd behind, or a retry loop against a peer
+         * that is not up yet exhausts the process. */
+        it ("a dial that never completes closes its descriptor") {
+            net_sock cli;
+            net_addr blackhole;
+            check(net_addr_from(&blackhole, "192.0.2.1", 9) == NET_OK);
+            int r = net_tcp_conn(&cli, NULL, &blackhole, 50);
+            check(r == NET_TIMEOUT || r == NET_ERR);
+            check(cli.fd < 0);
         }
     }
 

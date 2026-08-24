@@ -584,10 +584,14 @@ StreamConn* stream_connect(const std::string& host, uint16_t port, int proto,
     int      rc = proto == IPPROTO_SCTP
                       ? net_sctp_conn(&s, nullptr, &peer, timeout_ms)
                       : net_tcp_conn(&s, nullptr, &peer, timeout_ms);
-    if (rc != NET_OK)
-        throw Error("connect to " + host + ":" + std::to_string(port) +
-                        " failed",
-                    rc);
+    if (rc != NET_OK) {
+        /* Nothing but NET_OK yields a StreamConn, so nothing but NET_OK may
+         * keep a descriptor. NET_ERR/NET_TIMEOUT closed theirs already; the
+         * in-flight NET_WANT_WR of timeout_ms < 0 still holds one. */
+        net_sock_close(&s);
+        throw Error(
+            "connect to " + host + ":" + std::to_string(port) + " failed", rc);
+    }
     return new StreamConn(s);
 }
 
