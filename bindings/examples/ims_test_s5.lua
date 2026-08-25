@@ -1485,6 +1485,84 @@ local function run()
     -- Attempted (so a refusal is reported once, not once per subscriber) and
     -- installed (what teardown removes) are separate: 400 subscribers share
     -- one P-CSCF and one route.
+
+    -- The nexthop for that /32. A route with no gateway is an *on-link* route:
+    -- it tells the kernel to resolve the destination itself, with ARP, on that
+    -- link. True on a shared L2 -- a docker bridge, where every container in
+    -- the compose network answers for its own address -- and false under a CNI
+    -- that gives each pod a point-to-point veth. KinD's kindnet uses the `ptp`
+    -- plugin, which deletes the connected route for the pod subnet and leaves
+    -- the pod holding nothing but
+    --
+    --     10.244.0.1 dev eth0 scope link
+    --     default via 10.244.0.1 dev eth0
+    --
+    -- so a /32 `dev eth0` toward the P-CSCF has the kernel ARP for an address
+    -- that lives in another netns behind the node. Nothing answers -- the node
+    -- does not proxy-ARP -- the neighbour stays INCOMPLETE and the datagram is
+    -- dropped in neigh_resolve_output, which is *before* dev_queue_xmit and so
+    -- before TC egress: gtpu_encap never runs on it. The run then reports
+    -- "rx 0 pkt, tx 0 pkt" with every datapath error counter at zero and every
+    -- REGISTER timed out, which reads as a dead datapath and is a dead route.
+    --
+    -- So keep the nexthop the kernel would have picked itself: a longest-prefix
+    -- match over the device's routes, which is on-link (nil) on a bridge and
+    -- the default gateway under ptp. Host routes are skipped -- a /32 is never
+    -- evidence of a link, and one of them is this route as an earlier run of
+    -- this function left it.
+    local function nexthop_toward(dst, dev)
+        local f = io.open("/proc/net/route")
+        if not f then return nil end
+        -- The address fields are little-endian hex, so 10.244.0.1 reads
+        -- "0100F40A". Everything below stays in that byte order.
+        local function le(s)
+            local b = {}
+            for i = 1, 4 do b[i] = tonumber(s:sub(i * 2 - 1, i * 2), 16) end
+            return b
+        end
+        local a, b, c, e = dst:match("^(%d+)%.(%d+)%.(%d+)%.(%d+)$")
+        if not a then f:close() return nil end
+        local d = { tonumber(e), tonumber(c), tonumber(b), tonumber(a) }
+        -- Lua 5.1 has no bitwise operators, so the mask is applied and its
+        -- width counted a byte at a time -- all a prefix match needs.
+        local function band(x, y)
+            local r, bit = 0, 1
+            for _ = 1, 8 do
+                if x % 2 == 1 and y % 2 == 1 then r = r + bit end
+                x, y, bit = math.floor(x / 2), math.floor(y / 2), bit * 2
+            end
+            return r
+        end
+        local function bits(x)
+            local n = 0
+            while x > 0 do n, x = n + x % 2, math.floor(x / 2) end
+            return n
+        end
+        -- Longest prefix wins; on a tie the first line does, and the kernel
+        -- lists the main table by prefix then metric, so that is the cheapest.
+        local best, best_len = nil, -1
+        local hex8 = "(%x%x%x%x%x%x%x%x)"
+        for l in f:lines() do
+            local iface, rdst, rgw, rmask = l:match("^(%S+)%s+" .. hex8 ..
+                "%s+" .. hex8 .. "%s+%x+%s+%S+%s+%S+%s+%S+%s+" .. hex8)
+            if iface == dev then
+                local m, rd, g = le(rmask), le(rdst), le(rgw)
+                local len, covers = 0, true
+                for j = 1, 4 do
+                    len = len + bits(m[j])
+                    if band(d[j], m[j]) ~= band(rd[j], m[j]) then covers = false end
+                end
+                if covers and len < 32 and len > best_len then
+                    best_len = len
+                    best     = g[1] + g[2] + g[3] + g[4] > 0
+                        and ("%d.%d.%d.%d"):format(g[4], g[3], g[2], g[1]) or nil
+                end
+            end
+        end
+        f:close()
+        return best
+    end
+
     local mtu_routes, mtu_tried = {}, {}
     local function set_pcscf_mtu(sub)
         if not (up and inner_mtu > 0 and sub.pcscf) then return end
@@ -1492,10 +1570,13 @@ local function run()
         mtu_tried[sub.pcscf] = true
         local r = net.Route()
         r.dst, r.prefixlen, r.dev, r.mtu = sub.pcscf, 32, inner_name, inner_mtu
+        local gw = nexthop_toward(sub.pcscf, inner_name)
+        if gw then r.gateway = gw end
         local ok, err = pcall(function() net.route_add(r) end)
         if ok then mtu_routes[sub.pcscf] = r end
         line("P-CSCF route MTU", ok
-            and ("%s/32 dev %s mtu %d (GTP-U leaves 1500-36)"):format(sub.pcscf, inner_name, inner_mtu)
+            and ("%s/32 %sdev %s mtu %d (GTP-U leaves 1500-36)")
+                :format(sub.pcscf, gw and ("via %s "):format(gw) or "", inner_name, inner_mtu)
             or  ("could not set %d toward %s (need CAP_NET_ADMIN?): %s — an answered call's 200 OK will not fit")
                 :format(inner_mtu, sub.pcscf, why(err)))
     end
@@ -3700,6 +3781,17 @@ if stats.dp then
             line("", "a G-PDU arrived on a TEID with no decap entry -- most likely a")
             line("", "bearer we accepted in signalling but never steered.")
         end
+    elseif d.tx == 0 and d.teids > 0 then
+        -- Nothing encapsulated and nothing dropped at the hook either: the
+        -- packets never got as far as gtpu_encap. TC egress runs inside
+        -- dev_queue_xmit, so anything the kernel drops earlier -- an
+        -- unresolved neighbour above all -- is invisible to every counter
+        -- above and looks exactly like a datapath that does not work.
+        line("datapath idle", "no UE packet reached TC egress")
+        line("", "nothing was encapsulated and nothing was dropped at the hook, so")
+        line("", "the kernel never handed these packets to the device: check")
+        line("", "`ip neigh` for the inner destination and whether its route is")
+        line("", "on-link toward a peer that is not actually on that link.")
     end
 end
 
