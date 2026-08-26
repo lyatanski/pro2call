@@ -1,18 +1,17 @@
-FROM alpine:edge
+FROM alpine:edge AS build
 
-# Build dependencies, grouped by what needs them:
+# Build dependencies, as the root Dockerfile groups them:
 #
 #   build-base cmake ninja pkgconf   core C toolchain + build system
 #   openssl-dev                      net module (OpenSSL::SSL)
-#   go                               gtp/gen + diam/gen code generators (build-time)
+#   go                               gtp/gen + diam/gen code generators
 #   clang libbpf-dev bpftool         gtp/u eBPF datapath (BpfCompile.cmake)
-#   clang-extra-tools                clang-format/clang-tidy for the
-#                                    format/format-check/tidy targets
 #   linux-headers                    kernel UAPI headers for the BPF object
+#   swig lua5.1-dev                  the Lua bindings the scripts are written in
 #
-# The eBPF datapath is optional: without clang/bpftool/libbpf, gtp/u still
-# builds with the datapath stubbed out (GTPU_EBPF_DISABLED). DWARF
-# stripping (llvm-strip) is likewise optional and left out here.
+# Without clang/bpftool/libbpf gtp/u still builds, with the datapath stubbed
+# out (GTPU_EBPF_DISABLED) — and then nothing decapsulates the downlink, so
+# they are not optional here.
 RUN apk add --no-cache \
     build-base \
     cmake \
@@ -22,7 +21,6 @@ RUN apk add --no-cache \
     openssl-dev \
     go \
     clang \
-    clang-extra-tools \
     swig \
     lua5.1-dev \
     libbpf-dev \
@@ -30,4 +28,26 @@ RUN apk add --no-cache \
 
 ENV GOPATH=/tmp/go
 ENV GOCACHE=/tmp/go/cache
+
 WORKDIR /src
+COPY . .
+RUN cmake -B out -G Ninja \
+ && cmake --build out --target \
+    gtp_lua net_lua sip_lua sdp_lua sms_lua rtp_lua ipsec diam_lua json_lua
+
+
+FROM alpine:edge
+
+# Runtime deps of the modules: liblua5.1 (lua5.1 pulls lua5.1-libs) plus
+# libstdc++/libgcc for the SWIG C++ facades, libcrypto for Milenage and MD5,
+# and libbpf for the datapath.
+RUN apk add --no-cache lua5.1 libstdc++ libcrypto3 libbpf
+
+# /usr/lib/lua/5.1 is already on Lua's default package.cpath, so `require "gtp"`
+# resolves with no LUA_CPATH in the environment.
+COPY --from=build /src/out/bindings/lua/*.so /usr/lib/lua/5.1/
+COPY --from=build /src/bindings/examples/ /opt/
+
+WORKDIR /opt
+ENTRYPOINT ["lua"]
+CMD ["ims_test_s5.lua"]

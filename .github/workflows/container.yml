@@ -1,0 +1,23 @@
+name: container
+permissions: write-all
+on:
+  push:
+    branches:
+    - main
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v7
+    - name: Build
+      run: >
+        docker build -f Dockerfile
+        -t ghcr.io/${{ github.repository_owner }}/pro2call .
+    - name: Login
+      run: >
+        echo "${{ secrets.GITHUB_TOKEN }}"
+        | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+    - name: Publish
+      run: docker push ghcr.io/${{ github.repository_owner }}/pro2call

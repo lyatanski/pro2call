@@ -112,3 +112,28 @@ cmake --build build --target tidy          # clang-tidy over the whole tree
 
 Configuring with `-DENABLE_CLANG_TIDY=ON` additionally runs clang-tidy
 on every translation unit as it compiles.
+
+### Container
+
+`Dockerfile.test` packages `bindings/examples` — the IMS load generator
+(`ims_test_s5.lua`, `ims_test_gm.lua`) and the emulators that stand in for the
+network around whatever is under test — on top of the Lua modules, built from
+the working tree:
+
+```sh
+docker build -f Dockerfile.test -t ghcr.io/lyatanski/test \
+  --build-arg REVISION="$(git rev-parse HEAD)" .
+```
+
+`REVISION` is only stamped into `/opt/REVISION` so a run can say which tree it
+came from; the build itself takes the context as it is. The
+[ims](https://github.com/lyatanski/ims) stack runs the image as its `test`
+service and only references it, and `.github/workflows/image.yml` publishes it
+to `ghcr.io/<owner>/test` on every push to `main`.
+
+The root `Dockerfile` is a different image: `bld`, the toolchain with no source
+in it, for building this tree against a bind mount —
+
+```sh
+docker run --rm -v $PWD:/src -w /src bld sh -c 'cmake -B out -G Ninja && cmake --build out'
+```

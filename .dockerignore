@@ -1,0 +1,5 @@
+.git/
+# Build outputs.
+out/
+build/
+
