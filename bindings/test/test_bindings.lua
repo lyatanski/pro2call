@@ -7,7 +7,10 @@
 --   - value-type Sa/Policy fields round-trip through the proxy, keys and
 --     addresses included (binary strings survive the std::string bridge);
 --   - opening the socket works unprivileged, but an actual SA add is
---     rejected with a raised error unless the process has CAP_NET_ADMIN.
+--     rejected with a raised error unless the process has CAP_NET_ADMIN;
+--   - ipsec.Esp (the four IMS-AKA SAs of TS 33.203 §6.3 as one object)
+--     refuses a half-negotiated bundle before it touches the kernel, and
+--     with privilege installs and releases all eight of its objects.
 --
 -- Run: LUA_CPATH=<build>/bindings/lua/?.so lua test_bindings.lua
 
@@ -97,6 +100,48 @@ else
     local ok, err = pcall(function() x:sa_add(sa) end)
     check(not ok, "unprivileged sa_add raises")
     check(type(err) == "string" and err:find("sa_add"), "error names the operation")
+end
+
+-- Esp: the IMS-AKA SA set ---------------------------------------------
+-- The defaults are the ealg=null offer TS 33.203 §6.3 permits: integrity
+-- over IK, no cipher.
+local e = ipsec.Esp()
+check(e.auth_alg == "hmac(sha1)", "Esp defaults to HMAC-SHA-1 integrity")
+check(e.enc_alg == "ecb(cipher_null)" and e.enc_key == "", "and to ESP-NULL")
+
+-- A bundle missing half of the Security-Server is a caller bug, and is
+-- refused with the field named rather than as a kernel EINVAL on one of
+-- eight operations.
+e.ue, e.pcscf = "10.45.0.2", "10.10.0.20"
+e.port_uc, e.port_us = 5088, 5088
+e.spi_uc, e.spi_us = 0x2001, 0x2002
+e.auth_key = string.rep("\7", 20)
+local ok, err = pcall(function() return e:establish(x) end)
+check(not ok, "establish on a half-negotiated bundle raises")
+check(type(err) == "string" and err:find("P%-CSCF's protected ports"),
+      "and names the field that is unset")
+check(e:sa_count() == 0 and e:policy_count() == 0, "nothing was installed")
+
+e.port_pc, e.port_ps = 6100, 6101
+e.spi_pc, e.spi_ps = 0x3001, 0x3002
+if can_net_admin() then
+    check(e:establish(x) == 0, "privileged establish refuses nothing")
+    check(e:sa_count() == 4, "four SAs installed")
+    check(e:policy_count() == 4, "four policies installed")
+    check(e:error_count() == 0, "and no errors recorded")
+    e:release(x)
+    check(e:sa_count() == 0 and e:policy_count() == 0, "release empties both")
+else
+    -- Every one of the eight is refused, and each refusal names the SA or
+    -- the policy it belongs to (that is what the caller reports).
+    check(e:establish(x) == 8, "unprivileged establish reports 8 refusals")
+    check(e:error_count() == 8, "one recorded message each")
+    check(e:error_at(0):find("SA %(spi 0x3002%)"), "SA1 named by its SPI")
+    check(e:error_at(4):find("policy %(out 10%.45%.0%.2:5088"),
+          "and the policy by its selector")
+    check(not pcall(function() return e:error_at(8) end), "error_at range checked")
+    check(e:sa_count() == 0, "nothing the kernel refused is remembered")
+    e:release(x)    -- a no-op, and must not raise
 end
 
 print(string.format("\n%d checks, %d failed", tests, failed))

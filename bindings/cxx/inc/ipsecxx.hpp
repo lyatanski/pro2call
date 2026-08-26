@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 #include "xfrm.h"
 
@@ -204,6 +205,92 @@ class Xfrm
 
   private:
     xfrm_sock s_;
+};
+
+/* ---- the IMS-AKA security associations (TS 33.203 §6.3, Annex I) ----
+ *
+ * The four transport-mode ESP SAs a UE and its P-CSCF share once the AKA
+ * challenge is answered, and the four policies that steer traffic onto
+ * them — raised in one call from what the RFC 3329 Security-Client /
+ * Security-Server exchange settled on, and taken down in another. This
+ * is the reason AKA lives in this module: the keys the challenge yields
+ * become these SAs.
+ *
+ * The four are TS 33.203 §6.3's, each unidirectional and named for the
+ * SPI that protects it — the RECEIVER's, which the receiver chose:
+ *
+ *   SA1  UE:port_uc     -> P-CSCF:port_ps   spi_ps  (REGISTER and every
+ *                                                    other MO request)
+ *   SA2  P-CSCF:port_pc -> UE:port_us       spi_us  (MT requests)
+ *   SA3  P-CSCF:port_ps -> UE:port_uc       spi_uc  (their responses)
+ *   SA4  UE:port_us     -> P-CSCF:port_pc   spi_pc
+ *
+ * IK integrity-protects. Encryption with CK is OPTIONAL (§6.3 mandates
+ * integrity only), so the defaults are ESP-NULL with HMAC-SHA-1 over IK,
+ * which is what an ealg=null offer negotiates; set enc_alg/enc_key to
+ * run a cipher instead. The selector protocol is UDP — the protected SIP
+ * these SAs carry.
+ *
+ * Each SA's SPI doubles as its reqid, so the policy that must use a
+ * given SA names it unambiguously even when every subscriber shares one
+ * UE address. What went in is remembered here, so release() deletes
+ * exactly that and nothing else — flushing the tables instead would take
+ * out any other IPsec state in the namespace. */
+class Esp
+{
+  public:
+    /* The endpoints and what the two Security- headers settled on. The
+     * suffixes are TS 33.203's: _uc/_us the UE's protected client and
+     * server port, _pc/_ps the P-CSCF's; spi_uc/spi_us are the SPIs the
+     * UE offered (they protect traffic INTO the UE), spi_pc/spi_ps the
+     * ones the P-CSCF answered with. A UE that advertises one port in
+     * both roles sets port_uc and port_us to it. */
+    std::string ue;
+    std::string pcscf;
+    uint16_t    port_uc = 0;
+    uint16_t    port_us = 0;
+    uint16_t    port_pc = 0;
+    uint16_t    port_ps = 0;
+    uint32_t    spi_uc  = 0;
+    uint32_t    spi_us  = 0;
+    uint32_t    spi_pc  = 0;
+    uint32_t    spi_ps  = 0;
+
+    /* Algorithms as the kernel names them, keys as raw bytes. */
+    std::string auth_alg = "hmac(sha1)";      /* mandatory (IK)        */
+    std::string auth_key;                     /* IK                    */
+    std::string enc_alg = "ecb(cipher_null)"; /* ealg=null by default  */
+    std::string enc_key;                      /* CK, with a cipher     */
+
+    /* Install the four SAs and the four policies, remembering what the
+     * kernel accepted, and return how many of the eight operations it
+     * refused. A refusal is reported rather than thrown because the
+     * caller has a better answer for one than an aborted run: a
+     * "protected" REGISTER that leaves in the clear is discarded by the
+     * P-CSCF, so the report should name the missing CAP_NET_ADMIN rather
+     * than a plain registration failure. error_at() has the details, and
+     * release() still removes whatever did go in.
+     *
+     * Throws Error(XFRM_E_INVAL), before touching the kernel, when the
+     * bundle is not fully negotiated — an address, a port, an SPI or the
+     * integrity key left unset is a caller bug, not a refusal. */
+    int establish(Xfrm& x);
+
+    /* Delete exactly what establish() installed, policies first so that
+     * nothing is steered at an SA that is already gone. Never throws:
+     * teardown runs when the run is over and a refusal here leaves
+     * nothing a caller could do about it. */
+    void release(Xfrm& x);
+
+    int         sa_count() const; /* installed and not yet released      */
+    int         policy_count() const;
+    int         error_count() const;   /* refusals from the last establish()  */
+    std::string error_at(int i) const; /* throws on range            */
+
+  private:
+    std::vector<SaId>        sas_;
+    std::vector<PolicyId>    pols_;
+    std::vector<std::string> errs_;
 };
 
 } /* namespace ipsec */

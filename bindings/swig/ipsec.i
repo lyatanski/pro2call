@@ -22,6 +22,27 @@
  *
  * Keys and addresses are ordinary Lua strings; a key is the raw bytes,
  * so build it however you like (string.char, a literal, a file read).
+ *
+ * The four SAs of an IMS-AKA registration (TS 33.203 §6.3) are one
+ * object rather than eight calls, because they are negotiated, raised
+ * and torn down together:
+ *
+ *   local e = ipsec.Esp()
+ *   e.ue,      e.pcscf  = "10.45.0.2", "10.10.0.20"
+ *   e.port_uc, e.port_us = 5088, 5088       -- the UE's protected ports
+ *   e.spi_uc,  e.spi_us  = 0x2001, 0x2002   -- and its inbound SPIs
+ *   e.port_pc, e.port_ps = 6100, 6101       -- from the Security-Server
+ *   e.spi_pc,  e.spi_ps  = 0x3001, 0x3002
+ *   e.auth_key = ik                     -- ealg=null, so CK goes unused
+ *
+ *   local refused = e:establish(x)       -- 0 = all four SAs + policies in
+ *   for i = 0, e:error_count() - 1 do print(e:error_at(i)) end
+ *   e:release(x)                         -- deletes exactly what went in
+ *
+ * Iteration is a count()/at(i) pair rather than a wrapped vector: SWIG's
+ * Lua runtime keys wrapped types in a registry SHARED by every module in
+ * one lua_State, so a %template here would fight with another module's
+ * over the same C++ type.
  */
 
 %module ipsec

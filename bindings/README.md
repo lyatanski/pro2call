@@ -338,7 +338,15 @@ The `ipsec` module (same pattern over [`netlink/xfrm/`](../netlink/xfrm))
 is described in `swig/ipsec.i`: `ipsec.Xfrm` for SAs and policies, plus the
 IMS-AKA primitives its ESP keys come from — `ipsec.aka_opc`,
 `ipsec.aka_milenage` and `ipsec.aka_verify` (Milenage, TS 35.206) and
-`ipsec.md5` (for the HTTP Digest AKAv1-MD5 response).
+`ipsec.md5` (for the HTTP Digest AKAv1-MD5 response). One level up from
+the individual SA, `ipsec.Esp` is the whole security association set of
+an IMS-AKA registration (TS 33.203 §6.3): filled in from the
+Security-Client offer and the 401's Security-Server, `establish()`
+installs its four transport-mode ESP SAs and the four policies that steer
+traffic onto them and reports how many operations the kernel refused
+(`error_at(i)` says which and why), and `release()` deletes exactly what
+went in — not a table flush, which would take out any other IPsec state
+in the namespace.
 
 ## Lua: sms
 
@@ -802,6 +810,23 @@ All in Lua; run each with `LUA_CPATH=<build>/bindings/lua/?.so lua …`.
   de-REGISTERs (so the P-CSCF reaps the ESP SAs) and sends a Delete Session
   per PDN connection. Needs `CAP_NET_ADMIN` for the SAs and the
   UE-addressed sockets, plus `CAP_BPF` for the datapath.
+- [`examples/ims/`](examples/ims) — what those two share, one concern per
+  file, `require`d as `ims.<name>` from either script: `cfg` (the
+  environment — PLMN, realm, IMSI range, USIM keys, timers, the
+  per-subscriber port/SPI layout), `ue` (one subscriber: identities,
+  protected ports, SPIs, and the `sip.Registration` /
+  `sip.AuthChallenge` / `sip.Transaction` trio that drives it),
+  `register` (the REGISTER and the IMS-AKA credentials), `regflow` (the
+  exchange itself: REGISTER → 401 → the `ipsec.Esp` SAs → protected
+  REGISTER → 200 OK, and the `Expires: 0` release), `sipio` (the UE
+  socket — send, drain, count, and the preloaded `Route` an originating
+  request needs), `wire` (the shared `sip.Builder` and the header readers
+  the codec leaves as text), `reg_event` / `call_phase` / `sms_phase` (a
+  phase each, with its own knobs, flow and report), `log` and `stats`.
+  Each module's header explains what it does and why it does it that way,
+  so the two entry scripts are left with what is actually particular to
+  their access: a named P-CSCF and a host address for Gm, GTP-C plus the
+  eBPF datapath, the PAA route and the tunnel MTU for S5/S8.
 
 ## Extending
 
