@@ -152,6 +152,17 @@ function M.new(o)
                 :format(cfg.hex(keys.sqn), cfg.hex(keys.res)))
         end
 
+        -- After the verification, so an abandoned registration is one this UE
+        -- could have completed: a challenge it cannot answer is a different
+        -- failure, and reported as one above.
+        if cfg.abandon then
+            sub.abandoned = true
+            sub.stage = "abandoned"
+            log.slog(sub, "result", "abandoned at the 401 (IMS_ABANDON=1): " ..
+                                    "no SAs raised, no protected REGISTER")
+            return o.on_terminal(sub)
+        end
+
         sub.cseq = sub.cseq + 1
         sub.authz = register.digest(sub, ch, keys)   -- kept for the Expires:0 de-REGISTER
 

@@ -108,6 +108,16 @@ M.sip_t_ms   = num("SIP_T_MS", 5000)     -- response deadline per REGISTER step
 M.auth_cap   = 2                         -- give up after this many 401s
 M.expires    = num("IMS_EXPIRES", 600000)  -- ~7 days
 M.dereg      = flag("IMS_DEREG", true)
+-- IMS_ABANDON=1 walks away at the 401: the challenge is read and verified,
+-- and then nothing — no SAs on this side, no protected REGISTER. It is what
+-- the network sees of a UE that lost coverage, crashed or rebooted mid-
+-- registration, and the one case where the P-CSCF is left holding state for a
+-- registration that never completes: the pending contact save_pending() wrote
+-- at the first REGISTER, and the IPsec tunnel ipsec_create() built for it at
+-- the 401. Only its own expiry is meant to remove them. The run then succeeds
+-- when every subscriber was challenged and abandoned, and fails when any was
+-- not challenged at all — nothing to abandon is not the case being tested.
+M.abandon    = flag("IMS_ABANDON", false)
 
 -- IMS_IPSEC=1 (the default) treats a 401 without a Security-Server as a
 -- failure: these tests exist to exercise IMS-AKA *with* IPsec, and a P-CSCF
@@ -123,8 +133,8 @@ M.require_ipsec = flag("IMS_IPSEC", true)
 -- client/server ports and its two inbound ESP SPIs. A script that has more
 -- per-subscriber resources to lay out (S5/S8-U TEIDs, RTP ports) uses the same
 -- index with its own stride.
-M.port_uc_base, M.port_us_base = 5088, 5090
-M.spi_base = 0x2001
+M.port_uc_base, M.port_us_base = 5060, 5090
+M.spi_base = 0x100
 
 M.IPPROTO_UDP = 17    -- unprotected REGISTER, and the ESP policies' inner selector
 M.IPPROTO_ESP = 50    -- protected traffic (IMS-AKA IPsec, TS 33.203)

@@ -9,6 +9,18 @@
 #include <bpf/bpf.h>
 #include <bpf/libbpf.h>
 
+/* DECLARE_LIBBPF_OPTS is libbpf's own macro; its zero-init idiom uses a GNU
+ * statement expression we have no control over. */
+#ifdef __clang__
+#define GTPU_LIBBPF_OPTS(...)                                                \
+    _Pragma("clang diagnostic push")                                         \
+    _Pragma(                                                                 \
+        "clang diagnostic ignored \"-Wgnu-statement-expression-from-macro-expansion\"") \
+    DECLARE_LIBBPF_OPTS(__VA_ARGS__) _Pragma("clang diagnostic pop")
+#else
+#define GTPU_LIBBPF_OPTS(...) DECLARE_LIBBPF_OPTS(__VA_ARGS__)
+#endif
+
 /* Datapath tests: crafted frames through the TC programs via
  * BPF_PROG_TEST_RUN (§13.7 baseline correctness). Needs CAP_BPF +
  * CAP_NET_ADMIN; every test skips cleanly without them (§13.2
@@ -185,9 +197,9 @@ static size_t gpdu4(uint8_t* p, uint8_t msg_type, uint32_t teid, int with_ext,
 static int run_prog(int fd, const uint8_t* in, size_t in_len, uint8_t* out,
                     size_t* out_len, uint32_t* retval)
 {
-    DECLARE_LIBBPF_OPTS(bpf_test_run_opts, o, .data_in = in,
-                        .data_size_in = (uint32_t)in_len, .data_out = out,
-                        .data_size_out = out ? 4096 : 0);
+    GTPU_LIBBPF_OPTS(bpf_test_run_opts, o, .data_in = in,
+                     .data_size_in = (uint32_t)in_len, .data_out = out,
+                     .data_size_out = out ? 4096 : 0);
     int rc = bpf_prog_test_run_opts(fd, &o);
     if (rc) return rc;
     if (out_len) *out_len = o.data_size_out;

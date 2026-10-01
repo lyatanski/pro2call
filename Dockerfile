@@ -9,9 +9,8 @@ FROM alpine:edge AS build
 #   linux-headers                    kernel UAPI headers for the BPF object
 #   swig lua5.1-dev                  the Lua bindings the scripts are written in
 #
-# Without clang/bpftool/libbpf gtp/u still builds, with the datapath stubbed
-# out (GTPU_EBPF_DISABLED) — and then nothing decapsulates the downlink, so
-# they are not optional here.
+# Without clang/bpftool/libbpf the gtp/u configure step fails outright
+# (BpfCompile.cmake's check_bpf_toolchain), so they are not optional here.
 RUN apk add --no-cache \
     build-base \
     cmake \
@@ -28,6 +27,13 @@ RUN apk add --no-cache \
 
 ENV GOPATH=/tmp/go
 ENV GOCACHE=/tmp/go/cache
+
+# go depends on gcc/binutils/musl-dev (its own apk dependency, pulled in
+# regardless of what we ask for), so gcc ends up installed either way. Pin
+# the compiler to clang explicitly rather than letting cmake's default
+# search pick up gcc's `cc`.
+ENV CC=clang
+ENV CXX=clang++
 
 WORKDIR /src
 COPY . .

@@ -8,106 +8,6 @@
 #include <string.h>
 #include <sys/socket.h>
 
-/* Built without the BPF toolchain: keep the API linkable, report the
- * datapath unsupported and let callers use the userspace path (§13.2). */
-#ifdef GTPU_EBPF_DISABLED
-
-bool gtpu_ebpf_supported(void)
-{
-    return false;
-}
-
-int gtpu_ebpf_open(gtpu_ebpf_t** out, const gtpu_ebpf_cfg_t* cfg)
-{
-    (void)cfg;
-    if (out) *out = NULL;
-    MESG_WARN("gtpu: %s", "built without eBPF support, using userspace path");
-    return GTPU_E_UNSUPPORTED;
-}
-
-int gtpu_ebpf_attach(gtpu_ebpf_t* g, uint32_t rx, uint32_t tx)
-{
-    (void)g;
-    (void)rx;
-    (void)tx;
-    return GTPU_E_UNSUPPORTED;
-}
-int gtpu_ebpf_detach(gtpu_ebpf_t* g)
-{
-    (void)g;
-    return GTPU_E_UNSUPPORTED;
-}
-void gtpu_ebpf_close(gtpu_ebpf_t* g)
-{
-    (void)g;
-}
-
-int gtpu_teid_add(gtpu_ebpf_t* g, const gtpu_tunnel_t* t)
-{
-    (void)g;
-    (void)t;
-    return GTPU_E_UNSUPPORTED;
-}
-int gtpu_teid_update(gtpu_ebpf_t* g, const gtpu_tunnel_t* t)
-{
-    (void)g;
-    (void)t;
-    return GTPU_E_UNSUPPORTED;
-}
-int gtpu_teid_del(gtpu_ebpf_t* g, const gtpu_tunnel_t* t)
-{
-    (void)g;
-    (void)t;
-    return GTPU_E_UNSUPPORTED;
-}
-int gtpu_tft_add(gtpu_ebpf_t* g, const gtpu_tft_t* f)
-{
-    (void)g;
-    (void)f;
-    return GTPU_E_UNSUPPORTED;
-}
-int gtpu_tft_del(gtpu_ebpf_t* g, const gtpu_tft_t* f)
-{
-    (void)g;
-    (void)f;
-    return GTPU_E_UNSUPPORTED;
-}
-
-int gtpu_stats_read(gtpu_ebpf_t* g, uint32_t teid, struct gtpu_stats* out)
-{
-    (void)g;
-    (void)teid;
-    (void)out;
-    return GTPU_E_UNSUPPORTED;
-}
-int gtpu_events_poll(gtpu_ebpf_t* g, int t, gtpu_event_cb_t cb, void* ctx)
-{
-    (void)g;
-    (void)t;
-    (void)cb;
-    (void)ctx;
-    return GTPU_E_UNSUPPORTED;
-}
-int gtpu_events_fd(gtpu_ebpf_t* g)
-{
-    (void)g;
-    return GTPU_E_UNSUPPORTED;
-}
-int gtpu_ebpf_prog_fd(gtpu_ebpf_t* g, gtpu_prog_id_t p)
-{
-    (void)g;
-    (void)p;
-    return GTPU_E_UNSUPPORTED;
-}
-int gtpu_ebpf_map_fd(gtpu_ebpf_t* g, gtpu_map_id_t m)
-{
-    (void)g;
-    (void)m;
-    return GTPU_E_UNSUPPORTED;
-}
-
-#else /* eBPF build */
-
 #include <pthread.h>
 #include <stdio.h>
 #include <sys/stat.h>
@@ -118,7 +18,28 @@ int gtpu_ebpf_map_fd(gtpu_ebpf_t* g, gtpu_map_id_t m)
 #include <bpf/bpf.h>
 #include <bpf/libbpf.h>
 
+/* DECLARE_LIBBPF_OPTS is libbpf's own macro; its zero-init idiom uses a GNU
+ * statement expression we have no control over. */
+#ifdef __clang__
+#define GTPU_LIBBPF_OPTS(...)                                                \
+    _Pragma("clang diagnostic push")                                         \
+    _Pragma(                                                                 \
+        "clang diagnostic ignored \"-Wgnu-statement-expression-from-macro-expansion\"") \
+    DECLARE_LIBBPF_OPTS(__VA_ARGS__) _Pragma("clang diagnostic pop")
+#else
+#define GTPU_LIBBPF_OPTS(...) DECLARE_LIBBPF_OPTS(__VA_ARGS__)
+#endif
+
+/* The generated skeleton embeds the BPF object as one giant string literal,
+ * well past the 4095 chars ISO C99 guarantees support for. */
+#ifdef __clang__
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Woverlength-strings"
+#endif
 #include "gtpu_kern.skel.h"
+#ifdef __clang__
+#pragma clang diagnostic pop
+#endif
 
 #ifndef CAP_BPF
 #define CAP_BPF 39
@@ -269,8 +190,8 @@ static int tc_attach_one(uint32_t ifindex, enum bpf_tc_attach_point ap,
                          struct bpf_program* prog, const char* what,
                          uint32_t* handle, uint32_t* priority)
 {
-    DECLARE_LIBBPF_OPTS(bpf_tc_hook, hook, .ifindex = (int)ifindex,
-                        .attach_point = ap);
+    GTPU_LIBBPF_OPTS(bpf_tc_hook, hook, .ifindex = (int)ifindex,
+                     .attach_point = ap);
     int rc = bpf_tc_hook_create(&hook);
     if (rc && rc != -EEXIST) {
         MESG_FAIL("gtpu: clsact create on ifindex %u failed: %s", ifindex,
@@ -278,7 +199,7 @@ static int tc_attach_one(uint32_t ifindex, enum bpf_tc_attach_point ap,
         return err_sys(rc);
     }
 
-    DECLARE_LIBBPF_OPTS(bpf_tc_opts, opts, .prog_fd = bpf_program__fd(prog));
+    GTPU_LIBBPF_OPTS(bpf_tc_opts, opts, .prog_fd = bpf_program__fd(prog));
     rc = bpf_tc_attach(&hook, &opts);
     if (rc) {
         MESG_FAIL("gtpu: %s attach on ifindex %u failed: %s", what, ifindex,
@@ -296,10 +217,10 @@ static int tc_attach_one(uint32_t ifindex, enum bpf_tc_attach_point ap,
 static void tc_detach_one(uint32_t ifindex, enum bpf_tc_attach_point ap,
                           uint32_t handle, uint32_t priority)
 {
-    DECLARE_LIBBPF_OPTS(bpf_tc_hook, hook, .ifindex = (int)ifindex,
-                        .attach_point = ap);
-    DECLARE_LIBBPF_OPTS(bpf_tc_opts, opts, .handle = handle,
-                        .priority = priority);
+    GTPU_LIBBPF_OPTS(bpf_tc_hook, hook, .ifindex = (int)ifindex,
+                     .attach_point = ap);
+    GTPU_LIBBPF_OPTS(bpf_tc_opts, opts, .handle = handle,
+                     .priority = priority);
     int rc = bpf_tc_detach(&hook, &opts);
     if (rc)
         MESG_WARN("gtpu: detach on ifindex %u failed: %s", ifindex,
@@ -663,5 +584,3 @@ int gtpu_ebpf_map_fd(gtpu_ebpf_t* g, gtpu_map_id_t id)
     }
     return GTPU_E_INVAL;
 }
-
-#endif /* GTPU_EBPF_DISABLED */

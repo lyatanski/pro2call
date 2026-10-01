@@ -13,7 +13,7 @@ void mesg_set_level(int level)
     mesg_level = level;
 }
 
-int mesg_get_level()
+int mesg_get_level(void)
 {
     return mesg_level;
 }
@@ -23,7 +23,7 @@ void mesg_set_data(const void* arg_data)
     mesg_data = arg_data;
 }
 
-const void* mesg_get_data()
+const void* mesg_get_data(void)
 {
     return mesg_data;
 }
@@ -33,7 +33,7 @@ void mesg_set_dbug_cb(mesg_f cb)
     mesg_dbug_cb = cb;
 }
 
-mesg_f mesg_get_dbug_cb()
+mesg_f mesg_get_dbug_cb(void)
 {
     return mesg_dbug_cb;
 }
@@ -43,7 +43,7 @@ void mesg_set_info_cb(mesg_f cb)
     mesg_info_cb = cb;
 }
 
-mesg_f mesg_get_info_cb()
+mesg_f mesg_get_info_cb(void)
 {
     return mesg_info_cb;
 }
@@ -53,7 +53,7 @@ void mesg_set_warn_cb(mesg_f cb)
     mesg_warn_cb = cb;
 }
 
-mesg_f mesg_get_warn_cb()
+mesg_f mesg_get_warn_cb(void)
 {
     return mesg_warn_cb;
 }
@@ -63,7 +63,7 @@ void mesg_set_fail_cb(mesg_f cb)
     mesg_fail_cb = cb;
 }
 
-mesg_f mesg_get_fail_cb()
+mesg_f mesg_get_fail_cb(void)
 {
     return mesg_fail_cb;
 }
@@ -73,7 +73,7 @@ void mesg_set_dead_cb(mesg_f cb)
     mesg_dead_cb = cb;
 }
 
-mesg_f mesg_get_dead_cb()
+mesg_f mesg_get_dead_cb(void)
 {
     return mesg_dead_cb;
 }

@@ -5,7 +5,11 @@
 -- and the even one terminates (MT). Both ends of a pair live in this process on
 -- the same net.Loop and the same monotonic clock, which is what makes the
 -- setup-time decomposition possible with no clock synchronisation at all: t2-t0
--- is a true one-way core latency, not half a round trip. Per leg the flow is
+-- is a true one-way core latency, not half a round trip. Unless CALL_REVERSE=0,
+-- a second series follows the first, the same structural pairs with MO and MT
+-- swapped (the callee of the first series originates the second), after a
+-- CALL_REVERSE_SLEEP_MS gap — so the callee's own origination is exercised too,
+-- at no extra provisioning cost. Per leg the flow is
 --
 --   MO --INVITE (Route: orig, SDP offer)--> P-CSCF -> S-CSCF -> ... -> MT
 --   MT --180 Ringing--> ... --> MO,  then after CALL_ANSWER_MS a 200 OK with
@@ -79,6 +83,14 @@ M.hold_ms   = cfg.num("CALL_HOLD_MS", 2000)    -- talk time
 M.t_ms      = cfg.num("CALL_T_MS", 10000)      -- per-step deadline
 -- How many calls carry RTP. A small sample by default; -1 = all of them.
 M.media     = cfg.num("CALL_MEDIA", 1)
+-- A second series after the first, the same structural pairs read backwards
+-- (MO<->MT swapped), so the callee's own origination is measured too. On by
+-- default; CALL_REVERSE=0 keeps the single, one-directional series.
+M.reverse   = cfg.flag("CALL_REVERSE", true)
+-- The gap before that second series: lets the first series' BYEs and RTCP
+-- BYEs (fire-and-forget from here) reach the P-CSCF and rtpengine before the
+-- same UEs originate again.
+M.reverse_sleep_ms = cfg.num("CALL_REVERSE_SLEEP_MS", 1000)
 -- Which bearer carries media: "auto" uses the dedicated bearer once the Create
 -- Bearer Request brings one (re-homing if it arrives after the answer),
 -- "default" keeps media on the default bearer — worth having, because a UPF
@@ -179,7 +191,11 @@ function M.new(ctx)
     }
     P.stats = st
 
-    local function media_port(sub) return MEDIA.port_base + sub.idx * 4 end
+    -- gen tells the reversed series' streams apart from the first series':
+    -- same subscriber, same idx, but the first series' Stream is still open
+    -- (P.collect() reads it after the whole run stops, so nothing closes it
+    -- early) -- so the second series needs its own, non-overlapping block.
+    local function media_port(sub, gen) return MEDIA.port_base + (gen or 0) * cfg.nsubs * 4 + sub.idx * 4 end
 
     -- ---- the downlink size budget ------------------------------------------
     --
@@ -293,7 +309,7 @@ function M.new(ctx)
     -- IP_TRANSPARENT), like the SIP socket: the RTP that leaves must carry the
     -- address the SDP advertises, or the UPF drops it as spoofed.
     local function open_media(c, sub, role)
-        local port = media_port(sub)
+        local port = media_port(sub, c.gen)
         local ok, s = pcall(rtp.Stream, loop, sub.ue_addr, port, true)
         if not ok then
             log.slog(sub, "media session", ("cannot bind %s:%d: %s")
@@ -415,9 +431,9 @@ function M.new(ctx)
     -- on the downlink size budget above. Uniqueness is still guaranteed — the
     -- call index is unique within the run and the UE address within the pool, and
     -- every message of the call carries both.
-    local function make_call(n, mo, mt, with_media)
+    local function make_call(n, mo, mt, with_media, gen)
         local c = {
-            n = n, mo = mo, mt = mt, media = with_media, cseq = 1,
+            n = n, mo = mo, mt = mt, media = with_media, gen = gen or 0, cseq = 1,
             call_id  = ("c%d@%s"):format(n, mo.ue_addr),
             from_tag = ("o%d"):format(n),
             to_tag   = ("t%d"):format(n),
@@ -553,7 +569,7 @@ function M.new(ctx)
     local function send_answer(c)
         if c.done or not c.mt_req then return end
         local mt = c.mt
-        local body = sdp.offer{ addr = mt.ue_addr, port = media_port(mt),
+        local body = sdp.offer{ addr = mt.ue_addr, port = media_port(mt, c.gen),
                                 pt = c.mt_pt or MEDIA.pt,
                                 codec = c.mt_codec or MEDIA.codec,
                                 rate = c.mt_rate or MEDIA.rate,
@@ -702,8 +718,91 @@ function M.new(ctx)
         call_fail(c, ("%d %s"):format(m.status, m.reason), m.status)
     end
 
+    -- One series: `series_list`'s (mo, mt) pairs, numbered from base_n + i so
+    -- Call-ID/branch/tags stay unique across both series sharing the one
+    -- `calls`/`by_callid` table, and tagged with `gen` (0 first series, 1
+    -- reversed) so their media lands on a distinct port block (see
+    -- media_port) — the first series' sockets are still open, held by `calls`
+    -- for P.collect() to read once the whole run stops. Everything else about
+    -- a series is identical; `label`, or nil, only decorates its banner.
+    local function run_series(series_list, base_n, gen, label, spacing, series_done)
+        finished = series_done
+        local tag = label and (" (" .. label .. ")") or ""
+        log.banner(("Calls%s — %d of %d eligible pair(s) (%d structural), %d carrying RTP%s")
+            :format(tag, #series_list, st.eligible, st.pairs_total, st.media_calls,
+                    M.cps > 0 and (" at %.1f call/s"):format(M.cps) or " in one burst"))
+        -- What is actually dialled, spelled out: a run that fails because the HSS
+        -- profile carries no such identity is otherwise indistinguishable from a
+        -- routing fault, and this is the line that tells them apart.
+        log.line("dialled address", ("%s   (CALL_URI=%s%s)"):format(
+            series_list[1].mt.dial, cfg.dial_uri,
+            cfg.dial_uri == "sip" and "" or ", needs the number in the HSS profile"))
+
+        pending = #series_list
+        -- Overall deadline so a lost 200 OK cannot hang the run.
+        guard = loop:after(spacing * #series_list + M.t_ms + M.hold_ms + 5000, function()
+            guard = nil
+            for _, c in ipairs(calls) do
+                if not c.done then call_fail(c, "call phase deadline", nil) end
+            end
+            if pending > 0 then pending = 0; series_done() end
+        end)
+
+        for i, p in ipairs(series_list) do
+            local n = base_n + i
+            local c = make_call(n, p.mo, p.mt, i <= st.media_calls, gen)
+            calls[n] = c
+            by_callid[c.call_id] = c
+            p.mo.call, p.mt.call = c, c
+            -- The P-CSCF hands out protected port pairs from a pool sized by
+            -- ims_ipsec_pcscf's ipsec_max_connections (default 2), and shares them
+            -- between UEs once it runs out — the pairs even overlap ((5062,5063)
+            -- then (5063,5064)). When the MO's protected SERVER port is also the
+            -- MT's protected CLIENT port, this P-CSCF sends the terminating INVITE
+            -- from the wrong pair: it matches no ESP policy for the callee, so it
+            -- leaves unprotected (or not at all) and the callee never rings. Flag
+            -- it up front, so the failure is attributed to a stack that is
+            -- under-provisioned for concurrent UEs rather than looking like a core
+            -- routing bug.
+            if p.mo.ch and p.mt.ch and p.mo.ch.p_port_s
+               and p.mo.ch.p_port_s == p.mt.ch.p_port_c then
+                c.port_clash = true
+                st.port_clash = (st.port_clash or 0) + 1
+                log.slog(p.mo, "protected ports",
+                    ("call %d shares P-CSCF port %d (MO server = MT client); raise ipsec_max_connections")
+                    :format(n, p.mo.ch.p_port_s))
+            end
+            local function fire()
+                if c.media then
+                    c.sess_mo, c.mstat_mo = open_media(c, p.mo, "mo")
+                    c.sess_mt, c.mstat_mt = open_media(c, p.mt, "mt")
+                    c.media = (c.sess_mo ~= nil) and (c.sess_mt ~= nil)
+                end
+                c.offer = sdp.offer{ addr = p.mo.ue_addr, port = media_port(p.mo, gen),
+                                     pt = MEDIA.pt, codec = MEDIA.codec,
+                                     rate = MEDIA.rate, ptime = MEDIA.ptime_ms }
+                local w = build_invite(c)
+                feed_ev(c.txn_mo, sip.TE_SEND_REQUEST)
+                c.t.t0 = now()
+                st.first_invite = st.first_invite or c.t.t0
+                st.attempted = st.attempted + 1
+                if io_.send(p.mo, "mo", w, ("INVITE (call %d -> %s)"):format(n, c.callee)) then
+                    -- The message names what did arrive, so "the core never
+                    -- answered" and "the core answered but the callee never rang"
+                    -- are not reported as the same failure.
+                    carm(c, M.t_ms, function()
+                        call_fail(c, c.t.t1 and "no ringing after 100 Trying"
+                                            or  "no response to the INVITE")
+                    end)
+                else
+                    call_fail(c, "INVITE send failed", nil)
+                end
+            end
+            if spacing > 0 then loop:after((i - 1) * spacing, fire) else fire() end
+        end
+    end
+
     function P.begin(done)
-        finished = done
         -- Structural pairs: 1<->2, 3<->4, ... A pair is eligible only when BOTH
         -- ends registered, and the denominator stays the structural count —
         -- silently shrinking it would turn a registration failure into a perfect
@@ -727,80 +826,19 @@ function M.new(ctx)
             return done()
         end
 
-        local nmedia = M.media < 0 and #list or math.min(M.media, #list)
-        st.media_calls = nmedia
-        log.banner(("Calls — %d of %d eligible pair(s) (%d structural), %d carrying RTP%s")
-            :format(#list, st.eligible, st.pairs_total, nmedia,
-                    M.cps > 0 and (" at %.1f call/s"):format(M.cps) or " in one burst"))
-        -- What is actually dialled, spelled out: a run that fails because the HSS
-        -- profile carries no such identity is otherwise indistinguishable from a
-        -- routing fault, and this is the line that tells them apart.
-        log.line("dialled address", ("%s   (CALL_URI=%s%s)"):format(
-            list[1].mt.dial, cfg.dial_uri,
-            cfg.dial_uri == "sip" and "" or ", needs the number in the HSS profile"))
-
-        pending = #list
+        st.media_calls = M.media < 0 and #list or math.min(M.media, #list)
         local spacing = M.cps > 0 and math.floor(1000 / M.cps) or 0
-        -- Overall deadline so a lost 200 OK cannot hang the run.
-        guard = loop:after(spacing * #list + M.t_ms + M.hold_ms + 5000, function()
-            guard = nil
-            for _, c in ipairs(calls) do
-                if not c.done then call_fail(c, "call phase deadline", nil) end
-            end
-            if pending > 0 then pending = 0; done() end
-        end)
 
-        for i, p in ipairs(list) do
-            local c = make_call(i, p.mo, p.mt, i <= nmedia)
-            calls[i] = c
-            by_callid[c.call_id] = c
-            p.mo.call, p.mt.call = c, c
-            -- The P-CSCF hands out protected port pairs from a pool sized by
-            -- ims_ipsec_pcscf's ipsec_max_connections (default 2), and shares them
-            -- between UEs once it runs out — the pairs even overlap ((5062,5063)
-            -- then (5063,5064)). When the MO's protected SERVER port is also the
-            -- MT's protected CLIENT port, this P-CSCF sends the terminating INVITE
-            -- from the wrong pair: it matches no ESP policy for the callee, so it
-            -- leaves unprotected (or not at all) and the callee never rings. Flag
-            -- it up front, so the failure is attributed to a stack that is
-            -- under-provisioned for concurrent UEs rather than looking like a core
-            -- routing bug.
-            if p.mo.ch and p.mt.ch and p.mo.ch.p_port_s
-               and p.mo.ch.p_port_s == p.mt.ch.p_port_c then
-                c.port_clash = true
-                st.port_clash = (st.port_clash or 0) + 1
-                log.slog(p.mo, "protected ports",
-                    ("call %d shares P-CSCF port %d (MO server = MT client); raise ipsec_max_connections")
-                    :format(i, p.mo.ch.p_port_s))
-            end
-            local function fire()
-                if c.media then
-                    c.sess_mo, c.mstat_mo = open_media(c, p.mo, "mo")
-                    c.sess_mt, c.mstat_mt = open_media(c, p.mt, "mt")
-                    c.media = (c.sess_mo ~= nil) and (c.sess_mt ~= nil)
-                end
-                c.offer = sdp.offer{ addr = p.mo.ue_addr, port = media_port(p.mo),
-                                     pt = MEDIA.pt, codec = MEDIA.codec,
-                                     rate = MEDIA.rate, ptime = MEDIA.ptime_ms }
-                local w = build_invite(c)
-                feed_ev(c.txn_mo, sip.TE_SEND_REQUEST)
-                c.t.t0 = now()
-                st.first_invite = st.first_invite or c.t.t0
-                st.attempted = st.attempted + 1
-                if io_.send(p.mo, "mo", w, ("INVITE (call %d -> %s)"):format(i, c.callee)) then
-                    -- The message names what did arrive, so "the core never
-                    -- answered" and "the core answered but the callee never rang"
-                    -- are not reported as the same failure.
-                    carm(c, M.t_ms, function()
-                        call_fail(c, c.t.t1 and "no ringing after 100 Trying"
-                                            or  "no response to the INVITE")
-                    end)
-                else
-                    call_fail(c, "INVITE send failed", nil)
-                end
-            end
-            if spacing > 0 then loop:after((i - 1) * spacing, fire) else fire() end
-        end
+        run_series(list, 0, 0, M.reverse and "originating series" or nil, spacing, function()
+            if not M.reverse then return done() end
+            -- The same structural pairs, MO and MT swapped: whoever was called
+            -- in the first series originates the second.
+            local rlist = {}
+            for _, p in ipairs(list) do rlist[#rlist + 1] = { mo = p.mt, mt = p.mo } end
+            loop:after(M.reverse_sleep_ms, function()
+                run_series(rlist, #list, 1, "reversed series", spacing, done)
+            end)
+        end)
     end
 
     -- ---- media quality, read once the loop has stopped ----

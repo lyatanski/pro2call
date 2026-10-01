@@ -449,17 +449,21 @@ tx_classify(__u8 family, const __u8* ue_addr, const __u8* ue_saddr, __u8 proto,
 
 /* IPv6 outer needs a real UDP checksum; payloads too large for the
  * bounded checksum loop fall back to the userspace path. The chunk is
- * kept at 128 (not 256) so csum_pkt_range's frame plus gtpu_encap's stay
- * within BPF's 512-byte combined call-stack limit; CSUM_CHUNKS is doubled
- * to keep the same total checksummable length. */
-#define CSUM_CHUNK   128
-#define CSUM_CHUNKS  16
+ * kept at 64 (not 128, not 256) so csum_pkt_range's frame plus
+ * gtpu_encap's stay within BPF's 512-byte combined call-stack limit;
+ * CSUM_CHUNKS is doubled alongside it so CSUM_MAX_LEN stays at 2048 --
+ * that is a behavioural threshold, tested by both fallbacks below.
+ * At 128 the verifier rejects the load outright: "combined stack size
+ * of 2 calls is 528. Too large". gtpu_encap's own frame is ~400, so the
+ * helper has to stay at or under 112. */
+#define CSUM_CHUNK   64
+#define CSUM_CHUNKS  32
 #define CSUM_MAX_LEN (CSUM_CHUNK * CSUM_CHUNKS)
 
 /* One's-complement sum over a packet byte range. A real BPF subprogram
  * (not inlined) so the chunk buffer lives in its own stack frame rather
  * than adding to the caller's; the two frames together must still fit
- * BPF's 512-byte combined-stack limit (hence CSUM_CHUNK = 128).
+ * BPF's 512-byte combined-stack limit (hence CSUM_CHUNK = 64).
  * Returns the running 32-bit sum, or negative on a short packet. */
 static __noinline __s64 csum_pkt_range(struct __sk_buff* skb, __u32 off,
                                        __u32 remain, __u64 seed)

@@ -24,7 +24,7 @@ size_t  test_count;
 size_t  test_count_fail;
 size_t  test_count_skip;
 clock_t test_start;
-void    test_main();
+void    test_main(void);
 
 static int test_status(const char* name, int count)
 {
@@ -86,7 +86,7 @@ static inline int test_has_cap(unsigned cap)
 
 #define spec(name)                 \
     char* test_spec_name = (name); \
-    void  test_main()
+    void  test_main(void)
 #define context(name) printf("\n  " TEST_COLOR_BOLD(name) "\n");
 #define it1(name, count)  \
     test_start = clock(); \

@@ -11,13 +11,12 @@ target_compile_definitions(${name} PRIVATE _DEFAULT_SOURCE)  # syscall(2)
 find_package(Threads REQUIRED)
 target_link_libraries(${name} PRIVATE task Threads::Threads)
 
-if(GTPU_BPF)
-    add_bpf_object(gtpu_kern bpf/gtpu_kern.c)
-    target_link_libraries(${name} PRIVATE gtpu_kern PUBLIC PkgConfig::LIBBPF)
-else()
-    # API stays linkable; gtpu_ebpf_open() reports GTPU_E_UNSUPPORTED and
-    # callers fall back to the userspace datapath.
-    target_compile_definitions(${name} PRIVATE GTPU_EBPF_DISABLED)
+if(NOT GTPU_BPF)
+    message(FATAL_ERROR "BPF toolchain requirements not met (clang, bpftool, "
+                        "libbpf >= 1.0, kernel >= 5.4); see warnings above")
 endif()
+
+add_bpf_object(gtpu_kern bpf/gtpu_kern.c)
+target_link_libraries(${name} PRIVATE gtpu_kern PUBLIC PkgConfig::LIBBPF)
 
 add_subdirectory(test)

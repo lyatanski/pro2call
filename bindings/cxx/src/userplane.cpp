@@ -22,8 +22,7 @@ static void check(int rc, const char* doing)
     switch (rc) {
     case GTPU_E_SYS: what = "system/libbpf error"; break;
     case GTPU_E_UNSUPPORTED:
-        what = "eBPF datapath unavailable "
-               "(missing CAP_BPF/CAP_NET_ADMIN or non-eBPF build)";
+        what = "eBPF datapath unavailable (missing CAP_BPF/CAP_NET_ADMIN)";
         break;
     case GTPU_E_VERIFIER: what = "BPF program rejected by the verifier"; break;
     case GTPU_E_ABI:      what = "pinned maps from an incompatible loader"; break;

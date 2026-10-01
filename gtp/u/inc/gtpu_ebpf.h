@@ -32,16 +32,17 @@ extern "C" {
  * caller's timer job; these calls take effect immediately.
  *
  * All calls returning int use gtpu_err_t codes. The datapath is
- * optional at runtime: without CAP_BPF/CAP_NET_ADMIN (or when built
- * without the BPF toolchain) gtpu_ebpf_open() returns
- * GTPU_E_UNSUPPORTED and the caller falls back to the userspace
- * sendmmsg/recvmmsg path (§0.2).
+ * optional at runtime: without CAP_BPF/CAP_NET_ADMIN gtpu_ebpf_open()
+ * returns GTPU_E_UNSUPPORTED and the caller falls back to the
+ * userspace sendmmsg/recvmmsg path (§0.2). The BPF toolchain itself
+ * (clang, bpftool, libbpf >= 1.0, kernel >= 5.4) is a hard build
+ * requirement — configure fails without it.
  */
 
 typedef enum {
     GTPU_OK            = 0,
     GTPU_E_SYS         = -1, /* system/libbpf error, errno set */
-    GTPU_E_UNSUPPORTED = -2, /* missing capabilities or non-eBPF build */
+    GTPU_E_UNSUPPORTED = -2, /* missing CAP_BPF/CAP_NET_ADMIN */
     GTPU_E_VERIFIER    = -3, /* program rejected; log dumped to stderr */
     GTPU_E_ABI         = -4, /* pinned maps from an incompatible loader */
     GTPU_E_INVAL       = -5, /* invalid argument */

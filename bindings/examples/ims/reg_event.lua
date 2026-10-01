@@ -54,6 +54,16 @@ M.t_ms    = cfg.num("REG_EVENT_T_MS", 10000)   -- per-subscription deadline
 -- experiment, NOT a remedy for failures. 0 (the default) is a single burst,
 -- consistent with the deliberately unramped registration side.
 M.rps     = cfg.num("REG_EVENT_RPS", 0)
+-- REG_EVENT_EXCLUSIVE=1 makes the document answer one more question: is this
+-- UE's contact the ONLY one the registrar still offers? Off by default, because
+-- several bindings per identity are legitimate (RFC 3261 §10.3) and the
+-- ordinary run asserts only that its own binding is among them. On, any other
+-- contact still `active` fails the subscription — which is what a UE that came
+-- back on a new address without de-registering (the chart's rereg test runs
+-- this script back to back with IMS_DEREG=0) should never leave behind: the
+-- old contact names an address the UE no longer has, and every terminating
+-- request for it is forked there too until IMS_EXPIRES runs out.
+M.exclusive = cfg.flag("REG_EVENT_EXCLUSIVE", false)
 
 -- ---- the reginfo document ---------------------------------------------
 
@@ -62,6 +72,17 @@ M.rps     = cfg.num("REG_EVENT_RPS", 0)
 -- it, and a pattern that quietly reads the wrong attribute is worse than one
 -- that reads none.
 local function xattr(s, k) return s:match('%s' .. k .. '%s*=%s*"([^"]*)"') end
+
+-- The socket a contact URI names — host:port, without the scheme, the user
+-- part or any parameter — which is all that decides where a request forked to
+-- it goes. XML-escaped in the document, so the `&lt;` a registrar may leave
+-- around it is stripped along with the rest.
+local function hostport(uri)
+    local s = uri:gsub("^&lt;", ""):gsub("^<", "")
+    s = s:gsub("^sips?:", "")
+    s = s:gsub("^[^@;>&]*@", "")
+    return s:match("^([^;>&]+)") or s
+end
 
 -- The reg event's body (RFC 3680 §5.1, application/reginfo+xml): one
 -- <registration> per public identity of the implicit registration set, each
@@ -89,6 +110,7 @@ function M.parse(body)
         for c in chunk:gmatch("<contact(.-)</contact>") do
             r.contacts[#r.contacts + 1] = {
                 state = xattr(c, "state") or "", event = xattr(c, "event") or "",
+                expires = tonumber(xattr(c, "expires") or ""),
                 uri   = c:match("<uri>%s*(.-)%s*</uri>") or "",
             }
         end
@@ -277,11 +299,38 @@ function M.new(ctx)
         -- expires, the +g.3gpp.smsip feature tag) and none of them change which
         -- socket the binding points at.
         local want = ("%s:%d"):format(sub.ue_addr, sub.port_uc)
+        local found = false
         for _, c in ipairs(mine.contacts) do
-            if c.uri:find(want, 1, true) then u.event = c.event; return true end
+            if c.uri:find(want, 1, true) then u.event = c.event; found = true; break end
         end
-        return false, ("this identity is registered, but to %d other contact(s), not %s")
-            :format(#mine.contacts, want)
+        if not found then
+            return false, ("this identity is registered, but to %d other contact(s), not %s")
+                :format(#mine.contacts, want)
+        end
+        if not M.exclusive then return true end
+        -- Every <registration>, not only `mine`: a contact bound to ANY identity
+        -- of the implicit set is one the S-CSCF will fork a terminating request
+        -- to, and it is the contact that is stale, not the identity. Compared on
+        -- the exact host:port — a substring match would let 10.10.0.2:5060 hide
+        -- inside 10.10.0.12:5060 — and each counted once, since the same binding
+        -- is listed under every identity it serves.
+        local stale, seen = {}, {}
+        for _, r in ipairs(regs) do
+            for _, c in ipairs(r.contacts) do
+                local at = hostport(c.uri)
+                if c.state == "active" and at ~= want and not seen[at] then
+                    seen[at] = true
+                    stale[#stale + 1] = c.expires
+                        and ("%s (expires in %ds)"):format(at, c.expires) or at
+                end
+            end
+        end
+        u.stale = #stale
+        if #stale > 0 then
+            return false, ("%d other contact(s) still active beside %s: %s")
+                :format(#stale, want, table.concat(stale, ", ")), "stale"
+        end
+        return true
     end
 
     -- A NOTIFY arrived on a UE's socket: the network's view of that UE's own
@@ -333,8 +382,8 @@ function M.new(ctx)
         if u.t.t2 then return end
         u.t.t2, u.t.t3 = t2, t3
         st.notified = st.notified + 1
-        local okb, detail = check_reginfo(u, m)
-        if not okb then return settle_fail(u, "reginfo", detail) end
+        local okb, detail, stage = check_reginfo(u, m)
+        if not okb then return settle_fail(u, stage or "reginfo", detail) end
         st.verified = st.verified + 1
         st.identities[#st.identities + 1] = u.identities
         if u.dialable then st.dialable = st.dialable + 1 end
@@ -399,6 +448,9 @@ function M.new(ctx)
                     M.rps > 0 and (" at %.1f sub/s"):format(M.rps) or " in one burst"))
         log.line("event package", ("reg (RFC 3680), Expires: %d, Accept: application/reginfo+xml")
             :format(M.expires))
+        if M.exclusive then
+            log.line("exclusive", "any other active contact in the document fails the subscription")
+        end
 
         local spacing = M.rps > 0 and math.floor(1000 / M.rps) or 0
         local function subscribe(sub)
@@ -459,6 +511,7 @@ function M.new(ctx)
         { key = "accept",  label = "no 200 OK for the SUBSCRIBE" },
         { key = "notify",  label = "subscribed, never notified" },
         { key = "reginfo", label = "notified, but the state was not this UE's" },
+        { key = "stale",   label = "notified, but an older contact is still bound" },
         { key = "guard",   label = "reg-event phase deadline" },
         { key = "unknown", label = "other" },
     }
@@ -521,6 +574,13 @@ function M.new(ctx)
         -- the core: the reg-info document is the largest thing the network sends
         -- a UE outside a call, and a downlink that does not fit the tunnel is
         -- lost whole (see the downlink size budget in ims/call_phase.lua).
+        if st.stage.stale then
+            log.line("", "stale: the registrar still offers a contact this UE registered from")
+            log.line("", "an address it has since left, without de-registering. Nothing in the")
+            log.line("", "REGISTER asked for that binding to go, so only the core can notice")
+            log.line("", "it is dead -- and until it does, every terminating request for this")
+            log.line("", "identity is forked to it too (REG_EVENT_EXCLUSIVE=1 is what asked).")
+        end
         if st.stage.notify then
             log.line("", "a subscription accepted and never notified may be a NOTIFY that did")
             log.line("", "not fit: with 36 bytes of GTP-U on a 1500-byte path the reg-info")
