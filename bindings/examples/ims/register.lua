@@ -82,11 +82,22 @@ function M.advertise(sub) return M.authz_hdr(sub, cfg.realm, "", "") end
 -- Via/Contact carry the UE's address at its protected client port; a fresh
 -- transaction per REGISTER keys the branch and From-tag on the CSeq, while the
 -- Call-ID is stable across the binding's life.
+--
+-- The instance ID goes on every REGISTER's contact, the de-REGISTER's included
+-- (TS 24.229 §5.1.1.2.1 c, §5.1.1.4.1 c, §5.1.1.6.1 c), quoted and in angle
+-- brackets as RFC 5626 §4.1 spells it. Only on REGISTER: §5.1.2A.1.1 keeps it
+-- off the Contact of every other request and response, because an IMEI is not
+-- something the far end of a call is entitled to see — which is why wire.contact
+-- never adds it.
 function M.build(sub, authz, sec_name, sec_hdr, expires)
     local contact = ("<sip:%s:%d>"):format(sub.ue_addr, sub.port_uc)
     if expires == 0 then
         contact = contact .. ";expires=0"                       -- bind removal
-    elseif M.contact_params then
+    end
+    if sub.instance then
+        contact = contact .. (';+sip.instance="<%s>"'):format(sub.instance)
+    end
+    if expires ~= 0 and M.contact_params then
         contact = contact .. ";" .. M.contact_params
     end
     local b = wire.builder

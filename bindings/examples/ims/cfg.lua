@@ -126,6 +126,33 @@ M.abandon    = flag("IMS_ABANDON", false)
 -- digest-only fallback, for a core with ipsec turned off.
 M.require_ipsec = flag("IMS_IPSEC", true)
 
+-- The device behind each subscriber: an IMEI, and the instance ID derived from
+-- it that every REGISTER's Contact carries in "+sip.instance".
+--
+-- TS 24.229 §5.1.1.2.1 c) and §5.1.1.4.1 c): a UE that has an IMEI available
+-- SHALL include the parameter, on the initial registration and on every
+-- re-registration — and §5.1.1.6.1 c) puts it on the de-REGISTER's contact
+-- too. It is what lets a registrar tell a UE re-registering from a new
+-- address apart from a second device sharing the identity: the public user
+-- identity together with the instance ID names one UA instance (§3.1,
+-- "Instance ID"), whatever contact address it registers from, and it is the
+-- key the S-CSCF builds GRUUs from for a UE that also asks for them with
+-- Supported: gruu (§5.4.1.2.2F g, §5.4.7A) — which this one does not.
+--
+-- The IMEI is TAC + SNR with the subscriber index as the SNR, so it is as
+-- stable across runs as the IMSI is. IMS_IMEI_TAC is the eight-digit Type
+-- Allocation Code. IMS_INSTANCE=0 leaves the parameter off, which is a UE with no IMEI, no GRUU
+-- and no multiple registrations — the one case the spec lets omit it.
+M.instance = flag("IMS_INSTANCE", true)
+M.imei_tac = str("IMS_IMEI_TAC", "35000000")
+assert(M.imei_tac:match("^%d%d%d%d%d%d%d%d$"), "IMS_IMEI_TAC must be 8 digits")
+
+-- The IMEI URN (RFC 7254, TS 23.003 §13.8): "urn:gsma:imei:" TAC "-" SNR "-"
+-- spare, where the check digit is not sent and the spare digit is always 0.
+function M.imei_urn(idx)
+    return ("urn:gsma:imei:%s-%06d-0"):format(M.imei_tac, idx % 1000000)
+end
+
 -- ---- the per-subscriber resource layout -------------------------------
 --
 -- Spaced by the zero-based subscriber index so concurrent subscribers — which
@@ -135,6 +162,18 @@ M.require_ipsec = flag("IMS_IPSEC", true)
 -- index with its own stride.
 M.port_uc_base, M.port_us_base = 5060, 5090
 M.spi_base = 0x100
+
+-- The two inbound SPIs of a subscriber's `gen`-th registration. An initial
+-- registration made while an earlier one's SAs may still exist at the P-CSCF
+-- (S-CSCF restoration, ims/regflow.lua's restore) takes a fresh pair: TS
+-- 33.203 §7.1 has the UE select SPIs "different from any SPIs that might be
+-- used in any existing SAs", and a P-CSCF still holding outbound SAs to the
+-- old pair would otherwise find the new ones colliding with them. Each
+-- generation is a block of 2 * nsubs, so no two subscribers ever meet either.
+function M.spis(idx, gen)
+    local spi = M.spi_base + (idx + (gen or 0) * M.nsubs) * 2
+    return spi, spi + 1
+end
 
 M.IPPROTO_UDP = 17    -- unprotected REGISTER, and the ESP policies' inner selector
 M.IPPROTO_ESP = 50    -- protected traffic (IMS-AKA IPsec, TS 33.203)

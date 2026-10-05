@@ -29,6 +29,7 @@ function M.new(i, stage)
     local msisdn = cfg.msisdn_of(imsi)
     local tel    = ("tel:+%s"):format(msisdn)
     local phone  = ("sip:+%s@%s;user=phone"):format(msisdn, cfg.realm)
+    local spi_uc, spi_us = cfg.spis(idx, 0)
     return {
         i = i, idx = idx,
         imsi = imsi,
@@ -51,8 +52,16 @@ function M.new(i, stage)
         -- never bound — it stays in the layout to keep the stride unchanged.
         port_uc = cfg.port_uc_base + idx * 4,
         port_us = cfg.port_us_base + idx * 4,
-        spi_uc  = cfg.spi_base + idx * 2,
-        spi_us  = cfg.spi_base + idx * 2 + 1,
+        spi_uc  = spi_uc,
+        spi_us  = spi_us,
+        -- Which registration of this subscriber the SPIs above belong to:
+        -- 0 for the first, bumped by each initial registration S-CSCF
+        -- restoration forces (cfg.spis has why each takes a fresh pair).
+        gen = 0,
+
+        -- The device: its instance ID, the IMEI URN every REGISTER's Contact
+        -- carries in "+sip.instance" (see cfg.instance). nil when IMS_INSTANCE=0.
+        instance = cfg.instance and cfg.imei_urn(idx) or nil,
 
         -- The registration dialog as the sip module models it: a
         -- sip.Registration (RFC 3261 §10 / TS 24.229 §5.1) composed with a

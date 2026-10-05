@@ -71,7 +71,7 @@ local regflow = require("ims.regflow")-- the REGISTER exchange itself
 --
 -- Everything shared with the S5/S8 test — IMS_MCC / IMS_MNC / IMS_REALM,
 -- IMS_IMSI, IMS_SUBS, IMS_K / IMS_OPC, IMS_EXPIRES, IMS_DEREG, IMS_IPSEC,
--- SIP_T_MS, IMS_VERBOSE — is read by ims/cfg.lua and documented there. What
+-- IMS_INSTANCE, IMS_IMEI_TAC, SIP_T_MS, IMS_VERBOSE — is read by ims/cfg.lua and documented there. What
 -- follows is Gm's own.
 
 local pcscf_host = os.getenv("PCSCF_IP") or "pcscf"   -- a name or a literal IP

@@ -34,6 +34,14 @@
 --   o.on_response    optional, for every response, after the machines have
 --                    seen it (the S5/S8 script reads its datapath counters
 --                    here, to say the reply came back down the bearer)
+--   o.on_restored    optional, at the end of an initial registration restore()
+--                    started: (sub, ok) — on_terminal is not called for it,
+--                    the subscriber having been terminal once already
+--
+-- restore(sub, why) is the other way in: S-CSCF restoration (TS 24.229
+-- §5.1.2A.1.6), the initial registration a registered UE performs again when
+-- the network answers one of its requests with the 504 ims/restoration.lua
+-- recognises.
 
 local net   = require("net")
 local sip   = require("sip")
@@ -61,9 +69,27 @@ function M.new(o)
 
     -- ---- terminal states ----
 
+    -- The end of a restoration, either way. The subscriber stays what the
+    -- attempt left it: registered again, or not registered at all — the
+    -- binding the 504 said was lost is not one it can fall back on.
+    local function restored(sub, ok, msg)
+        local r = sub.restoring
+        sub.restoring = nil
+        r.ms = now() - r.t0
+        log.slog(sub, "restoration", ok
+            and ("registered again in %dms (%s)"):format(r.ms,
+                    sub.protected and "over ESP" or "unprotected")
+            or  ("FAILED after %dms: %s"):format(r.ms, msg))
+        if o.on_restored then o.on_restored(sub, ok, r) end
+    end
+
     function F.fail(sub, msg)
         sub.err = msg
         sub.fail_stage = sub.stage       -- snapshot the stage reached at give-up
+        if sub.restoring then
+            sub.fail_stage = "restore"
+            return restored(sub, false, msg)
+        end
         log.slog(sub, "result", "FAILED: " .. msg)
         o.on_terminal(sub)
     end
@@ -72,19 +98,26 @@ function M.new(o)
     local function succeed(sub, m)
         sub.registered = true
         sub.stage = "done"
+        -- Captured here, at the one message that carries them: the phases that
+        -- follow cannot originate a request without the Service-Route, and
+        -- nothing else ever says which identities this registration owns. No
+        -- fallback is invented when either is absent — a guessed Route would
+        -- fail as "mis-routed by the core" and hide the real cause. The Path
+        -- is kept for one reason: it holds the P-CSCF URI a restoration 504
+        -- from the P-CSCF asserts (ims/restoration.lua).
+        sub.svc_route = wire.service_route(m)
+        sub.assoc     = wire.associated_uris(m)
+        sub.path      = wire.uris(m, "Path")
+        if o.on_registered then o.on_registered(sub, m) end
+        -- A restoration is measured on its own: the run's registration rate
+        -- and latency describe the attach burst, and a second registration
+        -- per restored subscriber would inflate the one and skew the other.
+        if sub.restoring then return restored(sub, true) end
         sub.reg_ms = now() - sub.t0
         stats.regs = stats.regs + 1
         stats.reg_last = now()
         stats.latency[#stats.latency + 1] = sub.reg_ms
         if sub.protected then stats.protected = stats.protected + 1 end
-        -- Captured here, at the one message that carries them: the phases that
-        -- follow cannot originate a request without the Service-Route, and
-        -- nothing else ever says which identities this registration owns. No
-        -- fallback is invented when either is absent — a guessed Route would
-        -- fail as "mis-routed by the core" and hide the real cause.
-        sub.svc_route = wire.service_route(m)
-        sub.assoc     = wire.associated_uris(m)
-        if o.on_registered then o.on_registered(sub, m) end
         log.slog(sub, "result", ("registered in %dms (%s)")
             :format(sub.reg_ms, sub.protected and "over ESP" or "unprotected"))
         o.on_terminal(sub)
@@ -254,7 +287,9 @@ function M.new(o)
     -- Feed the machines and dispatch on what the registration machine makes of
     -- it: a 401 to answer, a 2xx that registered us, or a final that did not.
     function F.handle(sub, m)
-        if sub.done then return end   -- ignore late replies once terminal
+        -- Ignore late replies once terminal — unless a restoration has opened
+        -- a new registration on the subscriber since.
+        if sub.done and not sub.restoring then return end
         F.disarm(sub)
         pcall(function() sub.txn:recv(m) end)
         pcall(function() sub.auth:recv(m) end)
@@ -277,6 +312,52 @@ function M.new(o)
         elseif sub.reg:failed() then
             fail(sub, ("registration rejected: %d %s"):format(m.status, m.reason))
         end
+    end
+
+    -- ---- S-CSCF restoration ----
+    --
+    -- The network has said, with a 504 ims/restoration.lua vouched for, that
+    -- the registration this subscriber holds is gone; §5.1.2A.1.6 has the UE
+    -- "initiate S-CSCF restoration procedures by performing an initial
+    -- registration as specified in subclause 5.1.1.2". So this is
+    -- first_register() over again, from the same contact, after putting the
+    -- subscriber back where an initial registration starts:
+    --
+    --   - not registered: the phases stop picking it for new work until the
+    --     200 OK says otherwise, and the teardown de-REGISTER skips it unless
+    --     the new registration completes;
+    --   - no SAs: an initial REGISTER goes unprotected to the P-CSCF's
+    --     unprotected port (sipio picks the port from sub.ch), and its 401
+    --     raises new ones. Ours are released here; the P-CSCF's are its own;
+    --   - a fresh SPI pair (cfg.spis): if only the S-CSCF failed, the P-CSCF
+    --     still holds SAs keyed on the old one;
+    --   - fresh machines: sip.Registration has no way back to idle from
+    --     registered, and one restoration per 504 is rare enough that a new
+    --     allocation is the honest reset.
+    --
+    -- The Call-ID and the CSeq sequence carry on (RFC 3261 §10.2: one Call-ID
+    -- per boot cycle, a CSeq that only ever increases), and so do the
+    -- Service-Route and the associated identities, until the new 200 OK
+    -- replaces them — a dialog still in flight keeps the route it had.
+    --
+    -- One at a time: a second 504 that lands while the first's registration
+    -- is under way asks for what is already happening. Returns true when it
+    -- started one.
+    function F.restore(sub, why)
+        if sub.restoring or not (sub.registered and sub.sock) then return false end
+        sub.restoring = { t0 = now(), why = why }
+        log.slog(sub, "restoration", "504 asked for an initial registration" ..
+                 ((why and why ~= "") and (" (" .. why .. ")") or ""))
+        F.disarm(sub)
+        sub.registered = false
+        if sub.esp and F.xfrm then sub.esp:release(F.xfrm) end
+        sub.esp, sub.ch, sub.authz, sub.protected = nil, nil, nil, false
+        sub.gen = sub.gen + 1
+        sub.spi_uc, sub.spi_us = cfg.spis(sub.idx, sub.gen)
+        sub.reg, sub.auth = sip.Registration(), sip.AuthChallenge()
+        sub.attempts = 0
+        F.first_register(sub)
+        return true
     end
 
     -- ---- releasing the bindings ----

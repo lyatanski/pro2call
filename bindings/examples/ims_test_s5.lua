@@ -27,7 +27,8 @@
 --   ims/access.lua     the S5/S8 access: GTP-C, the eBPF GTP-U datapath, TFTs
 --   ims/register.lua   the REGISTER and the IMS-AKA credentials
 --   ims/regflow.lua    the exchange: REGISTER -> 401 -> SAs (ipsec.Esp) ->
---                      REGISTER -> 200
+--                      REGISTER -> 200, and doing it again on restoration
+--   ims/restoration.lua the 504 that asks for an initial registration
 --   ims/sipio.lua      the UE socket: send, drain, count, preloaded Route
 --   ims/wire.lua       the shared Builder and the header readers
 --   ims/reg_event.lua  the RFC 3680 subscription phase, with its own report
@@ -61,6 +62,7 @@ local ue       = require("ims.ue")
 local sipio    = require("ims.sipio")
 local register = require("ims.register")
 local regflow  = require("ims.regflow")
+local restoration = require("ims.restoration")
 local access     = require("ims.access")
 local reg_event  = require("ims.reg_event")
 local call_phase = require("ims.call_phase")
@@ -74,7 +76,7 @@ register.contact_params = sms.FEATURE_TAG
 -- ---- configuration ------------------------------------------------------
 --
 -- IMS_MCC / IMS_MNC / IMS_REALM, IMS_IMSI, IMS_SUBS, IMS_K / IMS_OPC,
--- IMS_EXPIRES, IMS_DEREG, IMS_ABANDON, IMS_IPSEC,
+-- IMS_EXPIRES, IMS_DEREG, IMS_ABANDON, IMS_IPSEC, IMS_INSTANCE, IMS_IMEI_TAC,
 -- SIP_T_MS, IMS_VERBOSE, IMS_DUMP, CALL_URI, IMS_MSISDN_* — is read by
 -- ims/cfg.lua; PGW_IP, SGW_IP, IMS_APN, GTP_T3_MS, GTP_N3, GTPU_IFACE,
 -- GTPU_INNER_IFACE, GTPU_INNER_MTU by ims/access.lua; and each phase's own
@@ -101,6 +103,16 @@ local function run()
         start = now(),                        -- run start (before any Create Session)
         pkt_last = nil, sess_last = nil, reg_last = nil,
         latency = {},                         -- per-subscriber registration time
+        -- S-CSCF restoration (TS 24.229 §5.1.2A.1.6): every 504 an originating
+        -- request drew, whether it asked for an initial registration, and how
+        -- the registrations it asked for went.
+        restore = {
+            seen = 0, started = 0, ok = 0, failed = 0,
+            by_method = {},   -- the request each acted-on 504 answered
+            ignored = {},     -- 504s that did not qualify, by why
+            stage = {},       -- where a restoration died
+            latency = {},
+        },
     }
     local io_ = sipio.new(stats)
 
@@ -109,6 +121,11 @@ local function run()
     -- build dispatch exist, and next_phase needs itself (it recurses).
     local flow, acc, dispatch, next_phase
     local pending, grace = cfg.nsubs, nil
+    -- Restorations under way, and what to run once the last one ends: the
+    -- run does not de-register and tear the bearers down under a REGISTER
+    -- exchange it started (each step is bounded by SIP_T_MS, so this cannot
+    -- hold the run open for long).
+    local restoring, after_restore = 0, nil
 
     -- A subscriber reached a terminal state; when the last one does, wait a
     -- little for late Create Bearer Requests, then run the phases.
@@ -146,6 +163,22 @@ local function run()
         -- down, since a reply that never arrives looks identical to one the
         -- datapath dropped.
         on_response = function(sub, m) acc.report_rx(sub, tostring(m.status)) end,
+        on_restored = function(sub, ok, r)
+            local rs = stats.restore
+            if ok then
+                rs.ok = rs.ok + 1
+                rs.latency[#rs.latency + 1] = r.ms
+            else
+                rs.failed = rs.failed + 1
+                stats_.fail(rs.stage, sub.stage or "other", sub.err or "unknown")
+            end
+            restoring = restoring - 1
+            if restoring == 0 and after_restore then
+                local f = after_restore
+                after_restore = nil
+                f()
+            end
+        end,
     }
 
     -- The GTP-C/GTP-U access: Create Session per subscriber, the eBPF datapath
@@ -190,6 +223,12 @@ local function run()
 
     next_phase = function(i)
         while PHASES[i] and not PHASES[i].on do i = i + 1 end
+        if not PHASES[i] and restoring > 0 then
+            log.banner(("Waiting for %d S-CSCF restoration(s) to finish registering")
+                :format(restoring))
+            after_restore = function() next_phase(i) end
+            return
+        end
         if not PHASES[i] then
             -- Everything is measured: release the IMS registrations (so the
             -- P-CSCF reaps their ESP SAs), then the PDN connections.
@@ -221,6 +260,23 @@ local function run()
         end
         local okc, cs = pcall(function() return m:cseq() end)
         if okc and cs.method == sip.REGISTER  then return flow.handle(sub, m) end
+        -- A 504 may be the network asking for an initial registration (S-CSCF
+        -- restoration, ims/restoration.lua). Acted on here, once, for whichever
+        -- phase's request drew it — and then still handed to that phase,
+        -- whose request did fail and whose report says so.
+        if m.status == 504 then
+            local rs = stats.restore
+            rs.seen = rs.seen + 1
+            local yes, why = restoration.check(sub, m)
+            if not yes then
+                stats_.bump(rs.ignored, why)
+                if cfg.verbose then log.slog(sub, "504", "not a restoration: " .. why) end
+            elseif flow.restore(sub, why) then
+                rs.started = rs.started + 1
+                restoring = restoring + 1
+                stats_.bump(rs.by_method, okc and cs.method_name or "?")
+            end
+        end
         if okc and cs.method == sip.MESSAGE   then return smsp.response(sub, m) end
         if okc and cs.method == sip.SUBSCRIBE then return regevp.response(sub, m) end
         return callp.response(sub, m)
@@ -285,6 +341,7 @@ local STAGES = {
     { key = "session",  label = "session setup (GTP-C)" },
     { key = "register", label = "REGISTER / 401 challenge" },
     { key = "auth",     label = "authentication / 200 OK" },
+    { key = "restore",  label = "S-CSCF restoration (504)" },
     { key = "other",    label = "other / incomplete" },
 }
 local ok, abandoned, tally = 0, 0, {}
@@ -324,6 +381,29 @@ end
 if ok + abandoned < #subs then
     log.line("failed", tostring(#subs - ok - abandoned))
     stats_.stages(STAGES, tally, 28)
+end
+
+-- ---- S-CSCF restoration ----------------------------------------------------
+--
+-- Only when a 504 turned up at all: a run against a healthy core has nothing to
+-- say here, and a section of zeros would read as a feature that was tried.
+local rs = stats.restore
+if rs.seen > 0 then
+    log.banner(("S-CSCF restoration: %d of %d restoration(s) registered again")
+        :format(rs.ok, rs.started))
+    log.line("504 responses", ("%d, %d asked for an initial registration (TS 24.229 §5.1.2A.1.6)")
+        :format(rs.seen, rs.seen - stats_.total(rs.ignored)))
+    for k, n in pairs(rs.by_method) do log.line("", ("%d on %s"):format(n, k)) end
+    for k, n in pairs(rs.ignored) do log.line("not acted on", ("%d: %s"):format(n, k)) end
+    local d = stats_.summarize(rs.latency)
+    if d then
+        log.line("re-registration latency", ("p50 %dms  p95 %dms  max %dms  (n=%d)")
+            :format(d.p50, d.p95, d.max, d.n))
+    end
+    if rs.failed > 0 then
+        log.line("failed", tostring(rs.failed))
+        stats_.stages(STAGES, rs.stage, 28)
+    end
 end
 
 -- ---- the access ----------------------------------------------------------
