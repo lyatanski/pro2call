@@ -17,9 +17,19 @@ local M = {}
 -- single-threaded and never have two messages half-built at once.
 M.builder = sip.Builder()
 
--- A UE's contact: the address and protected port it registered, which is also
--- the socket every phase sends from and every terminating request arrives at.
-function M.contact(sub) return ("<sip:%s:%d>"):format(sub.ue_addr, sub.port_uc) end
+-- host:port as SIP writes it (RFC 3261 §25.1): an IPv6 literal goes in
+-- brackets, or its colons run into the port's.
+function M.hostport(addr, port)
+    if addr:find(":", 1, true) then return ("[%s]:%d"):format(addr, port) end
+    return ("%s:%d"):format(addr, port)
+end
+
+-- A UE's own host:port: the address and protected port it registered, which is
+-- also the socket every phase sends from and every terminating request arrives at.
+function M.ue_at(sub) return M.hostport(sub.ue_addr, sub.port_uc) end
+
+-- A UE's contact.
+function M.contact(sub) return ("<sip:%s>"):format(M.ue_at(sub)) end
 
 -- A response from `sub` to `req`. Via order matters and Record-Route must be
 -- echoed in the order received — that is how the far end learns its route set

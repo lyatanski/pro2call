@@ -83,10 +83,12 @@ Bytes uli_tai_ecgi(const std::string& mcc, const std::string& mnc,
 
 /* Protocol Configuration Options (§8.13 / TS 24.008 §10.5.6.3).
  * pco_pcscf_v4 returns the first P-CSCF IPv4 address (container 0x000C)
- * as a dotted quad, or "" when absent. pco_request_pcscf builds the PCO
- * that asks the PGW for its P-CSCF IPv4 address. */
+ * as a dotted quad, pco_pcscf_v6 the first IPv6 one (container 0x0001),
+ * or "" when absent. pco_request_pcscf builds the PCO that asks the PGW
+ * for its P-CSCF address in each family asked for. */
 std::string pco_pcscf_v4(const Bytes& pco);
-Bytes       pco_request_pcscf();
+std::string pco_pcscf_v6(const Bytes& pco);
+Bytes       pco_request_pcscf(bool v4 = true, bool v6 = false);
 
 /* ---- Sub-IE value types (TS 29.274 §8) ---- */
 

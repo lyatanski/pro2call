@@ -457,6 +457,10 @@ int gtpu_tft_add(gtpu_ebpf_t* g, const gtpu_tft_t* f)
      * on the same bearer still needs. */
     struct gtpu_rx_tun cur;
     bool had_rx = bpf_map_lookup_elem(rx_fd, &f->tunnel.local_teid, &cur) == 0;
+    /* An IPv4v6 PDN's filters come in both families on the one bearer: once
+     * they disagree, the decap takes either rather than the last one added */
+    if (had_rx && cur.inner_family != rx.inner_family)
+        rx.inner_family = AF_UNSPEC;
     rc = bpf_map_update_elem(rx_fd, &f->tunnel.local_teid, &rx, BPF_ANY);
     if (!rc) {
         rc = bpf_map_update_elem(tft_fd, &k, &tx, BPF_NOEXIST);

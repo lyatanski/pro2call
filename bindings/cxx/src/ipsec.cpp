@@ -208,17 +208,18 @@ Sa esp_sa(const Esp& e, const std::string& src, const std::string& dst,
     return sa;
 }
 
-/* /32 selectors: the policy is THIS UE's traffic to THIS P-CSCF on this
- * port pair, not "anything on those ports", which is what a zero prefix
- * length would mean to the kernel. */
+/* Host selectors (/32, /128): the policy is THIS UE's traffic to THIS
+ * P-CSCF on this port pair, not "anything on those ports", which is what a
+ * zero prefix length would mean to the kernel. */
 Policy esp_policy(uint8_t dir, const std::string& src, const std::string& dst,
                   uint16_t sport, uint16_t dport, uint32_t reqid)
 {
+    const uint8_t host = src.find(':') != std::string::npos ? 128 : 32;
     Policy p;
     p.src        = src;
-    p.src_prefix = 32;
+    p.src_prefix = host;
     p.dst        = dst;
-    p.dst_prefix = 32;
+    p.dst_prefix = host;
     p.sel_proto  = IPPROTO_UDP;
     p.sport      = sport;
     p.dport      = dport;

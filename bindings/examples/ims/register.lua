@@ -90,7 +90,7 @@ function M.advertise(sub) return M.authz_hdr(sub, cfg.realm, "", "") end
 -- something the far end of a call is entitled to see — which is why wire.contact
 -- never adds it.
 function M.build(sub, authz, sec_name, sec_hdr, expires)
-    local contact = ("<sip:%s:%d>"):format(sub.ue_addr, sub.port_uc)
+    local contact = wire.contact(sub)
     if expires == 0 then
         contact = contact .. ";expires=0"                       -- bind removal
     end
@@ -102,8 +102,8 @@ function M.build(sub, authz, sec_name, sec_hdr, expires)
     end
     local b = wire.builder
         :request(sip.REGISTER, "sip:" .. cfg.realm)
-        :header(sip.H_VIA, ("SIP/2.0/UDP %s:%d;branch=z9hG4bK-%s-%d")
-                           :format(sub.ue_addr, sub.port_uc, sub.imsi, sub.cseq))
+        :header(sip.H_VIA, ("SIP/2.0/UDP %s;branch=z9hG4bK-%s-%d")
+                           :format(wire.ue_at(sub), sub.imsi, sub.cseq))
         :header_u32(sip.H_MAX_FORWARDS, 70)
         :header(sip.H_FROM, ("<%s>;tag=%s-%d"):format(sub.impu, sub.imsi, sub.cseq))
         :header(sip.H_TO, ("<%s>"):format(sub.impu))

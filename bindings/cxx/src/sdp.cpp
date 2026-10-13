@@ -576,12 +576,17 @@ std::string offer(const Offer& o)
     static uint64_t next_id = (uint64_t)std::time(nullptr);
     uint64_t        id      = o.id ? o.id : ++next_id;
 
+    /* An IPv6 literal is IP6 whatever addrtype says: its default is IP4,
+     * and "IN IP4 <v6 address>" is an offer no peer can answer. */
+    const std::string at =
+        o.addr.find(':') != std::string::npos ? std::string("IP6") : o.addrtype;
+
     std::string pt = std::to_string(o.pt);
     Builder     b(1024);
     b.version()
-        .origin(o.user, id, o.version, o.addr, o.addrtype)
+        .origin(o.user, id, o.version, o.addr, at)
         .name(o.name)
-        .conn(o.addr, o.addrtype)
+        .conn(o.addr, at)
         .time(0, 0)
         .media(M_AUDIO, o.port, P_RTP_AVP, pt)
         .attr(A_RTPMAP, pt + " " + codec + "/" + std::to_string(rate));

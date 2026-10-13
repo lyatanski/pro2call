@@ -228,8 +228,8 @@ function M.new(ctx)
         -- the Request-URI carries a number and the core has to resolve it through
         -- the HSS profile to the callee's registered contact.
         local b = io_.preload_route(wire.builder:request(sip.INVITE, c.callee), mo)
-        b:header(sip.H_VIA, ("SIP/2.0/UDP %s:%d;branch=%s")
-                            :format(mo.ue_addr, mo.port_uc, c.branch))
+        b:header(sip.H_VIA, ("SIP/2.0/UDP %s;branch=%s")
+                            :format(wire.ue_at(mo), c.branch))
             :header_u32(sip.H_MAX_FORWARDS, 70)
             :header(sip.H_FROM, c.from_hdr)
             :header(sip.H_TO, c.to_hdr)
@@ -266,8 +266,8 @@ function M.new(ctx)
         local mo = c.mo
         local b  = wire.builder:request(method, c.target or c.callee)
         for _, r in ipairs(route or {}) do b:header(sip.H_ROUTE, r) end
-        b:header(sip.H_VIA, ("SIP/2.0/UDP %s:%d;branch=%s")
-                            :format(mo.ue_addr, mo.port_uc, branch))
+        b:header(sip.H_VIA, ("SIP/2.0/UDP %s;branch=%s")
+                            :format(wire.ue_at(mo), branch))
             :header_u32(sip.H_MAX_FORWARDS, 70)
             :header(sip.H_FROM, c.from_hdr)
             :header(sip.H_TO, c.to_hdr)

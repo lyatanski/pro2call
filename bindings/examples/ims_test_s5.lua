@@ -78,7 +78,7 @@ register.contact_params = sms.FEATURE_TAG
 -- IMS_MCC / IMS_MNC / IMS_REALM, IMS_IMSI, IMS_SUBS, IMS_K / IMS_OPC,
 -- IMS_EXPIRES, IMS_DEREG, IMS_ABANDON, IMS_IPSEC, IMS_INSTANCE, IMS_IMEI_TAC,
 -- SIP_T_MS, IMS_VERBOSE, IMS_DUMP, CALL_URI, IMS_MSISDN_* — is read by
--- ims/cfg.lua; PGW_IP, SGW_IP, IMS_APN, GTP_T3_MS, GTP_N3, GTPU_IFACE,
+-- ims/cfg.lua; PGW_IP, SGW_IP, IMS_APN, IMS_PDN_TYPE, GTP_T3_MS, GTP_N3, GTPU_IFACE,
 -- GTPU_INNER_IFACE, GTPU_INNER_MTU by ims/access.lua; and each phase's own
 -- knobs by the phase module that uses them.
 

@@ -13,6 +13,7 @@ local net = require("net")
 local sip = require("sip")
 local cfg = require("ims.cfg")
 local log = require("ims.log")
+local wire = require("ims.wire")
 
 local M = {}
 
@@ -49,8 +50,8 @@ function M.new(stats)
     -- (pcscf_force_service_routes, commented out in this stack), so the UE
     -- synthesises it from the P-CSCF address it was given.
     function O.preload_route(b, sub)
-        b:header(sip.H_ROUTE, ("<sip:orig@%s:%d;lr>")
-            :format(sub.pcscf, O.pcscf_port(sub, "mo")))
+        b:header(sip.H_ROUTE, ("<sip:orig@%s;lr>")
+            :format(wire.hostport(sub.pcscf, O.pcscf_port(sub, "mo"))))
         for _, r in ipairs(sub.svc_route or {}) do b:header(sip.H_ROUTE, r) end
         return b
     end

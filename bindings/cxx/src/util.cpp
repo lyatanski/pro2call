@@ -117,7 +117,9 @@ Bytes uli_tai_ecgi(const std::string& mcc, const std::string& mnc,
     return out;
 }
 
-std::string pco_pcscf_v4(const Bytes& pco)
+/* The first container `want` carrying at least `alen` bytes, formatted as an
+ * address of that family, or "" when the PCO has none. */
+static std::string pco_addr(const Bytes& pco, uint16_t want, int af, size_t alen)
 {
     if (pco.size() < 4) return "";
     size_t i = 1; /* skip the configuration-protocol/flags octet */
@@ -126,10 +128,9 @@ std::string pco_pcscf_v4(const Bytes& pco)
         const uint8_t  len = pco[i + 2];
         const size_t   body = i + 3;
         if (body + len > pco.size()) break; /* truncated container */
-        if (id == 0x000c && len >= 4) {
-            char b[INET_ADDRSTRLEN];
-            std::snprintf(b, sizeof b, "%u.%u.%u.%u", pco[body], pco[body + 1],
-                          pco[body + 2], pco[body + 3]);
+        if (id == want && len >= alen) {
+            char b[INET6_ADDRSTRLEN];
+            if (!inet_ntop(af, &pco[body], b, sizeof b)) return "";
             return b;
         }
         i = body + len;
@@ -137,11 +138,24 @@ std::string pco_pcscf_v4(const Bytes& pco)
     return "";
 }
 
-Bytes pco_request_pcscf()
+std::string pco_pcscf_v4(const Bytes& pco)
 {
-    /* Configuration-protocol octet 0x80, then one empty P-CSCF IPv4
-     * Address Request container (id 0x000C, length 0). */
-    return Bytes{ 0x80, 0x00, 0x0c, 0x00 };
+    return pco_addr(pco, 0x000c, AF_INET, 4);
+}
+
+std::string pco_pcscf_v6(const Bytes& pco)
+{
+    return pco_addr(pco, 0x0001, AF_INET6, 16);
+}
+
+Bytes pco_request_pcscf(bool v4, bool v6)
+{
+    /* Configuration-protocol octet 0x80, then an empty P-CSCF Address
+     * Request container (length 0) per family: 0x0001 IPv6, 0x000C IPv4. */
+    Bytes out{ 0x80 };
+    if (v6) out.insert(out.end(), { 0x00, 0x01, 0x00 });
+    if (v4) out.insert(out.end(), { 0x00, 0x0c, 0x00 });
+    return out;
 }
 
 namespace intl

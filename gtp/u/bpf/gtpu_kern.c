@@ -86,9 +86,9 @@ struct {
  * nothing here learns that a datagram was reassembled: an entry outlives
  * one sendmsg by microseconds and is then evicted rather than deleted. */
 struct gtpu_frag_key {
-    __u8   family;    /* AF_INET; IPv6 fragments need the ext-header walk */
-    __u8   proto;     /* inner IPPROTO_* */
-    __be16 id;        /* IPv4 identification, network order */
+    __u8   family;    /* AF_INET / AF_INET6 */
+    __u8   proto;     /* inner IPPROTO_*, past an IPv6 Fragment header */
+    __be32 id;        /* IPv4 (16-bit) or IPv6 (32-bit) identification */
     __u8   saddr[16]; /* inner src */
     __u8   daddr[16]; /* inner dst */
 };
@@ -321,8 +321,12 @@ int gtpu_decap(struct __sk_buff* skb)
     if (bpf_skb_load_bytes(skb, payload_off, &inner_b0, 1)) goto malformed;
     __u8 inner_ver = inner_b0 >> 4;
 
+    /* AF_UNSPEC: a dual-stack (IPv4v6) bearer, which carries either. */
+    __u8 inner_family = tun->inner_family;
+    if (!inner_family) inner_family = inner_ver == 6 ? AF_INET6 : AF_INET;
+
     __be16 inner_proto;
-    if (tun->inner_family == AF_INET) {
+    if (inner_family == AF_INET) {
         if (inner_ver != 4 || inner_len < sizeof(struct iphdr)) goto malformed;
         inner_proto = bpf_htons(ETH_P_IP);
         if (!addr16_is_zero(tun->inner_addr)) {
@@ -345,9 +349,16 @@ int gtpu_decap(struct __sk_buff* skb)
     }
 
     /* Strip IP+UDP+GTP-U in-place, keeping the Ethernet header (§0.2:
-     * bpf_skb_adjust_room, no clones). */
+     * bpf_skb_adjust_room, no clones). skb->protocol was set from the outer
+     * header before TC ran, and the stack dispatches on it, not on the
+     * ethertype rewritten below: an IPv6 PDN inside an IPv4 tunnel (or the
+     * reverse) has to say so here or it is handed to ip_rcv and dropped. */
+    __u64 decap = 0;
+    if (inner_family != src_family)
+        decap = inner_family == AF_INET6 ? BPF_F_ADJ_ROOM_DECAP_L3_IPV6
+                                         : BPF_F_ADJ_ROOM_DECAP_L3_IPV4;
     if (bpf_skb_adjust_room(skb, -(__s32)(payload_off - ETH_HLEN),
-                            BPF_ADJ_ROOM_MAC, 0))
+                            BPF_ADJ_ROOM_MAC, decap))
         goto malformed;
 
     /* The exposed inner packet rides the old Ethernet header: fix the
@@ -504,7 +515,7 @@ int gtpu_encap(struct __sk_buff* skb)
     __u32 inner_l4_len    = 0;     /* L4 header + payload; 0 = do not checksum */
 
     /* Fragment state, for the classification below. */
-    __be16 frag_id   = 0; /* IPv4 id: what its fragments have in common */
+    __be32 frag_id   = 0; /* IP id: what its fragments have in common */
     __u8   frag_head = 0; /* the fragment at offset 0, the one with ports */
     __u8   frag_tail = 0; /* every fragment after it, which has none */
 
@@ -536,11 +547,30 @@ int gtpu_encap(struct __sk_buff* skb)
         struct ipv6hdr* ip6 = (void*)(eth + 1);
         if ((void*)(ip6 + 1) > data_end) return TC_ACT_OK;
         family = AF_INET6;
-        proto  = ip6->nexthdr; /* no ext walk: ports stay wildcard then */
+        proto  = ip6->nexthdr;
         __builtin_memcpy(ue_addr, &ip6->daddr, 16);
         __builtin_memcpy(inner_saddr, &ip6->saddr, 16);
-        inner_l4_len = bpf_ntohs(ip6->payload_len); /* no ext headers assumed */
-        l4_off       = ETH_HLEN + sizeof *ip6;
+        if (proto == IPPROTO_FRAGMENT) {
+            /* The one extension header this host's own traffic carries: the
+             * kernel splits a datagram over the MTU route at the source
+             * (RFC 8200 §4.5), and SIP's large responses are exactly those.
+             * Any other extension header leaves the ports wildcard. */
+            struct {
+                __u8   nexthdr, reserved;
+                __be16 frag_off; /* offset << 3 | M */
+                __be32 id;
+            } fh;
+            if (bpf_skb_load_bytes(skb, ETH_HLEN + sizeof *ip6, &fh, sizeof fh))
+                return TC_ACT_OK;
+            proto     = fh.nexthdr;
+            frag_id   = fh.id;
+            frag_tail = !!(fh.frag_off & bpf_htons(0xfff8));
+            frag_head = !frag_tail;
+            if (frag_head) l4_off = ETH_HLEN + sizeof *ip6 + sizeof fh;
+        } else {
+            inner_l4_len = bpf_ntohs(ip6->payload_len);
+            l4_off       = ETH_HLEN + sizeof *ip6;
+        }
     } else {
         return TC_ACT_OK;
     }

@@ -66,7 +66,8 @@ struct gtpu_hdr {
 /* ---- teid_rx_map: local TEID -> decap target (TC ingress) ---- */
 
 struct gtpu_rx_tun {
-    __u8 inner_family;   /* AF_INET / AF_INET6 expected inside the tunnel */
+    __u8 inner_family;   /* AF_INET / AF_INET6 expected inside the tunnel;
+                          * AF_UNSPEC = either (a dual-stack bearer) */
     __u8 ebi;            /* EPS bearer id (dedicated bearers), observability */
     __u8 inner_addr[16]; /* expected inner dst (UE addr); all-zero = no check */
     __u32 ifindex;       /* bpf_redirect target; 0 = pass to local stack */

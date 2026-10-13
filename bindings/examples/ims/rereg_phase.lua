@@ -380,7 +380,7 @@ function M.new(ctx)
     local function relocate(sub, gen, after)
         local r = {
             sub = sub, gen = gen, t0 = now(), waiting = 0, after = after,
-            old_at = ("%s:%d"):format(sub.ue_addr, sub.port_uc),
+            old_at = wire.ue_at(sub),
             probe = {}, stale_rx = {}, done = false,
         }
         records[#records + 1] = r
@@ -414,7 +414,7 @@ function M.new(ctx)
                 end
                 r.old, r.t_pdn = old, now()
                 old.rereg = r                  -- what arrives there is this relocation's
-                r.new_at  = ("%s:%d"):format(sub.ue_addr, sub.port_uc)
+                r.new_at  = wire.ue_at(sub)
                 st.relocated = st.relocated + 1
                 st.kpi.pdn[#st.kpi.pdn + 1] = r.t_pdn - r.t0
                 log.slog(sub, "relocated", ("%s -> %s (PDN connection %d, %d ms)")

@@ -84,6 +84,14 @@ M.n3    = cfg.num("GTP_N3", 3)
 M.pgw_host     = cfg.str("PGW_IP", "smf")          -- a name or a literal IP
 M.sgw_ip       = cfg.str("SGW_IP", "0.0.0.0")       -- auto-derived from GTPU_IFACE when unset
 M.apn          = cfg.str("IMS_APN", "ims")
+-- The PDN type the Create Session asks for. ipv6 and ipv4v6 put the UE's SIP
+-- and media on its IPv6 address, toward the P-CSCF the PCO names in container
+-- 0x0001; ipv4v6 falls back to IPv4 when the PGW leaves either one out.
+M.pdn_type     = (cfg.str("IMS_PDN_TYPE", "ipv4")):lower()
+if M.pdn_type ~= "ipv4" and M.pdn_type ~= "ipv6" and M.pdn_type ~= "ipv4v6" then
+    io.stderr:write(("IMS_PDN_TYPE=%q is not one of ipv4|ipv6|ipv4v6\n"):format(M.pdn_type))
+    os.exit(2)
+end
 M.gtpu_ifname  = cfg.str("GTPU_IFACE", "eth0")       -- the S5/S8-U interface
 M.inner_ifname = cfg.str("GTPU_INNER_IFACE", "eth0") -- the access side
 -- The MTU put on the route toward the P-CSCF: 1500 less the 36 bytes of GTP-U
@@ -104,6 +112,11 @@ local function resolve(name)
     local ok, res = pcall(function() return net.Resolver():resolve4(name) end)
     assert(ok, ("cannot resolve PGW host name %q: %s"):format(name, log.why(res)))
     return res
+end
+
+-- An address literal's host prefix length: 128 for IPv6, 32 for IPv4.
+local function host_len(addr)
+    return addr:find(":", 1, true) and 128 or 32
 end
 
 -- ---- the uplink size budget: the route MTU toward the P-CSCF ----
@@ -216,6 +229,61 @@ local function nexthop_toward(dst, dev)
     return best
 end
 
+-- The same for an IPv6 destination, over /proc/net/ipv6_route, whose fields
+-- are 32 hex digits of address in network order and the prefix length in hex:
+--
+--     dst dst_len src src_len nexthop metric refcnt use flags dev
+local function nexthop_toward6(dst, dev)
+    -- dst as 32 hex digits: expand "::" to the groups it stands for
+    local head, tail = dst:match("^(.-)::(.*)$")
+    local groups = {}
+    local function add(part)
+        for g in part:gmatch("[^:]+") do groups[#groups + 1] = ("%04x"):format(tonumber(g, 16)) end
+    end
+    if head then
+        add(head)
+        local n = #groups
+        local t = {}
+        for g in tail:gmatch("[^:]+") do t[#t + 1] = g end
+        for _ = 1, 8 - n - #t do groups[#groups + 1] = "0000" end
+        add(tail)
+    else
+        add(dst)
+    end
+    if #groups ~= 8 then return nil end
+    local d = table.concat(groups)
+    local f = io.open("/proc/net/ipv6_route")
+    if not f then return nil end
+    -- Whether the first `len` bits of two hex strings agree, a nibble at a time.
+    local function covers(a, b, len)
+        local whole = math.floor(len / 4)
+        if a:sub(1, whole) ~= b:sub(1, whole) then return false end
+        local rest = len % 4
+        if rest == 0 then return true end
+        local div = 2 ^ (4 - rest)
+        return math.floor(tonumber(a:sub(whole + 1, whole + 1), 16) / div)
+            == math.floor(tonumber(b:sub(whole + 1, whole + 1), 16) / div)
+    end
+    local best, best_len = nil, -1
+    for l in f:lines() do
+        local rdst, rlen, gw, iface = l:match("^(%x+)%s+(%x+)%s+%x+%s+%x+%s+(%x+)%s+%x+%s+%x+%s+%x+%s+%x+%s+(%S+)")
+        if iface == dev then
+            local len = tonumber(rlen, 16)
+            if len < 128 and len > best_len and covers(d, rdst, len) then
+                best_len = len
+                best = nil
+                if gw:find("[^0]") then
+                    local g = {}
+                    for i = 1, 32, 4 do g[#g + 1] = ("%x"):format(tonumber(gw:sub(i, i + 3), 16)) end
+                    best = table.concat(g, ":")
+                end
+            end
+        end
+    end
+    f:close()
+    return best
+end
+
 function M.new(o)
     local loop, io_, stats, subs = o.loop, o.io, o.stats, o.subs
     local flow = o.flow
@@ -319,13 +387,17 @@ function M.new(o)
     -- Make the UE PAA locally deliverable (net.addr_add adds <PAA>/32 to lo,
     -- RTNETLINK) so the decapped downlink whose inner dst is the PAA reaches the
     -- transparent UE socket. Best-effort, only with the datapath up.
+    --
+    -- A host prefix in either family: an IPv6 PDN's /64 on lo would install a
+    -- local route that swallows every other address in it.
     local function add_paa_route(sub)
-        if not (up and sub.ue_addr and sub.ue_addr:match("^%d+%.%d+%.%d+%.%d+$")) then return end
-        local ok2, err = pcall(function() net.addr_add("lo", sub.ue_addr, 32) end)
+        if not (up and sub.ue_addr) then return end
+        local len = host_len(sub.ue_addr)
+        local ok2, err = pcall(function() net.addr_add("lo", sub.ue_addr, len) end)
         sub.paa_added = ok2
         log.slog(sub, "PAA local route", ok2
-            and ("%s/32 dev lo"):format(sub.ue_addr)
-            or  ("could not add %s/32 (need CAP_NET_ADMIN?): %s"):format(sub.ue_addr, log.why(err)))
+            and ("%s/%d dev lo"):format(sub.ue_addr, len)
+            or  ("could not add %s/%d (need CAP_NET_ADMIN?): %s"):format(sub.ue_addr, len, log.why(err)))
     end
 
     -- The nexthop and the route itself: see the big comment block above this
@@ -336,15 +408,16 @@ function M.new(o)
         if not (up and M.inner_mtu > 0 and sub.pcscf) then return end
         if mtu_tried[sub.pcscf] then return end
         mtu_tried[sub.pcscf] = true
+        local len = host_len(sub.pcscf)
         local r = net.Route()
-        r.dst, r.prefixlen, r.dev, r.mtu = sub.pcscf, 32, M.inner_ifname, M.inner_mtu
-        local gw = nexthop_toward(sub.pcscf, M.inner_ifname)
+        r.dst, r.prefixlen, r.dev, r.mtu = sub.pcscf, len, M.inner_ifname, M.inner_mtu
+        local gw = (len == 128 and nexthop_toward6 or nexthop_toward)(sub.pcscf, M.inner_ifname)
         if gw then r.gateway = gw end
         local ok2, err = pcall(function() net.route_add(r) end)
         if ok2 then mtu_routes[sub.pcscf] = r end
         log.line("P-CSCF route MTU", ok2
-            and ("%s/32 %sdev %s mtu %d (GTP-U leaves 1500-36)")
-                :format(sub.pcscf, gw and ("via %s "):format(gw) or "", M.inner_ifname, M.inner_mtu)
+            and ("%s/%d %sdev %s mtu %d (GTP-U leaves 1500-36)")
+                :format(sub.pcscf, len, gw and ("via %s "):format(gw) or "", M.inner_ifname, M.inner_mtu)
             or  ("could not set %d toward %s (need CAP_NET_ADMIN?): %s — an answered call's 200 OK will not fit")
                 :format(M.inner_mtu, sub.pcscf, log.why(err)))
     end
@@ -474,7 +547,7 @@ function M.new(o)
             log.slog(sub, "UE SIP socket", ("%s:%d (UE PAA, transparent)")
                 :format(sub.ue_addr, sub.port_uc))
         else
-            sub.sock = net.UdpSocket("0.0.0.0", 0)
+            sub.sock = net.UdpSocket(host_len(sub.ue_addr) == 128 and "::" or "0.0.0.0", 0)
             log.slog(sub, "UE SIP socket", ("SGW source (UE PAA bind refused: %s); no reply can return")
                 :format(log.why(s)))
         end
@@ -532,10 +605,19 @@ function M.new(o)
             end
             stats.sess = stats.sess + 1; stats.sess_last = now()
             sub.pgw_ctrl_teid = sess:remote_teid()
-            if rsp.has_paa then sub.ue_addr = rsp.paa.addr4 end
-            if rsp.pco and #rsp.pco > 0 then
-                local p = gtp.pco_pcscf_v4(rsp.pco)
-                sub.pcscf = p ~= "" and p or nil
+            -- The family SIP runs over: IPv6 whenever the PDN has it and the
+            -- PCO names an IPv6 P-CSCF, else IPv4 when the PDN has that.
+            local pco = rsp.pco and #rsp.pco > 0 and rsp.pco or nil
+            local p6 = pco and M.pdn_type ~= "ipv4" and gtp.pco_pcscf_v6(pco) or ""
+            local p4 = pco and M.pdn_type ~= "ipv6" and gtp.pco_pcscf_v4(pco) or ""
+            local a6 = rsp.has_paa and rsp.paa.addr6 or ""
+            local a4 = rsp.has_paa and rsp.paa.addr4 or ""
+            if p6 ~= "" and a6 ~= "" and a6 ~= "::" then
+                -- A bare /64 is the prefix alone: the interface identifier is
+                -- the UE's to pick (TS 29.061 §11.2.1.3.2a)
+                sub.ue_addr, sub.pcscf = a6:match("::$") and (a6 .. "1") or a6, p6
+            elseif p4 ~= "" and a4 ~= "" and a4 ~= "0.0.0.0" then
+                sub.ue_addr, sub.pcscf = a4, p4
             end
             if cfg.verbose then
                 log.slog(sub, "<- Create Session Resp", ("PAA %s, P-CSCF %s")
@@ -754,13 +836,17 @@ function M.new(o)
         local CSR = gtp.CreateSessionRequest()
         CSR.apn      = M.apn
         CSR.rat_type = gtp.GTP2_RAT_EUTRAN
-        CSR.pdn_type = gtp.GTP2_PDN_IPV4
+        local pdn = ({ ipv4 = gtp.GTP2_PDN_IPV4, ipv6 = gtp.GTP2_PDN_IPV6,
+                       ipv4v6 = gtp.GTP2_PDN_IPV4V6 })[M.pdn_type]
+        local v4, v6 = M.pdn_type ~= "ipv6", M.pdn_type ~= "ipv4"
+        CSR.pdn_type = pdn
         CSR.serving_network = gtp.plmn_encode(cfg.mcc, cfg.mnc)
         CSR.uli             = gtp.uli_tai_ecgi(cfg.mcc, cfg.mnc, 0x0001, 0x0000001)
         CSR.has_paa      = true
-        CSR.paa.pdn_type = gtp.GTP2_PDN_IPV4
-        CSR.paa.addr4    = "0.0.0.0"                     -- request a dynamic IPv4
-        CSR.pco = gtp.pco_request_pcscf()                -- ask for the P-CSCF IPv4
+        CSR.paa.pdn_type = pdn
+        if v4 then CSR.paa.addr4 = "0.0.0.0" end         -- request a dynamic IPv4
+        if v6 then CSR.paa.addr6, CSR.paa.prefix_len = "::", 64 end -- and/or IPv6
+        CSR.pco = gtp.pco_request_pcscf(v4, v6)          -- the P-CSCF in each family
 
         local CSR_C = gtp.Fteid()
         CSR_C.if_type = gtp.GTP2_IF_S5S8C_SGW            -- sender F-TEID: SGW S5/S8-C
@@ -923,7 +1009,7 @@ function M.new(o)
             if sub.media_tft then pcall(function() apply_media_tfts(sub, "del") end) end
         end
         for _, sub in ipairs(subs) do
-            if sub.paa_added then pcall(function() net.addr_del("lo", sub.ue_addr, 32) end) end
+            if sub.paa_added then pcall(function() net.addr_del("lo", sub.ue_addr, host_len(sub.ue_addr)) end) end
         end
         for _, r in pairs(mtu_routes) do pcall(function() net.route_del(r) end) end
     end

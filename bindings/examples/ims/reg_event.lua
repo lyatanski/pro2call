@@ -160,8 +160,8 @@ function M.new(ctx)
     -- pcscf_is_registered() before it lets an originating request through at all.
     local function build_subscribe(sub, u)
         local b = io_.preload_route(wire.builder:request(sip.SUBSCRIBE, sub.impu), sub)
-        b:header(sip.H_VIA, ("SIP/2.0/UDP %s:%d;branch=%s")
-                            :format(sub.ue_addr, sub.port_uc, u.branch))
+        b:header(sip.H_VIA, ("SIP/2.0/UDP %s;branch=%s")
+                            :format(wire.ue_at(sub), u.branch))
             :header_u32(sip.H_MAX_FORWARDS, 70)
             :header(sip.H_FROM, ("<%s>;tag=%s"):format(sub.impu, u.from_tag))
             :header(sip.H_TO, ("<%s>"):format(sub.impu))
@@ -298,7 +298,7 @@ function M.new(ctx)
         -- S-CSCF may hand back the contact with parameters of its own (received,
         -- expires, the +g.3gpp.smsip feature tag) and none of them change which
         -- socket the binding points at.
-        local want = ("%s:%d"):format(sub.ue_addr, sub.port_uc)
+        local want = wire.ue_at(sub)
         local found = false
         for _, c in ipairs(mine.contacts) do
             if c.uri:find(want, 1, true) then u.event = c.event; found = true; break end
