@@ -681,7 +681,12 @@ function M.new(o)
                 -- The newest dedicated bearer is the one the call's media rule
                 -- lives on, so it becomes the media home; re-home anything already
                 -- programmed elsewhere. The Create Bearer Request and the SDP
-                -- answer race, and both orders have to work.
+                -- answer race, and both orders have to work. A bearer released
+                -- earlier (the previous call's) says nothing about this one, so
+                -- the release flag goes with it -- left set, the next call's
+                -- media stays on the default bearer while the network delivers
+                -- its downlink on this bearer's TEID.
+                sub.ded_released = false
                 sub.ded_bearer = {
                     ebi = ebi, local_teid = teid,
                     remote_teid = pgw_u and pgw_u.teid or 0,
