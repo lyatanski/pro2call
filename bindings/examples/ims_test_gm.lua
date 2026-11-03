@@ -185,6 +185,8 @@ local function run()
         -- loop). NET_RD is the fd's steady-state interest, which the queue
         -- restores after adding NET_WR to ride out a full send buffer.
         sub.sock:tx_loop(loop, net.NET_RD)
+        -- TCP on the same port, for a request the P-CSCF sends over 1300 bytes
+        io_.listen(sub, loop, on_msg)
         flow.first_register(sub)
     end
 

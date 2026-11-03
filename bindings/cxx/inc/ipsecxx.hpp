@@ -228,8 +228,9 @@ class Xfrm
  * IK integrity-protects. Encryption with CK is OPTIONAL (§6.3 mandates
  * integrity only), so the defaults are ESP-NULL with HMAC-SHA-1 over IK,
  * which is what an ealg=null offer negotiates; set enc_alg/enc_key to
- * run a cipher instead. The selector protocol is UDP — the protected SIP
- * these SAs carry.
+ * run a cipher instead. The selectors match any protocol on the port
+ * pair: the protected SIP goes over UDP or TCP, and §7.1 has both share
+ * these SAs.
  *
  * Each SA's SPI doubles as its reqid, so the policy that must use a
  * given SA names it unambiguously even when every subscriber shares one

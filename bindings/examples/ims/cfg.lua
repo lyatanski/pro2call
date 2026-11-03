@@ -175,7 +175,7 @@ function M.spis(idx, gen)
     return spi, spi + 1
 end
 
-M.IPPROTO_UDP = 17    -- unprotected REGISTER, and the ESP policies' inner selector
+M.IPPROTO_UDP = 17    -- unprotected REGISTER
 M.IPPROTO_ESP = 50    -- protected traffic (IMS-AKA IPsec, TS 33.203)
 
 -- ---- what the run says about itself -----------------------------------

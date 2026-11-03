@@ -558,6 +558,9 @@ function M.new(o)
         -- loop). NET_RD is the fd's steady-state interest above, which the queue
         -- restores after adding NET_WR to ride out a full send buffer.
         sub.sock:tx_loop(loop, net.NET_RD)
+        -- And TCP on the same protected port: a request over 1300 bytes (a
+        -- reg-event NOTIFY, an MT INVITE) comes over TCP (RFC 3261 §18.1.1).
+        if okb then io_.listen(sub, loop, dispatch) end
 
         -- No second socket: with one protected port in both roles (see
         -- ims/register.lua's security_client) the P-CSCF delivers terminating

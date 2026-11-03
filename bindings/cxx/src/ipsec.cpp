@@ -210,7 +210,10 @@ Sa esp_sa(const Esp& e, const std::string& src, const std::string& dst,
 
 /* Host selectors (/32, /128): the policy is THIS UE's traffic to THIS
  * P-CSCF on this port pair, not "anything on those ports", which is what a
- * zero prefix length would mean to the kernel. */
+ * zero prefix length would mean to the kernel. Any upper-layer protocol:
+ * TS 33.203 §7.1 has TCP and UDP share the SAs, and a UDP-only selector
+ * lets a TCP segment on the protected ports (the P-CSCF's RFC 3261 §18.1.1
+ * fallback for a request over 1300 bytes) leave in the clear. */
 Policy esp_policy(uint8_t dir, const std::string& src, const std::string& dst,
                   uint16_t sport, uint16_t dport, uint32_t reqid)
 {
@@ -220,7 +223,7 @@ Policy esp_policy(uint8_t dir, const std::string& src, const std::string& dst,
     p.src_prefix = host;
     p.dst        = dst;
     p.dst_prefix = host;
-    p.sel_proto  = IPPROTO_UDP;
+    p.sel_proto  = 0; /* any: UDP and TCP */
     p.sport      = sport;
     p.dport      = dport;
     p.dir        = dir;

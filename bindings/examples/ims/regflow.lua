@@ -402,6 +402,7 @@ function M.new(o)
 
     function F.close_sockets()
         for _, s in ipairs(o.subs) do
+            io_.close_stream(s, loop)
             if s.sock then
                 pcall(function() loop:del_fd(s.sock:fd()) end)
                 s.sock:close()
