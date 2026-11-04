@@ -42,7 +42,11 @@
 --   PEER_TRGW      the TrGW's Ici address, which an outgoing offer must name
 --   PEER_TRGW_MX   the TrGW's home-side address, which the answer must name.
 --                  Either can be a space-separated list, one address per TrGW
---                  node, paired by position: the offer's picks the answer's
+--                  node, paired by position: the offer's picks the answer's.
+--                  An entry can also be an IPv4 subnet (a.b.c.d/len), for a
+--                  TrGW whose address is its network's pick: any address in
+--                  it matches, and the ng check from inside is skipped, as
+--                  the address it would probe is not known
 --   PEER_TRGW_HTTP the TrGW's HTTP port, which takes ng too  (default 9090)
 --   PEER_REALM     the home domain, e.g. mnc001.mcc001.3gppnetwork.org
 --   PEER_DIAL      the peer's E.164 country code               (default 999)
@@ -195,13 +199,44 @@ local function leaks(m, markers)
     return nil
 end
 
+-- PEER_TRGW/_MX entries: an address, or an IPv4 subnet any address in which
+-- is the TrGW's
+local function is_subnet(spec) return spec:find("/", 1, true) ~= nil end
+local function ip4(a)
+    local o1, o2, o3, o4 = (a or ""):match("^(%d+)%.(%d+)%.(%d+)%.(%d+)$")
+    if not o1 then return nil end
+    return ((tonumber(o1) * 256 + tonumber(o2)) * 256 + tonumber(o3)) * 256 + tonumber(o4)
+end
+local function is_trgw(addr, spec)
+    if not is_subnet(spec) then return addr == spec end
+    local base, len = spec:match("^(.-)/(%d+)$")
+    local a, b = ip4(addr), ip4(base)
+    if not (a and b and len) then return false end
+    local size = 2 ^ (32 - tonumber(len))
+    return math.floor(a / size) == math.floor(b / size)
+end
+
 -- What the home network would not show the peer
 local HOME_MARKS = { MX, IBCF_MX, "ims." .. REALM }
-for _, a in ipairs(TRGWS_MX) do HOME_MARKS[#HOME_MARKS + 1] = a end
+for _, a in ipairs(TRGWS_MX) do
+    if not is_subnet(a) then HOME_MARKS[#HOME_MARKS + 1] = a end
+end
 
 -- The TrGW node an Ici address is, by position; nil for none of them
 local function node(addr)
-    for k, a in ipairs(TRGWS) do if a == addr then return k end end
+    for k, a in ipairs(TRGWS) do if is_trgw(addr, a) then return k end end
+end
+
+-- The TrGW's Ici addresses the calls named, for the port checks: the listed
+-- ones, and whatever a subnet entry turned out to be
+local TRGW_SEEN = {}
+for k, a in ipairs(TRGWS) do
+    if not is_subnet(a) then TRGW_SEEN[#TRGW_SEEN + 1] = { k = k, addr = a } end
+end
+local function seen(k, addr)
+    if not (k and addr) then return end
+    for _, s in ipairs(TRGW_SEEN) do if s.addr == addr then return end end
+    TRGW_SEEN[#TRGW_SEEN + 1] = { k = k, addr = addr }
 end
 
 local function rtp(seq)
@@ -301,13 +336,15 @@ local function exit_call()
     end
     check(inv:header("User-Agent") == "", "no core node's User-Agent", inv:header("User-Agent"))
     check(inv:from_().uri == "sip:anonymous@anonymous.invalid", "From anonymous for Privacy: user", inv:header("From"))
-    local k = node(sdp_conn(inv.body))
-    check(k ~= nil, "the offer names the TrGW on Ici", sdp_conn(inv.body))
+    local oc = sdp_conn(inv.body)
+    local k = node(oc)
+    check(k ~= nil, "the offer names the TrGW on Ici", oc)
+    seen(k, oc)
     check(c.ok200:header("From") == c.from, "From restored on the answer", c.ok200:header("From"))
-    check(k ~= nil and c.ac == TRGWS_MX[k], "the answer names the TrGW inside", c.ac)
+    check(k ~= nil and is_trgw(c.ac, TRGWS_MX[k]), "the answer names the TrGW inside", c.ac)
 
     local echoed, src = media(c, NRTP)
-    check(k ~= nil and src == TRGWS[k], "media reaches the peer from the TrGW", src)
+    check(k ~= nil and src == oc, "media reaches the peer from the TrGW", src)
     check(echoed >= NRTP - 2, ("media echoed back through the TrGW (%d/%d)"):format(echoed, NRTP))
 
     -- BYE from the peer, along its route set back into the home network
@@ -363,20 +400,23 @@ local function ici_ports()
     end
     -- rtpengine's ng protocol: a ping answered from inside, not from Ici
     local ng = "probe d7:command4:pinge"
-    for k = 1, #TRGWS do
+    for _, t in ipairs(TRGW_SEEN) do
         local ping = net.UdpSocket(ICI, 0)
-        ping:sendto(ng, TRGWS[k], 9910)
-        check(ping:recv(1000).timed_out, "no ng control socket on the TrGW's Ici address " .. TRGWS[k])
+        ping:sendto(ng, t.addr, 9910)
+        check(ping:recv(1000).timed_out, "no ng control socket on the TrGW's Ici address " .. t.addr)
         ping:close()
         -- and none over HTTP either: POST /ng-plain is the same protocol
-        local ok, conn = pcall(net.stream_connect, TRGWS[k], TRGW_HTTP, 0, 2000)
-        check(not (ok and conn), "no HTTP port on the TrGW's Ici address " .. TRGWS[k])
+        local ok, conn = pcall(net.stream_connect, t.addr, TRGW_HTTP, 0, 2000)
+        check(not (ok and conn), "no HTTP port on the TrGW's Ici address " .. t.addr)
         if ok and conn then conn:close() end
-        ping = net.UdpSocket(MX, 0)
-        ping:sendto(ng, TRGWS_MX[k], 9910)
-        local r = ping:recv(1000)
-        check(not r.timed_out and r.data:find("pong", 1, true) ~= nil, "while inside it answers on " .. TRGWS_MX[k])
-        ping:close()
+        local inside = TRGWS_MX[t.k]
+        if not is_subnet(inside) then
+            ping = net.UdpSocket(MX, 0)
+            ping:sendto(ng, inside, 9910)
+            local r = ping:recv(1000)
+            check(not r.timed_out and r.data:find("pong", 1, true) ~= nil, "while inside it answers on " .. inside)
+            ping:close()
+        end
     end
 end
 
