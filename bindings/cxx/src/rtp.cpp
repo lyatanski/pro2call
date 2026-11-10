@@ -253,17 +253,26 @@ Stream::Stream(net::Loop& loop, const std::string& local_host,
 
 Stream::~Stream()
 {
+    close();
+    delete impl_;
+}
+
+void Stream::close()
+{
     /* The loop may already be gone when a garbage collector tears the
-     * two down in the wrong order; unregister only while it lives. */
+     * two down in the wrong order; unregister only while it lives. A
+     * second call finds fd -1, which net_loop_del refuses. */
     net_loop* l = *impl_->loop_life;
     if (l) {
         net_loop_del(l, impl_->rtp_sock.fd);
         net_loop_del(l, impl_->rtcp_sock.fd);
         if (impl_->timer_id) net_loop_cancel(l, impl_->timer_id);
     }
+    impl_->timer_id   = 0;
+    impl_->reports_on = false;
+    impl_->has_peer   = false;
     net_sock_close(&impl_->rtp_sock);
     net_sock_close(&impl_->rtcp_sock);
-    delete impl_;
 }
 
 void Stream::set_peer(const std::string& host, uint16_t rtp_port)

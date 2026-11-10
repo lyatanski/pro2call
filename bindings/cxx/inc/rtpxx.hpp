@@ -195,6 +195,11 @@ class Stream
      * periodic reports. The stream can still receive. */
     void bye(const std::string& reason = "");
 
+    /* Unregister from the loop and close both sockets now, freeing the
+     * ports for the next stream rather than at destruction. Idempotent;
+     * stats() still reads, and sending afterwards fails as "no peer". */
+    void close();
+
     Stats stats() const;
 
   private:

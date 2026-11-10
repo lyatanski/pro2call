@@ -9,7 +9,9 @@
 -- a second series follows the first, the same structural pairs with MO and MT
 -- swapped (the callee of the first series originates the second), after a
 -- CALL_REVERSE_SLEEP_MS gap — so the callee's own origination is exercised too,
--- at no extra provisioning cost. Per leg the flow is
+-- at no extra provisioning cost. With CALL_DURATION_S set, each pair instead
+-- keeps calling for that long, alternating direction (see run_loop). Per leg
+-- the flow is
 --
 --   MO --INVITE (Route: orig, SDP offer)--> P-CSCF -> S-CSCF -> ... -> MT
 --   MT --180 Ringing--> ... --> MO,  then after CALL_ANSWER_MS a 200 OK with
@@ -91,6 +93,19 @@ M.reverse   = cfg.flag("CALL_REVERSE", true)
 -- BYEs (fire-and-forget from here) reach the P-CSCF and rtpengine before the
 -- same UEs originate again.
 M.reverse_sleep_ms = cfg.num("CALL_REVERSE_SLEEP_MS", 1000)
+-- Duration mode, for a soak: every pair redials CALL_GAP_MS after its call
+-- ends until CALL_DURATION_S has passed, so each pair holds at most one call.
+-- That makes the load closed-loop: concurrency is the number of pairs, and
+-- the attempt rate is pairs / (setup + CALL_HOLD_MS + CALL_GAP_MS). CALL_CPS
+-- only staggers the pairs' first calls. 0, the default, runs the single
+-- series (plus its reverse) as above.
+M.duration_s = cfg.num("CALL_DURATION_S", 0)
+-- The pause between one call of a pair and the next, for the same reason as
+-- CALL_REVERSE_SLEEP_MS, whose value it defaults to.
+M.gap_ms     = cfg.num("CALL_GAP_MS", M.reverse_sleep_ms)
+-- How often duration mode prints its running totals: a run of hours is
+-- otherwise silent between the banner and the report.
+M.report_s   = cfg.num("CALL_REPORT_S", 60)
 -- Which bearer carries media: "auto" uses the dedicated bearer once the Create
 -- Bearer Request brings one (re-homing if it arrives after the answer),
 -- "default" keeps media on the default bearer — worth having, because a UPF
@@ -178,7 +193,7 @@ function M.new(ctx)
     local pending, guard, finished = 0, nil, nil
     local st = {
         pairs_total = 0, eligible = 0, attempted = 0, answered = 0, released = 0,
-        media_calls = 0, first_invite = nil, last_answer = nil,
+        media_calls = 0, media_placed = 0, first_invite = nil, last_answer = nil,
         by_status = {},                       -- final-response counts, non-2xx
         stage = {},                           -- where a failed call died
         kpi = { pdd = {}, sst = {}, sst_net = {}, mo_transit = {}, mt_transit = {},
@@ -195,6 +210,8 @@ function M.new(ctx)
     -- same subscriber, same idx, but the first series' Stream is still open
     -- (P.collect() reads it after the whole run stops, so nothing closes it
     -- early) -- so the second series needs its own, non-overlapping block.
+    -- Duration mode alternates gen 0/1 per pair and closes a pair's call two
+    -- back before it places the next, so the two blocks are all it ever uses.
     local function media_port(sub, gen) return MEDIA.port_base + (gen or 0) * cfg.nsubs * 4 + sub.idx * 4 end
 
     -- ---- the downlink size budget ------------------------------------------
@@ -416,8 +433,11 @@ function M.new(ctx)
     -- rtpengine's address and port are only known once the SDP has been
     -- rewritten and come back, so the media filters are late-bound per call and
     -- cannot be pre-programmed at attach the way the signalling ones are.
-    local function point_media(sub, sess, s, what)
-        if media_hook.program then media_hook.program(sub, s.addr, s.port) end
+    local function point_media(c, sub, sess, s, what)
+        if media_hook.program then
+            local h = media_hook.program(sub, s.addr, s.port)
+            if h then c.tfts[#c.tfts + 1] = { sub = sub, h = h } end
+        end
         local sok = pcall(function() sess:set_peer(s.addr, s.port) end)
         if not sok then
             log.slog(sub, "media", ("cannot point the session at the %s"):format(what))
@@ -445,6 +465,7 @@ function M.new(ctx)
             txn_mo = sip.Transaction(sip.INVITE_CLIENT),
             txn_mt = sip.Transaction(sip.INVITE_SERVER),
             route_mo = {}, route_mt = {},
+            tfts = {},            -- the datapath filters its media got (point_media)
             t = {}, stage = "invite",
         }
         -- From identifies the caller (its registered IMPU); To is the address
@@ -491,6 +512,7 @@ function M.new(ctx)
         if c.timer then loop:cancel(c.timer); c.timer = nil end
         stop_media(c)
         record_kpis(c)
+        if c.on_done then return c.on_done(c) end
         pending = pending - 1
         if pending <= 0 then
             if guard then loop:cancel(guard); guard = nil end
@@ -530,7 +552,7 @@ function M.new(ctx)
         if c.media and c.sess_mo then
             local s = audio_of(m.body, c.mo, "answer")
             if s then
-                c.mo_ready = point_media(c.mo, c.sess_mo, s, "answer")
+                c.mo_ready = point_media(c, c.mo, c.sess_mo, s, "answer")
                 if cfg.verbose then
                     log.slog(c.mo, "media peer", ("%s:%d (pt %s)"):format(s.addr, s.port,
                         s:pt_count() > 0 and tostring(s:pt_at(0)) or "-"))
@@ -602,7 +624,7 @@ function M.new(ctx)
             local s = audio_of(m.body, sub, "offer")
             if s then
                 c.mt_pt, c.mt_codec, c.mt_rate = answer_pt(s)
-                point_media(sub, c.sess_mt, s, "offer")
+                point_media(c, sub, c.sess_mt, s, "offer")
                 c.mt_ready = false        -- armed at the answer
                 if cfg.verbose then
                     log.slog(sub, "media peer", ("%s:%d (pt %d %s/%d)")
@@ -718,6 +740,77 @@ function M.new(ctx)
         call_fail(c, ("%d %s"):format(m.status, m.reason), m.status)
     end
 
+    -- The P-CSCF hands out protected port pairs from a pool sized by
+    -- ims_ipsec_pcscf's ipsec_max_connections (default 2), and shares them
+    -- between UEs once it runs out — the pairs even overlap ((5062,5063)
+    -- then (5063,5064)). When the MO's protected SERVER port is also the
+    -- MT's protected CLIENT port, this P-CSCF sends the terminating INVITE
+    -- from the wrong pair: it matches no ESP policy for the callee, so it
+    -- leaves unprotected (or not at all) and the callee never rings. Flag
+    -- it up front, so the failure is attributed to a stack that is
+    -- under-provisioned for concurrent UEs rather than looking like a core
+    -- routing bug. Once per pair and direction: duration mode places the
+    -- same pair thousands of times.
+    local function check_ports(c, mo, mt)
+        if mo.ch and mt.ch and mo.ch.p_port_s and mo.ch.p_port_s == mt.ch.p_port_c then
+            c.port_clash = true
+            st.port_clash = (st.port_clash or 0) + 1
+            if mo.port_clash_said then return end
+            mo.port_clash_said = true
+            log.slog(mo, "protected ports",
+                ("call %d shares P-CSCF port %d (MO server = MT client); raise ipsec_max_connections")
+                :format(c.n, mo.ch.p_port_s))
+        end
+    end
+
+    -- One call from mo to mt, numbered n and with its media on port block gen.
+    -- on_done, when given, is called as the call ends in place of the series'
+    -- countdown — set before the INVITE goes out, since a failed send ends the
+    -- call right here.
+    local function place(n, mo, mt, with_media, gen, on_done)
+        local c = make_call(n, mo, mt, with_media, gen)
+        c.on_done = on_done
+        calls[n] = c
+        by_callid[c.call_id] = c
+        mo.call, mt.call = c, c
+        check_ports(c, mo, mt)
+        if c.media then
+            c.sess_mo, c.mstat_mo = open_media(c, mo, "mo")
+            c.sess_mt, c.mstat_mt = open_media(c, mt, "mt")
+            c.media = (c.sess_mo ~= nil) and (c.sess_mt ~= nil)
+            if c.media then st.media_placed = st.media_placed + 1 end
+        end
+        c.offer = sdp.offer{ addr = mo.ue_addr, port = media_port(mo, gen),
+                             pt = MEDIA.pt, codec = MEDIA.codec,
+                             rate = MEDIA.rate, ptime = MEDIA.ptime_ms }
+        local w = build_invite(c)
+        feed_ev(c.txn_mo, sip.TE_SEND_REQUEST)
+        c.t.t0 = now()
+        st.first_invite = st.first_invite or c.t.t0
+        st.attempted = st.attempted + 1
+        if io_.send(mo, "mo", w, ("INVITE (call %d -> %s)"):format(n, c.callee)) then
+            -- The message names what did arrive, so "the core never
+            -- answered" and "the core answered but the callee never rang"
+            -- are not reported as the same failure.
+            carm(c, M.t_ms, function()
+                call_fail(c, c.t.t1 and "no ringing after 100 Trying"
+                                    or  "no response to the INVITE")
+            end)
+        else
+            call_fail(c, "INVITE send failed", nil)
+        end
+        return c
+    end
+
+    local function dialled_line(mt)
+        -- What is actually dialled, spelled out: a run that fails because the HSS
+        -- profile carries no such identity is otherwise indistinguishable from a
+        -- routing fault, and this is the line that tells them apart.
+        log.line("dialled address", ("%s   (CALL_URI=%s%s)"):format(
+            mt.dial, cfg.dial_uri,
+            cfg.dial_uri == "sip" and "" or ", needs the number in the HSS profile"))
+    end
+
     -- One series: `series_list`'s (mo, mt) pairs, numbered from base_n + i so
     -- Call-ID/branch/tags stay unique across both series sharing the one
     -- `calls`/`by_callid` table, and tagged with `gen` (0 first series, 1
@@ -731,76 +824,35 @@ function M.new(ctx)
         log.banner(("Calls%s — %d of %d eligible pair(s) (%d structural), %d carrying RTP%s")
             :format(tag, #series_list, st.eligible, st.pairs_total, st.media_calls,
                     M.cps > 0 and (" at %.1f call/s"):format(M.cps) or " in one burst"))
-        -- What is actually dialled, spelled out: a run that fails because the HSS
-        -- profile carries no such identity is otherwise indistinguishable from a
-        -- routing fault, and this is the line that tells them apart.
-        log.line("dialled address", ("%s   (CALL_URI=%s%s)"):format(
-            series_list[1].mt.dial, cfg.dial_uri,
-            cfg.dial_uri == "sip" and "" or ", needs the number in the HSS profile"))
+        dialled_line(series_list[1].mt)
 
         pending = #series_list
         -- Overall deadline so a lost 200 OK cannot hang the run.
         guard = loop:after(spacing * #series_list + M.t_ms + M.hold_ms + 5000, function()
             guard = nil
-            for _, c in ipairs(calls) do
+            for _, c in pairs(calls) do
                 if not c.done then call_fail(c, "call phase deadline", nil) end
             end
             if pending > 0 then pending = 0; series_done() end
         end)
 
         for i, p in ipairs(series_list) do
-            local n = base_n + i
-            local c = make_call(n, p.mo, p.mt, i <= st.media_calls, gen)
-            calls[n] = c
-            by_callid[c.call_id] = c
-            p.mo.call, p.mt.call = c, c
-            -- The P-CSCF hands out protected port pairs from a pool sized by
-            -- ims_ipsec_pcscf's ipsec_max_connections (default 2), and shares them
-            -- between UEs once it runs out — the pairs even overlap ((5062,5063)
-            -- then (5063,5064)). When the MO's protected SERVER port is also the
-            -- MT's protected CLIENT port, this P-CSCF sends the terminating INVITE
-            -- from the wrong pair: it matches no ESP policy for the callee, so it
-            -- leaves unprotected (or not at all) and the callee never rings. Flag
-            -- it up front, so the failure is attributed to a stack that is
-            -- under-provisioned for concurrent UEs rather than looking like a core
-            -- routing bug.
-            if p.mo.ch and p.mt.ch and p.mo.ch.p_port_s
-               and p.mo.ch.p_port_s == p.mt.ch.p_port_c then
-                c.port_clash = true
-                st.port_clash = (st.port_clash or 0) + 1
-                log.slog(p.mo, "protected ports",
-                    ("call %d shares P-CSCF port %d (MO server = MT client); raise ipsec_max_connections")
-                    :format(n, p.mo.ch.p_port_s))
-            end
-            local function fire()
-                if c.media then
-                    c.sess_mo, c.mstat_mo = open_media(c, p.mo, "mo")
-                    c.sess_mt, c.mstat_mt = open_media(c, p.mt, "mt")
-                    c.media = (c.sess_mo ~= nil) and (c.sess_mt ~= nil)
-                end
-                c.offer = sdp.offer{ addr = p.mo.ue_addr, port = media_port(p.mo, gen),
-                                     pt = MEDIA.pt, codec = MEDIA.codec,
-                                     rate = MEDIA.rate, ptime = MEDIA.ptime_ms }
-                local w = build_invite(c)
-                feed_ev(c.txn_mo, sip.TE_SEND_REQUEST)
-                c.t.t0 = now()
-                st.first_invite = st.first_invite or c.t.t0
-                st.attempted = st.attempted + 1
-                if io_.send(p.mo, "mo", w, ("INVITE (call %d -> %s)"):format(n, c.callee)) then
-                    -- The message names what did arrive, so "the core never
-                    -- answered" and "the core answered but the callee never rang"
-                    -- are not reported as the same failure.
-                    carm(c, M.t_ms, function()
-                        call_fail(c, c.t.t1 and "no ringing after 100 Trying"
-                                            or  "no response to the INVITE")
-                    end)
-                else
-                    call_fail(c, "INVITE send failed", nil)
-                end
-            end
+            local function fire() place(base_n + i, p.mo, p.mt, i <= st.media_calls, gen) end
             if spacing > 0 then loop:after((i - 1) * spacing, fire) else fire() end
         end
     end
+
+    -- Duration mode: each pair calls, waits M.gap_ms after the call ends and
+    -- calls again until M.duration_s has passed; then the calls in flight
+    -- finish and the phase ends. With CALL_REVERSE on, a pair's calls
+    -- alternate direction, so both ends originate as often.
+    --
+    -- What is kept per call is bounded, because a soak is about the network's
+    -- memory and the tool's must not grow with it: placing a pair's call k
+    -- first folds call k-2 into the media figures and closes its sockets
+    -- (collect_call), which also frees its port block for call k. Call k-1
+    -- stays open meanwhile, so its late media is still counted.
+    local run_loop
 
     function P.begin(done)
         -- Structural pairs: 1<->2, 3<->4, ... A pair is eligible only when BOTH
@@ -828,6 +880,7 @@ function M.new(ctx)
 
         st.media_calls = M.media < 0 and #list or math.min(M.media, #list)
         local spacing = M.cps > 0 and math.floor(1000 / M.cps) or 0
+        if M.duration_s > 0 then return run_loop(list, spacing, done) end
 
         run_series(list, 0, 0, M.reverse and "originating series" or nil, spacing, function()
             if not M.reverse then return done() end
@@ -852,9 +905,9 @@ function M.new(ctx)
     --   4. expected-vs-received at a fixed ptime — computed without RTCP at all,
     --      which is what catches "no reports ever arrived" (the shape the
     --      rtpengine routing bug takes) instead of reporting it as no data.
-    function P.collect()
+    local function collect_call(c)
         local mm = st.media
-        for _, c in ipairs(calls) do
+        do
             -- A call that never reached its 200 OK still opened both sockets at
             -- INVITE time, and they carried nothing because nothing was ever
             -- negotiated. Those streams are counted APART from the media figures:
@@ -916,6 +969,88 @@ function M.new(ctx)
                 end
             end
             if counted > 0 then mm.calls = mm.calls + 1 end
+        end
+        -- Done with: its ports and datapath filters go back, and nothing holds
+        -- it any more.
+        if c.sess_mo then c.sess_mo:close() end
+        if c.sess_mt then c.sess_mt:close() end
+        if media_hook.release then
+            for _, f in ipairs(c.tfts) do media_hook.release(f.sub, f.h) end
+        end
+        calls[c.n], by_callid[c.call_id] = nil, nil
+    end
+
+    function P.collect()
+        for _, c in pairs(calls) do collect_call(c) end
+    end
+
+    run_loop = function(list, spacing, done)
+        local t_start = now()
+        local deadline = t_start + M.duration_s * 1000
+        local n, idle, ticker, guard_l, ended = 0, 0, nil, nil, false
+
+        log.banner(("Calls — every one of %d pair(s) for %ds, %d carrying RTP, %d ms hold, %d ms gap%s")
+            :format(#list, M.duration_s, st.media_calls, M.hold_ms, M.gap_ms,
+                    M.reverse and ", alternating direction" or ""))
+        log.line("", ("%d of %d structural pair(s) eligible"):format(st.eligible, st.pairs_total))
+        dialled_line(list[1].mt)
+
+        local function progress()
+            local active = 0
+            for _, c in pairs(calls) do if not c.done then active = active + 1 end end
+            log.line(("t+%ds"):format(math.floor((now() - t_start) / 1000)),
+                ("%d attempted, %d answered, %d failed, %d up")
+                :format(st.attempted, st.answered, stats_.total(st.stage), active))
+        end
+
+        local function finish()
+            if ended then return end
+            ended = true
+            if ticker then loop:cancel(ticker); ticker = nil end
+            if guard_l then loop:cancel(guard_l); guard_l = nil end
+            progress()
+            done()
+        end
+
+        local function tick()
+            progress()
+            ticker = loop:after(M.report_s * 1000, tick)
+        end
+        if M.report_s > 0 then ticker = loop:after(M.report_s * 1000, tick) end
+
+        -- Every call carries its own step timers, so the calls in flight at the
+        -- deadline end by themselves; this only backs that up.
+        guard_l = loop:after(M.duration_s * 1000 + spacing * #list
+                             + 2 * M.t_ms + M.answer_ms + M.hold_ms + 5000, function()
+            guard_l = nil
+            for _, c in pairs(calls) do
+                if not c.done then call_fail(c, "call phase deadline", nil) end
+            end
+            finish()
+        end)
+
+        local function next_call(i, p)
+            if ended then return end
+            if now() >= deadline then
+                idle = idle + 1
+                if idle == #list then finish() end
+                return
+            end
+            p.k = (p.k or 0) + 1
+            local gen = p.k % 2
+            if p.hist and p.hist[gen] then collect_call(p.hist[gen]) end
+            p.hist = p.hist or {}
+            local mo, mt = p.mo, p.mt
+            if M.reverse and gen == 0 then mo, mt = mt, mo end
+            n = n + 1
+            p.hist[gen] = place(n, mo, mt, i <= st.media_calls, gen, function()
+                loop:after(M.gap_ms, function() next_call(i, p) end)
+            end)
+        end
+
+        for i, p in ipairs(list) do
+            if spacing > 0 then loop:after((i - 1) * spacing, function() next_call(i, p) end)
+            else next_call(i, p) end
         end
     end
 
@@ -995,7 +1130,7 @@ function M.new(ctx)
         local mm = st.media
         if mm.streams > 0 then
             log.banner(("Media quality — %d stream(s) over %d of %d call(s) carrying RTP  [%s, %d ms, RTCP %d ms]")
-                :format(mm.streams, mm.calls, st.media_calls,
+                :format(mm.streams, mm.calls, st.media_placed,
                         MEDIA.pt == 0 and "G.711 PCMU" or ("payload type " .. MEDIA.pt),
                         MEDIA.ptime_ms, MEDIA.rtcp_ms))
             log.line("packets sent / received", ("%d / %d"):format(mm.tx, mm.rx))

@@ -822,6 +822,37 @@ spec ("gtpu_bpf") {
     }
 
     context ("teardown") {
+        it ("keeps a bearer's decap entry until its last filter goes", !!g) {
+            /* 0x1006 carries two filters (UDP and ESP to PCSCF). Removing
+             * one must leave the downlink on that bearer working. */
+            gtpu_tft_t udp;
+            memset(&udp, 0, sizeof udp);
+            udp.tunnel             = bearer_a;
+            udp.tunnel.local_teid  = 0x1006;
+            udp.tunnel.remote_teid = 0x2006;
+            udp.tunnel.ebi         = 5;
+            memcpy(udp.tunnel.inner_addr, PCSCF, 4);
+            udp.proto              = 17;
+            udp.ue_port            = 5060;
+            gtpu_tft_t esp = udp;
+            esp.proto      = 50;
+            esp.ue_port    = 0;
+
+            uint8_t  inner[128], in[256], out[4096];
+            size_t   ilen = inner_udp4(inner, UE, 5060, 40000, "downlink-shared");
+            size_t   ln   = gpdu4(in, GTPU_MT_GPDU, 0x1006, 0, inner, ilen);
+            uint32_t ret;
+            size_t   olen;
+
+            check(gtpu_tft_del(g, &esp) == GTPU_OK);
+            check(run_prog(decap_fd, in, ln, out, &olen, &ret) == 0);
+            check(olen == 14 + ilen); /* still decapsulated */
+
+            check(gtpu_tft_del(g, &udp) == GTPU_OK);
+            check(run_prog(decap_fd, in, ln, out, &olen, &ret) == 0);
+            check(olen == ln); /* the last filter took it: unknown TEID */
+        }
+
         it ("removes bearers and closes", !!g) {
             gtpu_tunnel_t b = bearer_a;
             check(gtpu_teid_del(g, &bearer_a) == GTPU_OK);

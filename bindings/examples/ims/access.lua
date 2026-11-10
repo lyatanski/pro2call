@@ -51,6 +51,8 @@
 -- returns A with
 --   A.subs                the subscriber list (== o.subs, filled by attach_burst)
 --   A.media.program(sub, addr, port)  the media-TFT hook ims/call_phase.lua calls
+--                         returns a handle for the filters it installed
+--   A.media.release(sub, h)  ... and takes them out again, once the call is over
 --   A.report_rx(sub, what) a downlink reply came back down this bearer's decap
 --                          entry — regflow's on_response hook
 --   A.attach_burst()      fire every subscriber's Create Session Request
@@ -102,9 +104,14 @@ M.inner_mtu    = cfg.num("GTPU_INNER_MTU", 1464)
 -- protected ports and SPIs in ims/cfg.lua. The stride is 0x10, so a second and
 -- third dedicated bearer stay inside this subscriber's range.
 local S5_UP_TEID_BASE = 0x200
--- The EBI we assign the dedicated (media) bearer when the network asks for one,
--- and quote back when it asks us to delete it.
-local DED_EBI = 6
+-- The EBI we assign the first dedicated (media) bearer when the network asks
+-- for one, and quote back when it asks us to delete it. Further ones take the
+-- next free EBI, up to 15 (the EBI is four bits), and a deleted bearer's EBI
+-- and TEID go back for reuse: a run that places calls for hours brings up and
+-- tears down a bearer per call. Ten slots also keep the TEIDs inside the 0x10
+-- stride above.
+local DED_EBI   = 6
+local DED_SLOTS = 10
 
 -- Resolve a host name to an IPv4 literal via the net module's own resolver (a
 -- dotted quad passes through unchanged). No external tools.
@@ -437,11 +444,13 @@ function M.new(o)
     -- Two per UE (RTP, and RTCP on the next port), each carrying the UE's own PAA
     -- as the inner-source match: that is what keeps many UEs talking to the ONE
     -- rtpengine on their own bearers, exactly as it does for the one P-CSCF.
-    local function apply_media_tfts(sub, op, only)
-        if not (up and sub.media_tft) then return end
-        for _, t in ipairs(sub.media_tft.tuples) do
+    local function apply_media_tfts(sub, op, only, tft, keep)
+        tft = tft or sub.media_tft
+        if not (up and tft) then return end
+        for _, t in ipairs(tft.tuples) do
             local bearer = t.bearer
-            if bearer and (only == nil or only == t.follows_media) then
+            if bearer and (only == nil or only == t.follows_media)
+               and not (keep and keep(t)) then
                 local tun = gtp.Tunnel()
                 tun.local_teid, tun.remote_teid = bearer.local_teid, bearer.remote_teid
                 tun.ebi, tun.ue_addr, tun.remote_addr = bearer.ebi, t.addr, bearer.remote_addr
@@ -451,9 +460,9 @@ function M.new(o)
                 local pok, perr = pcall(function()
                     if op == "del" then up:del_filter(f) else up:add_filter(f) end
                 end)
-                -- A failed delete is expected and harmless: several filters share
-                -- one bearer's decap entry, and removing the first takes that
-                -- entry with it, so the rest have nothing left to unhook.
+                -- Several filters share one bearer's decap entry, which the
+                -- datapath keeps until the last of them goes. A failed delete
+                -- is harmless: the filter is already gone, with its bearer.
                 if not pok and op ~= "del" and cfg.verbose then
                     log.slog(sub, "media filter", ("%s %s %s:%d failed: %s")
                         :format(op, t.label, t.addr, t.port, log.why(perr)))
@@ -491,6 +500,23 @@ function M.new(o)
         log.slog(sub, "media on bearer", ("%s (EBI %d, TEID %#x) -> %s:%d, RTCP on the %s bearer")
             :format(kind, bearer.ebi or 0, bearer.local_teid or 0, addr, port,
                     rtcp_on_media and kind or "default"))
+        return sub.media_tft
+    end
+
+    -- A call is over: take out the filters program_media_tfts installed for
+    -- it. Left in, every call adds two and the filter table fills over a long
+    -- run. A filter is keyed on its tuple alone, so one the subscriber's
+    -- current call also uses (rtpengine handed out the same port again) is
+    -- kept: deleting it would take the current call's.
+    local function release_media_tfts(sub, h)
+        if not h then return end
+        local cur = sub.media_tft ~= h and sub.media_tft or nil
+        apply_media_tfts(sub, "del", nil, h, cur and function(t)
+            for _, c in ipairs(cur.tuples) do
+                if c.proto == t.proto and c.addr == t.addr and c.port == t.port then return true end
+            end
+        end)
+        if sub.media_tft == h then sub.media_tft = nil end
     end
 
     -- The Create Bearer Request and the SDP answer race. If the bearer is known
@@ -660,11 +686,18 @@ function M.new(o)
             -- then rejects uplink ("Off-filter G-PDU") and delivers downlink on a
             -- TEID we have no decap entry for. The per-subscriber TEID stride is
             -- 0x10, so +n stays inside it.
-            local n    = (sub and (sub.ded_n or 0) + 1) or 1
+            local n = 1
+            if sub then
+                sub.ded_used = sub.ded_used or {}
+                while n <= DED_SLOTS and sub.ded_used[n] do n = n + 1 end
+            end
+            local full  = n > DED_SLOTS
+            local cause = full and gtp.GTP2_CAUSE_NO_RESOURCES_AVAILABLE
+                               or  gtp.GTP2_CAUSE_REQUEST_ACCEPTED
             local ebi  = DED_EBI + n - 1
             local teid = (sub and sub.ded_teid + n - 1) or (S5_UP_TEID_BASE - 1)
             local rbc = gtp.BearerContext()
-            rbc.ebi, rbc.cause = ebi, gtp.GTP2_CAUSE_REQUEST_ACCEPTED
+            rbc.ebi, rbc.cause = full and 0 or ebi, cause
             local u = gtp.Fteid()
             u.if_type, u.teid, u.addr4 = gtp.GTP2_IF_S5S8U_SGW, teid, sgw_ip
             rbc:add_fteid(2, u)
@@ -673,12 +706,15 @@ function M.new(o)
             local resp = gtp.CreateBearerResponse()
             resp.teid     = (sub and sub.pgw_ctrl_teid) or 0
             resp.sequence = req.sequence
-            resp.cause    = gtp.GTP2_CAUSE_REQUEST_ACCEPTED
+            resp.cause    = cause
             resp.pti      = req.pti
             resp:add_bearer(rbc)
             ep:send_create_bearer_response(resp, host, port)
-            if sub then
-                sub.ded_n = n
+            if sub and full then
+                log.slog(sub, "<> Create Bearer", ("seq %d refused: all %d dedicated bearer slots in use")
+                    :format(req.sequence, DED_SLOTS))
+            elseif sub then
+                sub.ded_used[n] = true
                 log.slog(sub, "<> Create Bearer", ("seq %d, EBI %d accepted (media #%d, TEID %#x)")
                     :format(req.sequence, ebi, n, teid))
                 -- The newest dedicated bearer is the one the call's media rule
@@ -802,7 +838,11 @@ function M.new(o)
                         if e == sub.ded_bearer.ebi then sub.ded_released = true end
                     end
                 end
-                if whole_pdn then sub.pdn_gone = true end
+                -- Its EBI and TEID are free for the next Create Bearer.
+                for _, e in ipairs(ebis) do
+                    if sub.ded_used then sub.ded_used[e - DED_EBI + 1] = nil end
+                end
+                if whole_pdn then sub.pdn_gone = true; sub.ded_used = nil end
                 log.slog(sub, "<> Delete Bearer", ok2
                     and ("seq %d, %s released"):format(seq, whole_pdn and "PDN connection"
                          or ("EBI " .. table.concat(ebis, ",")))
@@ -824,7 +864,7 @@ function M.new(o)
 
     local A = {}
     A.subs = subs
-    A.media = { program = program_media_tfts }
+    A.media = { program = program_media_tfts, release = release_media_tfts }
     A.report_rx = report_rx
 
     -- ---- the attach burst ----

@@ -269,6 +269,35 @@ do
     check(rx == 5, ("media flowed under the shared loop (%d packets)"):format(rx))
 end
 
+-- close() frees the ports at once, even while a handler that closes over
+-- the stream still pins it against the collector
+do
+    local loop = net.Loop()
+    local pa, pb = port_pair(), port_pair()
+    local a = rtp.Stream(loop, "127.0.0.1", pa)
+    local b = rtp.Stream(loop, "127.0.0.1", pb)
+    a:set_peer("127.0.0.1", pb)
+    b:set_peer("127.0.0.1", pa)
+    local rx = 0
+    b:set_handler({ on_rtp = function() rx = rx + b:ssrc() * 0 + 1 end })
+    a:send(PCMU_160, 160)
+    pump(loop, 50)
+    check(rx == 1, ("media flowed before close (%d packets)"):format(rx))
+
+    b:close()
+    b:close()                                   -- idempotent
+    check(b:stats().rx_packets == 1, "stats still read after close")
+    local ok = pcall(function() a:send(PCMU_160, 160) end)
+    pump(loop, 50)
+    check(ok and rx == 1, "a closed stream receives nothing")
+
+    local ok2, b2 = pcall(rtp.Stream, loop, "127.0.0.1", pb)
+    check(ok2, "the closed stream's ports bind again (" .. (ok2 and "bound" or tostring(b2)) .. ")")
+    a:close()
+    check(not pcall(function() a:send(PCMU_160, 160) end), "sending after close fails")
+    if ok2 then b2:close() end
+end
+
 -- the non-local source flag is accepted (binding it needs CAP_NET_ADMIN)
 do
     local loop = net.Loop()

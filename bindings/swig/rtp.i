@@ -250,6 +250,11 @@ struct RtpLuaTable;
 /* ---- pruning ---- */
 
 %ignore rtp::Error;
+#ifdef SWIGLUA
+/* Replaced below by a close() that also drops the Lua handler. */
+%ignore rtp::Stream::close;
+%rename(close) rtp::Stream::close_lua;
+#endif
 
 /* ---- the facade itself ---- */
 
@@ -282,6 +287,15 @@ struct RtpLuaTable;
         auto* h = new LuaStreamHandler(handler.L, handler.ref);
         rtplua_handlers()[$self].reset(h);   /* frees any previous handler */
         $self->set_handler(h);
+    }
+    /* Close the sockets and release the handler table's registry ref.
+     * That ref is what keeps a stream alive under the collector when its
+     * handler closes over the stream itself, so without this a script
+     * that opens streams for hours leaks one port pair per stream. */
+    void close_lua() {
+        $self->close();
+        $self->set_handler(static_cast<rtp::StreamHandler*>(nullptr));
+        rtplua_handlers().erase($self);
     }
 }
 #endif

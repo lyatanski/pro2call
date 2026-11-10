@@ -470,6 +470,36 @@ int gtpu_tft_add(gtpu_ebpf_t* g, const gtpu_tft_t* f)
     return err_sys(rc);
 }
 
+/* Whether a filter or default-bearer route still encapsulates onto
+ * local_teid, and so still needs the bearer's shared decap entry. A walk
+ * of the three tx maps: they hold one entry per filter and per default
+ * bearer, a few per UE, so this stays cheap next to the syscalls of the
+ * delete itself. Called under g->lock. */
+static bool teid_in_use(gtpu_ebpf_t* g, uint32_t teid)
+{
+    const int fds[] = {
+        bpf_map__fd(g->skel->maps.teid_tft_map),
+        bpf_map__fd(g->skel->maps.teid_tx4_map),
+        bpf_map__fd(g->skel->maps.teid_tx6_map),
+    };
+    union {
+        struct gtpu_tft_key  tft;
+        struct gtpu_lpm4_key v4;
+        struct gtpu_lpm6_key v6;
+    } cur, next;
+    for (size_t i = 0; i < sizeof fds / sizeof fds[0]; i++) {
+        void* prev = NULL;
+        while (bpf_map_get_next_key(fds[i], prev, &next) == 0) {
+            struct gtpu_tx_tun tx;
+            if (bpf_map_lookup_elem(fds[i], &next, &tx) == 0 && tx.local_teid == teid)
+                return true;
+            cur  = next;
+            prev = &cur;
+        }
+    }
+    return false;
+}
+
 int gtpu_tft_del(gtpu_ebpf_t* g, const gtpu_tft_t* f)
 {
     if (!g) return GTPU_E_INVAL;
@@ -481,9 +511,15 @@ int gtpu_tft_del(gtpu_ebpf_t* g, const gtpu_tft_t* f)
     int rx_fd  = bpf_map__fd(g->skel->maps.teid_rx_map);
     int tft_fd = bpf_map__fd(g->skel->maps.teid_tft_map);
 
+    /* The decap entry is shared by every filter on the bearer (see
+     * gtpu_tft_add), so it goes only with the last of them: removing a
+     * call's media filter must not cut the SIP downlink that rides the
+     * same bearer. */
     pthread_mutex_lock(&g->lock);
     int rc1 = bpf_map_delete_elem(tft_fd, &k);
-    int rc2 = bpf_map_delete_elem(rx_fd, &f->tunnel.local_teid);
+    int rc2 = 0;
+    if (!teid_in_use(g, f->tunnel.local_teid))
+        rc2 = bpf_map_delete_elem(rx_fd, &f->tunnel.local_teid);
     pthread_mutex_unlock(&g->lock);
     return err_sys(rc1 ? rc1 : rc2);
 }
