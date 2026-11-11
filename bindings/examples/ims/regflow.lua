@@ -290,6 +290,22 @@ function M.new(o)
         -- Ignore late replies once terminal — unless a restoration has opened
         -- a new registration on the subscriber since.
         if sub.done and not sub.restoring then return end
+        -- Only the answer to the REGISTER in flight moves the machines. A slow
+        -- P-CSCF retransmits its 401 to the UDP retransmissions of the previous
+        -- REGISTER, and that copy can land just after the authenticated
+        -- REGISTER went out: taken as its answer, it reads as a second
+        -- challenge (and fails as one), and the step deadline is lost. Each
+        -- REGISTER carries a new CSeq (sub.cseq is bumped before it is built),
+        -- so the number tells the two apart; the deadline stays armed.
+        local okc, cs = pcall(function() return m:cseq() end)
+        if not okc or cs.method ~= sip.REGISTER or cs.number ~= sub.cseq then
+            if cfg.verbose then
+                log.slog(sub, "SIP", ("ignoring %d %s for CSeq %s (awaiting %d)")
+                    :format(m.status, m.reason,
+                            okc and tostring(cs.number) or "?", sub.cseq))
+            end
+            return
+        end
         F.disarm(sub)
         pcall(function() sub.txn:recv(m) end)
         pcall(function() sub.auth:recv(m) end)
