@@ -17,6 +17,10 @@
 --   MT --180 Ringing--> ... --> MO,  then after CALL_ANSWER_MS a 200 OK with
 --   the answer SDP; MO ACKs, media runs for CALL_HOLD_MS, MO sends BYE.
 --
+-- CALL_MIX makes each pair place other calls besides that one, in turn: a
+-- busy callee, a CANCEL while ringing or during early media, a call the
+-- caller's credit cuts off, and one refused for no credit (see the knobs).
+--
 -- The callee is dialled by NUMBER: the Request-URI and To of that INVITE are the
 -- tel URI of its MSISDN (CALL_URI=tel, the default) — what a handset does, and
 -- one more link of the chain under test rather than assumed, because the number
@@ -119,6 +123,44 @@ assert(not M.expect_status or M.expect_status >= 300,
        "CALL_EXPECT_STATUS is a non-2xx final response")
 assert(M.expect_release == "ue" or M.expect_release == "network",
        "CALL_EXPECT_RELEASE is ue or network")
+-- The calls each pair places, in order: CALL_MIX is a comma-separated list
+-- of the outcomes below, and every pair walks the whole list, so two
+-- subscribers are enough to see all of them. One pass per series in the
+-- default mode (each direction gets the whole list), round and round in
+-- duration mode (each entry once per direction). "ok" alone, the default,
+-- is the plain answered call and changes nothing else.
+--
+--   ok        answered, held for CALL_HOLD_MS, our BYE (or CALL_EXPECT_*)
+--   busy      the callee answers the INVITE with 486; the caller must get it
+--   noanswer  the callee rings (180) and never answers; after CALL_RING_MS
+--             the caller CANCELs, and needs the CANCEL to reach the callee
+--             and the 487 to come back
+--   cancel    the same after a 183 carrying the callee's SDP answer, with
+--             early media flowing both ways until the CANCEL; a call with
+--             RTP also needs the caller to have heard some of it
+--   kill      answered and held up to CALL_KILL_HOLD_MS, which has to be
+--             longer than the caller's credit: the network's BYE must come
+--             first. It empties the caller's account, so in a list it goes
+--             last, or before nocredit
+--   nocredit  refused with 402 before the callee rings: the caller has no
+--             credit left
+local VARIANTS = {
+    ok       = { media = true },
+    busy     = { status = 486 },
+    noanswer = { status = 487, cancel = true },
+    cancel   = { status = 487, cancel = true, media = true, early = true },
+    kill     = { media = true },
+    nocredit = { status = 402 },
+}
+M.VARIANTS = VARIANTS
+M.mix = {}
+for v in (cfg.str("CALL_MIX", "ok")):gmatch("[^,%s]+") do
+    assert(VARIANTS[v], ("CALL_MIX: unknown call '%s' (ok, busy, noanswer, cancel, kill, nocredit)"):format(v))
+    M.mix[#M.mix + 1] = v
+end
+if #M.mix == 0 then M.mix[1] = "ok" end
+M.ring_ms      = cfg.num("CALL_RING_MS", 1000)        -- ringing before the CANCEL
+M.kill_hold_ms = cfg.num("CALL_KILL_HOLD_MS", 60000)  -- longest a kill call waits
 -- Which bearer carries media: "auto" uses the dedicated bearer once the Create
 -- Bearer Request brings one (re-homing if it arrives after the answer),
 -- "default" keeps media on the default bearer — worth having, because a UPF
@@ -208,6 +250,9 @@ function M.new(ctx)
         pairs_total = 0, eligible = 0, attempted = 0, answered = 0, released = 0,
         expected = 0,                         -- refused with CALL_EXPECT_STATUS
         net_released = 0,                     -- the network's BYE came first
+        passed = 0,                           -- calls that ended the way CALL_MIX asked
+        by_variant = {},                      -- CALL_MIX entry -> { n, ok }
+        early = { calls = 0, mo = 0, mt = 0 }, -- cancel calls with RTP, and who heard it
         media_calls = 0, media_placed = 0, first_invite = nil, last_answer = nil,
         by_status = {},                       -- final-response counts, non-2xx
         stage = {},                           -- where a failed call died
@@ -221,12 +266,13 @@ function M.new(ctx)
     }
     P.stats = st
 
-    -- gen tells the reversed series' streams apart from the first series':
-    -- same subscriber, same idx, but the first series' Stream is still open
-    -- (P.collect() reads it after the whole run stops, so nothing closes it
-    -- early) -- so the second series needs its own, non-overlapping block.
-    -- Duration mode alternates gen 0/1 per pair and closes a pair's call two
-    -- back before it places the next, so the two blocks are all it ever uses.
+    -- gen keeps a subscriber's calls that are open at once on different
+    -- port blocks. A pair's calls alternate between two blocks, and placing
+    -- a call first closes the one two back that held its block
+    -- (collect_call), so the call before it stays open for its late media.
+    -- The default mode gives the reversed series blocks 2/3: the first
+    -- series' last calls are still open (P.collect() reads them after the
+    -- whole run stops). Duration mode only ever uses 0/1.
     local function media_port(sub, gen) return MEDIA.port_base + (gen or 0) * cfg.nsubs * 4 + sub.idx * 4 end
 
     -- ---- the downlink size budget ------------------------------------------
@@ -466,9 +512,15 @@ function M.new(ctx)
     -- on the downlink size budget above. Uniqueness is still guaranteed — the
     -- call index is unique within the run and the UE address within the pool, and
     -- every message of the call carries both.
-    local function make_call(n, mo, mt, with_media, gen)
+    local function make_call(n, mo, mt, with_media, gen, variant)
+        variant = variant or "ok"
+        local v = VARIANTS[variant]
         local c = {
-            n = n, mo = mo, mt = mt, media = with_media, gen = gen or 0, cseq = 1,
+            n = n, mo = mo, mt = mt, media = with_media and v.media, gen = gen or 0, cseq = 1,
+            variant = variant,
+            -- The non-2xx final this call should end with, if any: its
+            -- variant's, or for an answered one CALL_EXPECT_STATUS.
+            expect_status = v.status or M.expect_status,
             call_id  = ("c%d@%s"):format(n, mo.ue_addr),
             from_tag = ("o%d"):format(n),
             to_tag   = ("t%d"):format(n),
@@ -521,12 +573,53 @@ function M.new(ctx)
         end
     end
 
+    -- Why a call that ended without an error still did not end the way its
+    -- variant asks, or nil when it did.
+    local function verdict(c)
+        local v = c.variant
+        if c.expect_status then
+            if c.final ~= c.expect_status then
+                return ("%s ended with %s, not %d"):format(v,
+                    c.final and tostring(c.final) or "no final response", c.expect_status)
+            end
+            if v == "nocredit" and c.t.t2 then return "the callee rang with no credit left" end
+            if VARIANTS[v].cancel and not c.mt_cancelled then
+                return "487 came back but the CANCEL never reached the callee"
+            end
+            if VARIANTS[v].early and c.media and c.early_mo == 0 then
+                return "no early media reached the caller before the CANCEL"
+            end
+            return nil
+        end
+        if not c.answered_at then return "never answered" end
+        if (v == "kill" or M.expect_release == "network") and not c.net_bye then
+            return v == "kill" and ("the credit did not run out in %d ms"):format(M.kill_hold_ms)
+                                or "the network never sent the BYE"
+        end
+        return nil
+    end
+
     local function call_finish(c)
         if c.done then return end
         c.done = true
         if c.timer then loop:cancel(c.timer); c.timer = nil end
         stop_media(c)
         record_kpis(c)
+        local bv = st.by_variant[c.variant] or { n = 0, ok = 0 }
+        st.by_variant[c.variant] = bv
+        bv.n = bv.n + 1
+        if not c.err then
+            local why = verdict(c)
+            if why then
+                c.err = why
+                stats_.fail(st.stage, c.stage, why)
+                log.slog(c.mo, "call", ("%d (%s) FAILED: %s"):format(c.n, c.variant, why))
+            else
+                c.passed = true
+                st.passed = st.passed + 1
+                bv.ok = bv.ok + 1
+            end
+        end
         if c.on_done then return c.on_done(c) end
         pending = pending - 1
         if pending <= 0 then
@@ -557,6 +650,7 @@ function M.new(ctx)
     local function on_answered(c, m)
         c.t.t6 = now()
         c.answered_at = c.t.t6
+        c.final = m.status
         c.stage = "answered"
         st.answered = st.answered + 1
         st.last_answer = c.t.t6
@@ -581,7 +675,9 @@ function M.new(ctx)
         start_media(c)
 
         c.stage = "media"
-        carm(c, M.hold_ms, function()
+        -- A kill call waits for the network to end it; our BYE at the end of
+        -- CALL_KILL_HOLD_MS only clears up after a credit that never ran out.
+        carm(c, c.variant == "kill" and M.kill_hold_ms or M.hold_ms, function()
             -- Always BYE: rtpengine holds a port pair per call for its 60 s
             -- timeout, so a run that walks away from calls exhausts its
             -- 30000-40000 range instead of failing anything visibly.
@@ -603,16 +699,21 @@ function M.new(ctx)
     end
 
     -- MT: answer the INVITE we are holding, with the SDP answer.
-    local function send_answer(c)
-        if c.done or not c.mt_req then return end
+    local function answer_sdp(c)
         local mt = c.mt
-        local body = sdp.offer{ addr = mt.ue_addr, port = media_port(mt, c.gen),
-                                pt = c.mt_pt or MEDIA.pt,
-                                codec = c.mt_codec or MEDIA.codec,
-                                rate = c.mt_rate or MEDIA.rate,
-                                ptime = MEDIA.ptime_ms }
+        return sdp.offer{ addr = mt.ue_addr, port = media_port(mt, c.gen),
+                          pt = c.mt_pt or MEDIA.pt,
+                          codec = c.mt_codec or MEDIA.codec,
+                          rate = c.mt_rate or MEDIA.rate,
+                          ptime = MEDIA.ptime_ms }
+    end
+
+    local function send_answer(c)
+        if c.done or not c.mt_req or c.mt_final then return end
+        c.mt_final = true
+        local mt = c.mt
         local w = wire.response(mt, c.mt_req, { status = 200, reason = "OK",
-                                                to_tag = c.to_tag, body = body })
+                                                to_tag = c.to_tag, body = answer_sdp(c) })
         -- The 2xx ends the INVITE server transaction (§17.2.1); the ACK that
         -- follows is a transaction of its own, which is why P.request feeds it
         -- through feed_msg rather than into this machine.
@@ -648,15 +749,64 @@ function M.new(ctx)
             end
         end
 
+        -- Busy: the INVITE's final answer straight away. The ACK for it comes
+        -- back hop by hop and lands on txn_mt (P.request).
+        if c.variant == "busy" then
+            c.t.t3 = now()
+            c.mt_final = true
+            feed_ev(c.txn_mt, sip.TE_SEND_3XX_6XX)
+            return io_.send(sub, "mt", wire.response(sub, m, { status = 486,
+                reason = "Busy Here", to_tag = c.to_tag }), "486 Busy Here")
+        end
+
         -- 180 now (that is what the MO's post-dial delay measures), 200 OK after
-        -- the deliberate ring hold.
-        local ring = wire.response(sub, m, { status = 180, reason = "Ringing",
-                                             to_tag = c.to_tag })
+        -- the deliberate ring hold. The cancel variant sends a 183 with the
+        -- answer SDP instead and starts its early media; neither it nor
+        -- noanswer ever answers, the caller CANCELs them.
+        local early = c.variant == "cancel"
+        local ring = early
+            and wire.response(sub, m, { status = 183, reason = "Session Progress",
+                                        to_tag = c.to_tag, body = answer_sdp(c) })
+            or  wire.response(sub, m, { status = 180, reason = "Ringing",
+                                        to_tag = c.to_tag })
         feed_ev(c.txn_mt, sip.TE_SEND_1XX)
         feed_ev(c.dlg_mt, sip.DE_EARLY)
         c.t.t3 = now()
-        io_.send(sub, "mt", ring, "180 Ringing")
+        io_.send(sub, "mt", ring, early and "183 Session Progress" or "180 Ringing")
+        if early then
+            c.mt_ready = c.sess_mt ~= nil
+            start_media(c)
+        end
+        if VARIANTS[c.variant].cancel then return end
         loop:after(M.answer_ms, function() send_answer(c) end)
+    end
+
+    -- MO: the callee has rung for CALL_RING_MS; give up on it. The CANCEL is
+    -- the INVITE's twin (RFC 3261 §9.1): same Request-URI, Route, Via branch,
+    -- Call-ID, From, To (no tag) and CSeq number.
+    local function send_cancel(c)
+        if c.done or c.t.tc then return end
+        c.t.tc = now()
+        c.stage = "cancel"
+        if c.media then
+            -- What each end heard before the CANCEL: early media, if any.
+            c.early_mo = c.mstat_mo and c.mstat_mo.rx or 0
+            c.early_mt = c.mstat_mt and c.mstat_mt.rx or 0
+            st.early.calls = st.early.calls + 1
+            if c.early_mo > 0 then st.early.mo = st.early.mo + 1 end
+            if c.early_mt > 0 then st.early.mt = st.early.mt + 1 end
+        end
+        stop_media(c)
+        local mo = c.mo
+        local b = io_.preload_route(wire.builder:request(sip.CANCEL, c.callee), mo)
+        b:header(sip.H_VIA, ("SIP/2.0/UDP %s;branch=%s"):format(wire.ue_at(mo), c.branch))
+            :header_u32(sip.H_MAX_FORWARDS, 70)
+            :header(sip.H_FROM, c.from_hdr)
+            :header(sip.H_TO, c.to_hdr)
+            :header(sip.H_CALL_ID, c.call_id)
+            :header(sip.H_CSEQ, ("%d CANCEL"):format(c.cseq))
+        io_.send(mo, "mo", b:done(), "CANCEL")
+        carm(c, M.t_ms, function() call_fail(c, "no final response to the cancelled INVITE") end)
     end
 
     -- Incoming requests: the MT INVITE and its ACK, plus a BYE from whichever end
@@ -686,6 +836,7 @@ function M.new(ctx)
                 feed_msg(sub == c.mt and c.dlg_mt or c.dlg_mo, m)
                 -- Before our own BYE went out: the network ended the call.
                 if c.answered_at and not c.t.t9 then
+                    c.net_bye = true
                     st.net_released = st.net_released + 1
                     st.kpi.net_hold[#st.kpi.net_hold + 1] = now() - c.answered_at
                 end
@@ -696,7 +847,26 @@ function M.new(ctx)
             end
             return
         elseif m.method == sip.CANCEL then
-            if c then call_fail(c, "cancelled by the network", nil) end
+            -- 200 for the CANCEL itself (it is its own transaction), then,
+            -- unless we answered first, 487 for the INVITE it cancels.
+            io_.send(sub, "mt", wire.response(sub, m, {
+                status = 200, reason = "OK", to_tag = (c and c.to_tag) or "x",
+                record_route = false,
+            }), "200 OK (CANCEL)")
+            if not c then return end
+            if c.mt_req and not c.mt_final then
+                c.mt_final = true
+                c.mt_cancelled = now()
+                c.mt_ready = false
+                feed_ev(c.txn_mt, sip.TE_SEND_3XX_6XX)
+                feed_ev(c.dlg_mt, sip.DE_TERMINATE)
+                io_.send(sub, "mt", wire.response(sub, c.mt_req, {
+                    status = 487, reason = "Request Terminated", to_tag = c.to_tag,
+                }), "487 Request Terminated")
+            end
+            -- Only the caller's own CANCEL is expected; one the network
+            -- sends on its own is a failure.
+            if not c.t.tc then call_fail(c, "cancelled by the network", nil) end
             return
         end
         if cfg.verbose then
@@ -737,14 +907,29 @@ function M.new(ctx)
             c.t.t1 = c.t.t1 or now()
             return
         elseif m.status > 100 and m.status < 200 then
-            if not c.t.t4 then
+            local first = not c.t.t4
+            if first then
                 c.t.t4 = now()
                 if cfg.verbose then
                     log.slog(sub, "<- " .. tostring(m.status), ("%s (dialog %s)")
                         :format(m.reason, c.dlg_mo:state_name()))
                 end
             end
-            carm(c, M.t_ms, function() call_fail(c, "no final response after ringing") end)
+            if not VARIANTS[c.variant].cancel then
+                carm(c, M.t_ms, function() call_fail(c, "no final response after ringing") end)
+                return
+            end
+            -- A provisional with SDP opens early media: point ours at it and
+            -- start sending, as the callee already has.
+            if c.media and c.sess_mo and not c.mo_ready and not c.t.tc
+               and m.body and #m.body > 0 then
+                local s = audio_of(m.body, c.mo, tostring(m.status))
+                if s then
+                    c.mo_ready = point_media(c, c.mo, c.sess_mo, s, tostring(m.status))
+                    start_media(c)
+                end
+            end
+            if first then carm(c, M.ring_ms, function() send_cancel(c) end) end
             return
         elseif m.status >= 200 and m.status < 300 then
             if c.t.t6 then return end            -- 200 retransmission
@@ -755,13 +940,14 @@ function M.new(ctx)
         -- transaction, so it reuses its branch and needs no route set) and record
         -- where the network said no.
         c.to_hdr = m:header("To")
+        c.final = m.status
         local ack = build_in_dialog(c, sip.ACK, "ACK", c.cseq, c.branch, nil)
         io_.send(c.mo, "mo", ack, "ACK (non-2xx)")
-        if m.status == M.expect_status then
-            st.expected = st.expected + 1
+        if m.status == c.expect_status then
+            if m.status == M.expect_status then st.expected = st.expected + 1 end
             if cfg.verbose then
-                log.slog(c.mo, "call", ("%d refused as expected: %d %s")
-                    :format(c.n, m.status, m.reason))
+                log.slog(c.mo, "call", ("%d (%s) ended as expected: %d %s")
+                    :format(c.n, c.variant, m.status, m.reason))
             end
             return call_finish(c)
         end
@@ -791,12 +977,13 @@ function M.new(ctx)
         end
     end
 
-    -- One call from mo to mt, numbered n and with its media on port block gen.
-    -- on_done, when given, is called as the call ends in place of the series'
-    -- countdown — set before the INVITE goes out, since a failed send ends the
-    -- call right here.
-    local function place(n, mo, mt, with_media, gen, on_done)
-        local c = make_call(n, mo, mt, with_media, gen)
+    -- One call from mo to mt, numbered n, with its media on port block gen
+    -- and ending the way `variant` (a CALL_MIX entry) says. on_done, when
+    -- given, is called as the call ends in place of the series' countdown —
+    -- set before the INVITE goes out, since a failed send ends the call right
+    -- here.
+    local function place(n, mo, mt, with_media, gen, variant, on_done)
+        local c = make_call(n, mo, mt, with_media, gen, variant)
         c.on_done = on_done
         calls[n] = c
         by_callid[c.call_id] = c
@@ -839,34 +1026,79 @@ function M.new(ctx)
             cfg.dial_uri == "sip" and "" or ", needs the number in the HSS profile"))
     end
 
-    -- One series: `series_list`'s (mo, mt) pairs, numbered from base_n + i so
-    -- Call-ID/branch/tags stay unique across both series sharing the one
-    -- `calls`/`by_callid` table, and tagged with `gen` (0 first series, 1
-    -- reversed) so their media lands on a distinct port block (see
-    -- media_port) — the first series' sockets are still open, held by `calls`
-    -- for P.collect() to read once the whole run stops. Everything else about
-    -- a series is identical; `label`, or nil, only decorates its banner.
-    local function run_series(series_list, base_n, gen, label, spacing, series_done)
+    local collect_call   -- below, with the media figures it folds a call into
+
+    -- The longest a pass through CALL_MIX can take with every step running
+    -- into its own deadline: the per-call timers end each call by themselves,
+    -- this only sizes the backstop behind them.
+    local function mix_budget()
+        local ms = 0
+        for _, v in ipairs(M.mix) do
+            ms = ms + 2 * M.t_ms + M.gap_ms
+                + (v == "kill" and M.kill_hold_ms or M.hold_ms)
+                + (VARIANTS[v].cancel and M.ring_ms or M.answer_ms)
+        end
+        return ms
+    end
+
+    local function mix_line()
+        if #M.mix == 1 and M.mix[1] == "ok" then return end
+        log.line("calls per pair", ("%s   (CALL_MIX)"):format(table.concat(M.mix, ", ")))
+    end
+
+    -- One series: each of `series_list`'s (mo, mt) pairs places the calls
+    -- of CALL_MIX one after the other, M.gap_ms apart, numbered from base_n
+    -- so Call-ID/branch/tags stay unique across both series sharing the one
+    -- `calls`/`by_callid` table. A pair's calls alternate between port
+    -- blocks gen0 and gen0 + 1 (see media_port), closing the call two back
+    -- before placing the next. The series ends when every pair has been
+    -- through the list; `label`, or nil, only decorates its banner.
+    local function run_series(series_list, base_n, gen0, label, spacing, series_done)
         finished = series_done
         local tag = label and (" (" .. label .. ")") or ""
         log.banner(("Calls%s — %d of %d eligible pair(s) (%d structural), %d carrying RTP%s")
             :format(tag, #series_list, st.eligible, st.pairs_total, st.media_calls,
                     M.cps > 0 and (" at %.1f call/s"):format(M.cps) or " in one burst"))
         dialled_line(series_list[1].mt)
+        mix_line()
+
+        local stopped = false
+        local function chain_done()
+            if stopped then return end
+            pending = pending - 1
+            if pending <= 0 then
+                stopped = true
+                if guard then loop:cancel(guard); guard = nil end
+                series_done()
+            end
+        end
 
         pending = #series_list
         -- Overall deadline so a lost 200 OK cannot hang the run.
-        guard = loop:after(spacing * #series_list + M.t_ms + M.hold_ms + 5000, function()
+        guard = loop:after(spacing * #series_list + mix_budget() + 5000, function()
             guard = nil
+            stopped = true
             for _, c in pairs(calls) do
                 if not c.done then call_fail(c, "call phase deadline", nil) end
             end
-            if pending > 0 then pending = 0; series_done() end
+            series_done()
         end)
 
         for i, p in ipairs(series_list) do
-            local function fire() place(base_n + i, p.mo, p.mt, i <= st.media_calls, gen) end
-            if spacing > 0 then loop:after((i - 1) * spacing, fire) else fire() end
+            local k, hist = 0, {}
+            local function next_call()
+                if stopped then return end
+                k = k + 1
+                if not M.mix[k] then return chain_done() end
+                local gen = gen0 + (k - 1) % 2
+                if hist[gen] then collect_call(hist[gen]) end
+                hist[gen] = place(base_n + (i - 1) * #M.mix + k, p.mo, p.mt,
+                                  i <= st.media_calls, gen, M.mix[k], function()
+                    if not M.mix[k + 1] then return next_call() end
+                    loop:after(M.gap_ms, next_call)
+                end)
+            end
+            if spacing > 0 then loop:after((i - 1) * spacing, next_call) else next_call() end
         end
     end
 
@@ -917,7 +1149,7 @@ function M.new(ctx)
             local rlist = {}
             for _, p in ipairs(list) do rlist[#rlist + 1] = { mo = p.mt, mt = p.mo } end
             loop:after(M.reverse_sleep_ms, function()
-                run_series(rlist, #list, 1, "reversed series", spacing, done)
+                run_series(rlist, #list * #M.mix, 2, "reversed series", spacing, done)
             end)
         end)
     end
@@ -933,7 +1165,7 @@ function M.new(ctx)
     --   4. expected-vs-received at a fixed ptime — computed without RTCP at all,
     --      which is what catches "no reports ever arrived" (the shape the
     --      rtpengine routing bug takes) instead of reporting it as no data.
-    local function collect_call(c)
+    collect_call = function(c)
         local mm = st.media
         do
             -- A call that never reached its 200 OK still opened both sockets at
@@ -1022,6 +1254,7 @@ function M.new(ctx)
                     M.reverse and ", alternating direction" or ""))
         log.line("", ("%d of %d structural pair(s) eligible"):format(st.eligible, st.pairs_total))
         dialled_line(list[1].mt)
+        mix_line()
 
         local function progress()
             local active = 0
@@ -1049,7 +1282,7 @@ function M.new(ctx)
         -- Every call carries its own step timers, so the calls in flight at the
         -- deadline end by themselves; this only backs that up.
         guard_l = loop:after(M.duration_s * 1000 + spacing * #list
-                             + 2 * M.t_ms + M.answer_ms + M.hold_ms + 5000, function()
+                             + mix_budget() + 5000, function()
             guard_l = nil
             for _, c in pairs(calls) do
                 if not c.done then call_fail(c, "call phase deadline", nil) end
@@ -1070,8 +1303,12 @@ function M.new(ctx)
             p.hist = p.hist or {}
             local mo, mt = p.mo, p.mt
             if M.reverse and gen == 0 then mo, mt = mt, mo end
+            -- CALL_MIX round and round; with the direction alternating, each
+            -- entry is placed once each way before the next.
+            local step = M.reverse and math.floor((p.k - 1) / 2) or (p.k - 1)
             n = n + 1
-            p.hist[gen] = place(n, mo, mt, i <= st.media_calls, gen, function()
+            p.hist[gen] = place(n, mo, mt, i <= st.media_calls, gen,
+                                M.mix[step % #M.mix + 1], function()
                 loop:after(M.gap_ms, function() next_call(i, p) end)
             end)
         end
@@ -1087,6 +1324,7 @@ function M.new(ctx)
     local STAGES = {
         { key = "invite",   label = "INVITE / no response" },
         { key = "ringing",  label = "ringing / no answer" },
+        { key = "cancel",   label = "CANCEL / no 487" },
         { key = "answered", label = "answered / ACK" },
         { key = "media",    label = "media / talk time" },
         { key = "release",  label = "release (BYE)" },
@@ -1126,6 +1364,25 @@ function M.new(ctx)
             log.line("", "MT's protected client port, so the P-CSCF sends the terminating")
             log.line("", "INVITE from the wrong pair. Raise ims_ipsec_pcscf's")
             log.line("", "ipsec_max_connections to the concurrent UE count and restart it.")
+        end
+
+        -- What each CALL_MIX entry came to, when there is more than the
+        -- plain answered call.
+        if not (#M.mix == 1 and M.mix[1] == "ok") then
+            local seen = {}
+            for _, v in ipairs(M.mix) do
+                local bv = st.by_variant[v]
+                if bv and not seen[v] then
+                    seen[v] = true
+                    local want = VARIANTS[v].status
+                    log.line(("  %s%s"):format(v, want and (" (" .. want .. ")") or ""),
+                        ("%d of %d as expected"):format(bv.ok, bv.n))
+                end
+            end
+            if st.early.calls > 0 then
+                log.line("early media before CANCEL", ("caller heard it on %d, callee on %d, of %d call(s) with RTP")
+                    :format(st.early.mo, st.early.mt, st.early.calls))
+            end
         end
 
         -- Failure attribution: where a call died, the same way a registration's
@@ -1231,15 +1488,12 @@ function M.new(ctx)
             or  ("%d (single burst, under one clock tick)"):format(st.answered))
     end
 
-    -- A phase passes when every call it actually placed was answered, or
-    -- refused with CALL_EXPECT_STATUS when that is set, and with
-    -- CALL_EXPECT_RELEASE=network every answered call was ended by the
-    -- network.
+    -- A phase passes when every call it actually placed ended the way its
+    -- CALL_MIX entry asks (see verdict): an "ok" call answered, or refused
+    -- with CALL_EXPECT_STATUS when that is set, and with
+    -- CALL_EXPECT_RELEASE=network ended by the network.
     function P.ok()
-        if st.attempted == 0 then return true end
-        if M.expect_status then return st.expected == st.attempted end
-        if st.answered ~= st.attempted then return false end
-        return M.expect_release ~= "network" or st.net_released == st.answered
+        return st.passed == st.attempted
     end
 
     return P
