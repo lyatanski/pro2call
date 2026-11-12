@@ -106,6 +106,19 @@ M.gap_ms     = cfg.num("CALL_GAP_MS", M.reverse_sleep_ms)
 -- How often duration mode prints its running totals: a run of hours is
 -- otherwise silent between the banner and the report.
 M.report_s   = cfg.num("CALL_REPORT_S", 60)
+-- What the network is expected to do to each call, for tests where refusing
+-- or ending it is the right answer, say an online charging limit.
+-- CALL_EXPECT_STATUS is the non-2xx final response every INVITE should get:
+-- a call refused with it passes, and one that is answered fails. Unset, the
+-- default, every call should be answered. CALL_EXPECT_RELEASE=network
+-- makes every answered call pass only if the network sends the BYE before
+-- CALL_HOLD_MS is up, rather than our own; "ue", the default, takes either.
+M.expect_status  = cfg.num("CALL_EXPECT_STATUS")
+M.expect_release = cfg.str("CALL_EXPECT_RELEASE", "ue")
+assert(not M.expect_status or M.expect_status >= 300,
+       "CALL_EXPECT_STATUS is a non-2xx final response")
+assert(M.expect_release == "ue" or M.expect_release == "network",
+       "CALL_EXPECT_RELEASE is ue or network")
 -- Which bearer carries media: "auto" uses the dedicated bearer once the Create
 -- Bearer Request brings one (re-homing if it arrives after the answer),
 -- "default" keeps media on the default bearer — worth having, because a UPF
@@ -193,11 +206,13 @@ function M.new(ctx)
     local pending, guard, finished = 0, nil, nil
     local st = {
         pairs_total = 0, eligible = 0, attempted = 0, answered = 0, released = 0,
+        expected = 0,                         -- refused with CALL_EXPECT_STATUS
+        net_released = 0,                     -- the network's BYE came first
         media_calls = 0, media_placed = 0, first_invite = nil, last_answer = nil,
         by_status = {},                       -- final-response counts, non-2xx
         stage = {},                           -- where a failed call died
         kpi = { pdd = {}, sst = {}, sst_net = {}, mo_transit = {}, mt_transit = {},
-                answer = {}, cut = {}, release = {} },
+                answer = {}, cut = {}, release = {}, net_hold = {} },
         media = { streams = 0, calls = 0, zero = 0, early = 0, late = 0, no_reports = 0,
                   unconnected = 0,   -- streams opened for a call that never answered
                   tx = 0, rx = 0, tx_err = 0, tx_why = nil,
@@ -669,6 +684,11 @@ function M.new(ctx)
             }), "200 OK (BYE)")
             if c and not c.done then
                 feed_msg(sub == c.mt and c.dlg_mt or c.dlg_mo, m)
+                -- Before our own BYE went out: the network ended the call.
+                if c.answered_at and not c.t.t9 then
+                    st.net_released = st.net_released + 1
+                    st.kpi.net_hold[#st.kpi.net_hold + 1] = now() - c.answered_at
+                end
                 if not c.released_at then c.released_at = now() end
                 st.released = st.released + 1
                 stop_media(c)
@@ -737,6 +757,14 @@ function M.new(ctx)
         c.to_hdr = m:header("To")
         local ack = build_in_dialog(c, sip.ACK, "ACK", c.cseq, c.branch, nil)
         io_.send(c.mo, "mo", ack, "ACK (non-2xx)")
+        if m.status == M.expect_status then
+            st.expected = st.expected + 1
+            if cfg.verbose then
+                log.slog(c.mo, "call", ("%d refused as expected: %d %s")
+                    :format(c.n, m.status, m.reason))
+            end
+            return call_finish(c)
+        end
         call_fail(c, ("%d %s"):format(m.status, m.reason), m.status)
     end
 
@@ -1072,6 +1100,7 @@ function M.new(ctx)
         { k = "answer",     label = "answer transit   t6-t5" },
         { k = "cut",        label = "media cut-through t8-t6" },
         { k = "release",    label = "release delay    t10-t9" },
+        { k = "net_hold",   label = "talk time to the network's BYE" },
     }
 
     function P.report()
@@ -1082,6 +1111,15 @@ function M.new(ctx)
             log.line("ASR (answer/seizure)", ("%.1f%%"):format(st.answered / st.attempted * 100))
         end
         log.line("calls released (BYE)", tostring(st.released))
+        if st.net_released > 0 or M.expect_release == "network" then
+            log.line("  ... by the network", ("%d of %d answered%s"):format(
+                st.net_released, st.answered,
+                M.expect_release == "network" and ", all expected" or ""))
+        end
+        if M.expect_status then
+            log.line(("refused %d (expected)"):format(M.expect_status),
+                ("%d of %d attempted"):format(st.expected, st.attempted))
+        end
         if st.port_clash and st.port_clash > 0 then
             log.line("SHARED P-CSCF PORTS", ("%d call(s): the MO's protected server port is also the")
                 :format(st.port_clash))
@@ -1193,8 +1231,16 @@ function M.new(ctx)
             or  ("%d (single burst, under one clock tick)"):format(st.answered))
     end
 
-    -- A phase passes when every call it actually placed was answered.
-    function P.ok() return st.attempted == 0 or st.answered == st.attempted end
+    -- A phase passes when every call it actually placed was answered, or
+    -- refused with CALL_EXPECT_STATUS when that is set, and with
+    -- CALL_EXPECT_RELEASE=network every answered call was ended by the
+    -- network.
+    function P.ok()
+        if st.attempted == 0 then return true end
+        if M.expect_status then return st.expected == st.attempted end
+        if st.answered ~= st.attempted then return false end
+        return M.expect_release ~= "network" or st.net_released == st.answered
+    end
 
     return P
 end
